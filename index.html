@@ -1,0 +1,578 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Local AI Chat</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg2: #161b22;
+    --bg3: #1c232d;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --accent2: #79c0ff;
+    --danger: #f85149;
+    --ok: #3fb950;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 10px 16px;
+    background: var(--bg2);
+    border-bottom: 1px solid var(--border);
+    flex: 0 0 auto;
+  }
+  header .logo { font-weight: 700; font-size: 16px; letter-spacing: .2px; }
+  header .logo span { color: var(--accent2); }
+  header .spacer { flex: 1; }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+  .pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .pill.ok .dot { background: var(--ok); }
+  .pill.warn .dot { background: #d29922; }
+  .pill.bad .dot { background: var(--danger); }
+
+  #model-select {
+    background: var(--bg3);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 13px;
+    max-width: 260px;
+  }
+  #model-select:focus { outline: none; border-color: var(--accent); }
+
+  main {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    padding: 20px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  .msg { display: flex; flex-direction: column; max-width: 840px; width: 100%; margin: 0 auto; }
+  .msg .who { font-size: 12px; color: var(--muted); margin-bottom: 4px; font-weight: 600; }
+  .msg .bubble {
+    line-height: 1.55;
+    font-size: 15px;
+    padding: 10px 14px;
+    border-radius: 10px;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+  }
+  .msg.user { align-items: flex-end; }
+  .msg.user .bubble { background: var(--bg3); }
+  .msg.assistant { align-items: flex-start; }
+  .msg.assistant .bubble { background: var(--bg2); border: 1px solid var(--border); }
+  .msg.error .bubble { background: #2b1215; border: 1px solid var(--danger); color: #ffb3ad; }
+
+  .thinking { color: var(--muted); font-style: italic; animation: pulse 1.2s infinite; }
+  @keyframes pulse { 0%,100% { opacity: .4 } 50% { opacity: 1 } }
+
+  footer {
+    flex: 0 0 auto;
+    padding: 12px 16px;
+    background: var(--bg2);
+    border-top: 1px solid var(--border);
+  }
+  .input-row {
+    display: flex;
+    gap: 10px;
+    max-width: 840px;
+    margin: 0 auto;
+    align-items: flex-end;
+  }
+  textarea {
+    flex: 1;
+    resize: none;
+    background: var(--bg3);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 12px;
+    font-size: 15px;
+    font-family: inherit;
+    line-height: 1.5;
+    min-height: 44px;
+    max-height: 200px;
+  }
+  textarea:focus { outline: none; border-color: var(--accent); }
+  button {
+    background: var(--accent);
+    color: #04121f;
+    border: none;
+    border-radius: 10px;
+    padding: 10px 18px;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  button:hover { background: var(--accent2); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.ghost { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+  button.ghost:hover { color: var(--text); border-color: var(--muted); }
+
+  .hint { text-align: center; color: var(--muted); font-size: 12px; margin-top: 8px; }
+
+  .welcome { text-align: center; color: var(--muted); padding: 60px 20px; }
+  .welcome h2 { color: var(--text); margin-bottom: 8px; }
+  .welcome code { font-family: var(--mono); background: var(--bg3); padding: 2px 6px; border-radius: 4px; }
+
+  .code-block { font-family: var(--mono); font-size: 13px; background: #010409; padding: 10px 12px; border-radius: 6px; margin: 8px 0; overflow-x: auto; }
+
+  .gear { background: transparent; border: 1px solid var(--border); color: var(--muted); border-radius: 6px; padding: 5px 9px; font-size: 16px; cursor: pointer; line-height: 1; }
+  .gear:hover { color: var(--text); border-color: var(--muted); }
+  .gear.active { color: var(--accent2); border-color: var(--accent); }
+
+  .settings-pop {
+    position: fixed; top: 52px; right: 16px; width: 340px; z-index: 40;
+    background: var(--bg2); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px; box-shadow: 0 8px 30px rgba(0,0,0,.45); display: none;
+  }
+  .settings-pop.open { display: block; }
+  .settings-pop h3 { margin: 0 0 4px; font-size: 14px; }
+  .settings-pop .sub { color: var(--muted); font-size: 12px; margin: 0 0 10px; }
+  .settings-pop textarea {
+    width: 100%; resize: vertical; min-height: 130px; background: var(--bg3);
+    color: var(--text); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; font-size: 13px; font-family: inherit; line-height: 1.5;
+  }
+  .settings-pop .row { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
+  .settings-pop .row button { font-size: 13px; padding: 7px 12px; }
+  .settings-pop .preset-note { color: var(--muted); font-size: 11px; margin-top: 10px; line-height: 1.4; }
+  .settings-pop .preset-note code { font-family: var(--mono); background: var(--bg3); padding: 1px 5px; border-radius: 4px; }
+</style>
+</head>
+<body>
+  <header>
+    <div class="logo">Local <span>AI Chat</span></div>
+    <div id="conn-pill" class="pill"><span class="dot"></span><span id="conn-text">connecting…</span></div>
+    <div class="spacer"></div>
+    <select id="model-select" title="Select model"></select>
+    <button class="gear" id="gear-btn" title="System prompt & settings">⚙</button>
+    <button class="ghost" id="clear-btn" title="Clear conversation">Clear</button>
+  </header>
+
+  <div class="settings-pop" id="settings-pop">
+    <h3>System prompt</h3>
+    <p class="sub">Sets the model's tone and behavior for every message.</p>
+    <textarea id="sys-prompt" spellcheck="false"></textarea>
+    <div class="row">
+      <button id="preset-mirror">Use "Mirror Me" preset</button>
+      <button class="ghost" id="preset-reset">Clear</button>
+    </div>
+    <p class="preset-note">
+      The <code>Mirror Me</code> preset makes the model warm, natural, and
+      mirror your tone — closer to a GPT-4o-style conversation partner.
+    </p>
+
+    <hr style="border:none;border-top:1px solid var(--border);margin:14px 0;" />
+
+    <h3>Download a model</h3>
+    <p class="sub">Pull a <code>.gguf</code> from HuggingFace into the models folder.</p>
+    <textarea id="dl-spec" spellcheck="false" rows="2" placeholder="owner/repo  or  owner/repo/file.gguf  or  https://…/file.gguf"></textarea>
+    <div class="row">
+      <button id="dl-btn">Download</button>
+      <button class="ghost" id="dl-clear">Clear</button>
+    </div>
+    <div id="dl-status" class="preset-note" style="display:none;"></div>
+  </div>
+
+  <main id="chat"></main>
+
+  <footer>
+    <div class="input-row">
+      <textarea id="input" placeholder="Message your local model… (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
+      <button id="send-btn">Send</button>
+    </div>
+    <div class="hint">
+      OpenAI-compatible endpoint: <code>http://localhost:5173/v1</code>
+    </div>
+  </footer>
+
+<script>
+(function () {
+  const chatEl = document.getElementById('chat');
+  const inputEl = document.getElementById('input');
+  const sendBtn = document.getElementById('send-btn');
+  const clearBtn = document.getElementById('clear-btn');
+  const modelSelect = document.getElementById('model-select');
+  const connPill = document.getElementById('conn-pill');
+  const connText = document.getElementById('conn-text');
+  const gearBtn = document.getElementById('gear-btn');
+  const settingsPop = document.getElementById('settings-pop');
+  const sysPromptEl = document.getElementById('sys-prompt');
+  const presetMirror = document.getElementById('preset-mirror');
+  const presetReset = document.getElementById('preset-reset');
+
+  let conversation = [];
+  let streaming = false;
+  let selectedModel = localStorage.getItem('lc.model') || '';
+  let authToken = localStorage.getItem('lc.token') || '';
+  let systemPrompt = localStorage.getItem('lc.sysprompt') || '';
+
+  const MIRROR_PRESET = [
+    'You are a thoughtful, perceptive conversation partner. Be warm, direct, and',
+    'natural — never stiff, never "as an AI language model."',
+    '',
+    'Mirror the user\'s tone and energy: if they\'re casual, be casual. If they\'re',
+    'technical, match that depth. If they use humor, meet it. Read between the',
+    'lines and respond to what they\'re actually getting at, not just the literal',
+    'question.',
+    '',
+    'Keep answers clear and specific. Don\'t pad with disclaimers or generic',
+    'summaries. When you don\'t know something, say so plainly and offer a useful',
+    'direction. Ask one good follow-up question when it genuinely helps.',
+    '',
+    'Sound like a sharp, friendly person who\'s actually listening — not a textbook.'
+  ].join('\n');
+
+  sysPromptEl.value = systemPrompt;
+
+  // ---- rendering helpers ----
+  function addMessage(role, text, opts = {}) {
+    const wrap = document.createElement('div');
+    wrap.className = 'msg ' + role + (opts.error ? ' error' : '');
+    const who = document.createElement('div');
+    who.className = 'who';
+    who.textContent = role === 'user' ? 'You' : (opts.model || 'Assistant');
+    const bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    if (opts.html) bubble.innerHTML = text; else bubble.textContent = text;
+    wrap.appendChild(who);
+    wrap.appendChild(bubble);
+    chatEl.appendChild(wrap);
+    chatEl.scrollTop = chatEl.scrollHeight;
+    return bubble;
+  }
+
+  function renderWelcome() {
+    if (conversation.length === 0) {
+      chatEl.innerHTML = '<div class="welcome">'
+        + '<h2>Chat with your local models</h2>'
+        + '<p>Pick a model above and start typing below.</p>'
+        + '<p>API base: <code>http://localhost:5173/v1</code></p>'
+        + '</div>';
+    }
+  }
+
+  // ---- connection health ----
+  async function checkHealth() {
+    try {
+      const r = await fetch('/health');
+      const j = await r.json();
+      if (j.ollama) {
+        connPill.className = 'pill ok';
+        connText.textContent = 'Ollama ' + (j.version || '');
+      } else if (j.mode === 'tunnel') {
+        connPill.className = 'pill ok';
+        connText.textContent = 'online';
+      } else {
+        connPill.className = 'pill bad';
+        connText.textContent = 'Ollama offline';
+      }
+    } catch {
+      connPill.className = 'pill bad';
+      connText.textContent = 'server offline';
+    }
+  }
+
+  // ---- models ----
+  async function loadModels() {
+    const prev = selectedModel;
+    try {
+      const r = await fetch('/api/models');
+      const j = await r.json();
+      const models = (j.models || []).map(m => ({ name: m.name, size: m.size }));
+      modelSelect.innerHTML = '';
+      if (models.length === 0) {
+        modelSelect.innerHTML = '<option value="">No models found</option>';
+      } else {
+        for (const m of models) {
+          const opt = document.createElement('option');
+          opt.value = m.name;
+          opt.textContent = m.name;
+          modelSelect.appendChild(opt);
+        }
+      }
+      if (prev && [...modelSelect.options].some(o => o.value === prev)) {
+        selectedModel = prev;
+      } else if (models.length > 0) {
+        selectedModel = models[0].name;
+        localStorage.setItem('lc.model', selectedModel);
+      }
+      modelSelect.value = selectedModel;
+    } catch (e) {
+      modelSelect.innerHTML = '<option value="">(cannot reach Ollama)</option>';
+    }
+  }
+
+  // ---- sending ----
+  async function send() {
+    const text = inputEl.value.trim();
+    if (!text || streaming) return;
+    if (!selectedModel) {
+      addMessage('assistant', 'No model selected. Pull a model with the CLI and reload, or select one above.', { error: true });
+      return;
+    }
+
+    inputEl.value = '';
+    autoresize();
+    conversation.push({ role: 'user', content: text });
+    addMessage('user', text);
+
+    const thinking = document.createElement('div');
+    thinking.className = 'msg assistant';
+    thinking.innerHTML = '<div class="who">' + escapeHtml(selectedModel) + '</div><div class="bubble thinking">Thinking…</div>';
+    chatEl.appendChild(thinking);
+    chatEl.scrollTop = chatEl.scrollHeight;
+
+    streaming = true;
+    sendBtn.disabled = true;
+
+    const payload = {
+      model: selectedModel,
+      stream: true,
+      messages: systemPrompt
+        ? [{ role: 'system', content: systemPrompt }, ...conversation]
+        : conversation,
+    };
+
+    let bubble = null;
+    let full = '';
+
+    try {
+      const headers = { 'Content-Type': 'application/json' };
+      if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
+
+      const resp = await fetch('/v1/chat/completions', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(payload),
+      });
+
+      if (!resp.ok) {
+        const errText = await resp.text();
+        throw new Error('HTTP ' + resp.status + ': ' + errText.slice(0, 400));
+      }
+
+      const ctype = resp.headers.get('content-type') || '';
+      const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.startsWith('data:')) continue;
+          const data = line.slice(5).trim();
+          if (!data || data === '[DONE]') continue;
+          let chunk;
+          try { chunk = JSON.parse(data); } catch { continue; }
+          const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
+          if (!delta) continue;
+          const content = delta.content;
+          if (content) {
+            full += content;
+            if (!bubble) {
+              thinking.remove();
+              bubble = addMessage('assistant', '', { model: selectedModel });
+            }
+            bubble.textContent = full;
+            chatEl.scrollTop = chatEl.scrollHeight;
+          }
+        }
+      }
+
+      if (!bubble) {
+        thinking.remove();
+        bubble = addMessage('assistant', full || '(no response)', { model: selectedModel });
+      }
+
+      conversation.push({ role: 'assistant', content: full });
+    } catch (e) {
+      thinking.remove();
+      addMessage('assistant', 'Error: ' + e.message, { error: true });
+    } finally {
+      streaming = false;
+      sendBtn.disabled = false;
+      inputEl.focus();
+    }
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  }
+
+  function autoresize() {
+    inputEl.style.height = 'auto';
+    inputEl.style.height = Math.min(inputEl.scrollHeight, 200) + 'px';
+  }
+
+  // ---- events ----
+  inputEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
+  });
+  inputEl.addEventListener('input', autoresize);
+  sendBtn.addEventListener('click', send);
+  clearBtn.addEventListener('click', () => {
+    conversation = [];
+    chatEl.innerHTML = '';
+    renderWelcome();
+  });
+  modelSelect.addEventListener('change', () => {
+    selectedModel = modelSelect.value;
+    localStorage.setItem('lc.model', selectedModel);
+  });
+
+  // ---- system prompt settings ----
+  gearBtn.addEventListener('click', () => {
+    const open = settingsPop.classList.toggle('open');
+    gearBtn.classList.toggle('active', open);
+  });
+  document.addEventListener('click', (e) => {
+    if (!settingsPop.contains(e.target) && e.target !== gearBtn) {
+      settingsPop.classList.remove('open');
+      gearBtn.classList.remove('active');
+    }
+  });
+  sysPromptEl.addEventListener('input', () => {
+    systemPrompt = sysPromptEl.value;
+    localStorage.setItem('lc.sysprompt', systemPrompt);
+  });
+  presetMirror.addEventListener('click', () => {
+    sysPromptEl.value = MIRROR_PRESET;
+    systemPrompt = MIRROR_PRESET;
+    localStorage.setItem('lc.sysprompt', systemPrompt);
+  });
+  presetReset.addEventListener('click', () => {
+    sysPromptEl.value = '';
+    systemPrompt = '';
+    localStorage.removeItem('lc.sysprompt');
+  });
+
+  // ---- model download ----
+  let dlPoll = null;
+  function fmtBytes(n) {
+    if (!n) return '0 B';
+    const u = ['B', 'KB', 'MB', 'GB'];
+    let i = 0, v = n;
+    while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+    return v.toFixed(v >= 100 || i === 0 ? 0 : 1) + ' ' + u[i];
+  }
+  function showDlStatus(html) {
+    dlStatus.innerHTML = html;
+    dlStatus.style.display = 'block';
+  }
+  function clearDlPoll() {
+    if (dlPoll) { clearInterval(dlPoll); dlPoll = null; }
+  }
+  async function pollDownload(id) {
+    clearDlPoll();
+    dlPoll = setInterval(async () => {
+      try {
+        const r = await fetch('/api/models/download?id=' + encodeURIComponent(id));
+        const j = await r.json();
+        if (j.status === 'error') {
+          showDlStatus('⚠ <b>Download failed:</b> ' + escapeHtml(j.error || 'unknown error'));
+          clearDlPoll();
+          loadModels();
+          return;
+        }
+        if (j.status === 'ready' || j.status === 'done') {
+          showDlStatus('✅ <b>' + escapeHtml(j.filename || 'model') + '</b> downloaded' +
+            (j.status === 'ready' ? ' and registered' : '') + '.');
+          clearDlPoll();
+          loadModels();
+          return;
+        }
+        if (j.status === 'downloading') {
+          const pct = j.total ? Math.round((j.downloaded / j.total) * 100) : 0;
+          showDlStatus('⬇ Downloading <b>' + escapeHtml(j.filename || j.spec || '') + '</b>… ' +
+            fmtBytes(j.downloaded) + (j.total ? ' / ' + fmtBytes(j.total) + ' (' + pct + '%)' : ''));
+          return;
+        }
+        if (j.status === 'registering') {
+          showDlStatus('🔧 Downloading done — registering with Ollama…');
+          return;
+        }
+        showDlStatus('⏳ Starting download…');
+      } catch (e) {
+        showDlStatus('⚠ Could not reach server: ' + escapeHtml(e.message));
+        clearDlPoll();
+      }
+    }, 1000);
+  }
+  dlBtn.addEventListener('click', async () => {
+    const spec = dlSpecEl.value.trim();
+    if (!spec) { showDlStatus('⚠ Enter a HuggingFace repo id or a .gguf URL first.'); return; }
+    dlBtn.disabled = true;
+    showDlStatus('⏳ Starting download…');
+    try {
+      const r = await fetch('/api/models/download', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ spec }),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || 'HTTP ' + r.status);
+      pollDownload(j.id);
+    } catch (e) {
+      showDlStatus('⚠ ' + escapeHtml(e.message));
+    } finally {
+      dlBtn.disabled = false;
+    }
+  });
+  dlClear.addEventListener('click', () => {
+    clearDlPoll();
+    dlSpecEl.value = '';
+    dlStatus.style.display = 'none';
+    dlStatus.innerHTML = '';
+  });
+
+  // ---- init ----
+  renderWelcome();
+  checkHealth();
+  loadModels();
+  setInterval(checkHealth, 10000);
+  setInterval(loadModels, 30000);
+})();
+</script>
+</body>
+</html>
