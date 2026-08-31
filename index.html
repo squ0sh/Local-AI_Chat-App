@@ -179,6 +179,7 @@
     <div class="spacer"></div>
     <select id="model-select" title="Select model"></select>
     <button class="gear" id="gear-btn" title="System prompt & settings">⚙</button>
+    <button class="ghost" id="export-btn" title="Download this conversation">Export</button>
     <button class="ghost" id="clear-btn" title="Clear conversation">Clear</button>
   </header>
 
@@ -197,6 +198,13 @@
 
     <hr style="border:none;border-top:1px solid var(--border);margin:14px 0;" />
 
+    <h3>Access token</h3>
+    <p class="sub">Only needed when the server starts with <code>AUTH_TOKEN</code>.</p>
+    <input id="auth-token" type="password" autocomplete="off" placeholder="Bearer token (stored in this browser)" />
+    <div class="row"><button class="ghost" id="token-clear">Forget token</button></div>
+
+    <hr style="border:none;border-top:1px solid var(--border);margin:14px 0;" />
+
     <h3>Download a model</h3>
     <p class="sub">Pull a <code>.gguf</code> from HuggingFace into the models folder.</p>
     <textarea id="dl-spec" spellcheck="false" rows="2" placeholder="owner/repo  or  owner/repo/file.gguf  or  https://…/file.gguf"></textarea>
@@ -212,10 +220,11 @@
   <footer>
     <div class="input-row">
       <textarea id="input" placeholder="Message your local model… (Enter to send, Shift+Enter for newline)" rows="1"></textarea>
+      <button class="ghost" id="stop-btn" type="button" hidden>Stop</button>
       <button id="send-btn">Send</button>
     </div>
     <div class="hint">
-      OpenAI-compatible endpoint: <code>http://localhost:5173/v1</code>
+      OpenAI-compatible endpoint: <code id="api-base"></code>
     </div>
   </footer>
 
@@ -224,6 +233,7 @@
   const chatEl = document.getElementById('chat');
   const inputEl = document.getElementById('input');
   const sendBtn = document.getElementById('send-btn');
+  const stopBtn = document.getElementById('stop-btn');
   const clearBtn = document.getElementById('clear-btn');
   const modelSelect = document.getElementById('model-select');
   const connPill = document.getElementById('conn-pill');
@@ -233,12 +243,21 @@
   const sysPromptEl = document.getElementById('sys-prompt');
   const presetMirror = document.getElementById('preset-mirror');
   const presetReset = document.getElementById('preset-reset');
+  const dlSpecEl = document.getElementById('dl-spec');
+  const dlBtn = document.getElementById('dl-btn');
+  const dlClear = document.getElementById('dl-clear');
+  const dlStatus = document.getElementById('dl-status');
+  const authTokenEl = document.getElementById('auth-token');
+  const tokenClear = document.getElementById('token-clear');
+  const exportBtn = document.getElementById('export-btn');
+  const apiBaseEl = document.getElementById('api-base');
 
   let conversation = [];
   let streaming = false;
   let selectedModel = localStorage.getItem('lc.model') || '';
   let authToken = localStorage.getItem('lc.token') || '';
   let systemPrompt = localStorage.getItem('lc.sysprompt') || '';
+  let activeRequest = null;
 
   const MIRROR_PRESET = [
     'You are a thoughtful, perceptive conversation partner. Be warm, direct, and',
@@ -257,6 +276,16 @@
   ].join('\n');
 
   sysPromptEl.value = systemPrompt;
+  authTokenEl.value = authToken;
+  apiBaseEl.textContent = location.origin + '/v1';
+
+  function authHeaders(extra = {}) {
+    return { ...extra, ...(authToken ? { 'Authorization': 'Bearer ' + authToken } : {}) };
+  }
+
+  function saveConversation() {
+    localStorage.setItem('lc.conversation', JSON.stringify(conversation));
+  }
 
   // ---- rendering helpers ----
   function addMessage(role, text, opts = {}) {
@@ -288,7 +317,7 @@
   // ---- connection health ----
   async function checkHealth() {
     try {
-      const r = await fetch('/health');
+      const r = await fetch('/health', { headers: authHeaders() });
       const j = await r.json();
       if (j.ollama) {
         connPill.className = 'pill ok';
@@ -310,7 +339,7 @@
   async function loadModels() {
     const prev = selectedModel;
     try {
-      const r = await fetch('/api/models');
+      const r = await fetch('/api/models', { headers: authHeaders() });
       const j = await r.json();
       const models = (j.models || []).map(m => ({ name: m.name, size: m.size }));
       modelSelect.innerHTML = '';
@@ -348,6 +377,7 @@
     inputEl.value = '';
     autoresize();
     conversation.push({ role: 'user', content: text });
+    saveConversation();
     addMessage('user', text);
 
     const thinking = document.createElement('div');
@@ -358,6 +388,8 @@
 
     streaming = true;
     sendBtn.disabled = true;
+    stopBtn.hidden = false;
+    activeRequest = new AbortController();
 
     const payload = {
       model: selectedModel,
@@ -371,13 +403,13 @@
     let full = '';
 
     try {
-      const headers = { 'Content-Type': 'application/json' };
-      if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
+      const headers = authHeaders({ 'Content-Type': 'application/json' });
 
-      const resp = await fetch('/v1/chat/completions', {
+      const resp = await fetch('/api/chat', {
         method: 'POST',
         headers,
         body: JSON.stringify(payload),
+        signal: activeRequest.signal,
       });
 
       if (!resp.ok) {
@@ -402,9 +434,7 @@
           if (!data || data === '[DONE]') continue;
           let chunk;
           try { chunk = JSON.parse(data); } catch { continue; }
-          const delta = chunk.choices && chunk.choices[0] && chunk.choices[0].delta;
-          if (!delta) continue;
-          const content = delta.content;
+          const content = chunk.content || (chunk.choices && chunk.choices[0] && chunk.choices[0].delta && chunk.choices[0].delta.content);
           if (content) {
             full += content;
             if (!bubble) {
@@ -423,12 +453,15 @@
       }
 
       conversation.push({ role: 'assistant', content: full });
+      saveConversation();
     } catch (e) {
       thinking.remove();
-      addMessage('assistant', 'Error: ' + e.message, { error: true });
+      if (e.name !== 'AbortError') addMessage('assistant', 'Error: ' + e.message, { error: true });
     } finally {
       streaming = false;
+      activeRequest = null;
       sendBtn.disabled = false;
+      stopBtn.hidden = true;
       inputEl.focus();
     }
   }
@@ -451,10 +484,20 @@
   });
   inputEl.addEventListener('input', autoresize);
   sendBtn.addEventListener('click', send);
+  stopBtn.addEventListener('click', () => activeRequest?.abort());
   clearBtn.addEventListener('click', () => {
     conversation = [];
+    localStorage.removeItem('lc.conversation');
     chatEl.innerHTML = '';
     renderWelcome();
+  });
+  exportBtn.addEventListener('click', () => {
+    const text = conversation.map(m => (m.role === 'user' ? 'You' : 'Assistant') + ':\n' + m.content).join('\n\n');
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+    link.download = 'local-ai-chat-' + new Date().toISOString().slice(0, 10) + '.txt';
+    link.click();
+    URL.revokeObjectURL(link.href);
   });
   modelSelect.addEventListener('change', () => {
     selectedModel = modelSelect.value;
@@ -475,6 +518,20 @@
   sysPromptEl.addEventListener('input', () => {
     systemPrompt = sysPromptEl.value;
     localStorage.setItem('lc.sysprompt', systemPrompt);
+  });
+  authTokenEl.addEventListener('input', () => {
+    authToken = authTokenEl.value.trim();
+    if (authToken) localStorage.setItem('lc.token', authToken);
+    else localStorage.removeItem('lc.token');
+    checkHealth();
+    loadModels();
+  });
+  tokenClear.addEventListener('click', () => {
+    authToken = '';
+    authTokenEl.value = '';
+    localStorage.removeItem('lc.token');
+    checkHealth();
+    loadModels();
   });
   presetMirror.addEventListener('click', () => {
     sysPromptEl.value = MIRROR_PRESET;
@@ -507,7 +564,7 @@
     clearDlPoll();
     dlPoll = setInterval(async () => {
       try {
-        const r = await fetch('/api/models/download?id=' + encodeURIComponent(id));
+        const r = await fetch('/api/models/download?id=' + encodeURIComponent(id), { headers: authHeaders() });
         const j = await r.json();
         if (j.status === 'error') {
           showDlStatus('⚠ <b>Download failed:</b> ' + escapeHtml(j.error || 'unknown error'));
@@ -547,7 +604,7 @@
     try {
       const r = await fetch('/api/models/download', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ spec }),
       });
       const j = await r.json();
@@ -567,7 +624,14 @@
   });
 
   // ---- init ----
-  renderWelcome();
+  try {
+    const saved = JSON.parse(localStorage.getItem('lc.conversation') || '[]');
+    if (Array.isArray(saved)) {
+      conversation = saved.filter(m => m && (m.role === 'user' || m.role === 'assistant') && typeof m.content === 'string');
+      for (const m of conversation) addMessage(m.role, m.content, { model: selectedModel });
+    }
+  } catch { localStorage.removeItem('lc.conversation'); }
+  if (!conversation.length) renderWelcome();
   checkHealth();
   loadModels();
   setInterval(checkHealth, 10000);

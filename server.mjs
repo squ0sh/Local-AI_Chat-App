@@ -136,7 +136,7 @@ function scanModels() {
     let st;
     try { st = statSync(join(MODELS_DIR, name)); } catch { continue; }
     if (!st.isFile()) continue;
-    out.push({ name: name.replace(/\.safetensors$/i, ''), files: [name], size: st.size, kind: 'gguf' });
+    out.push({ name: name.replace(/\.safetensors$/i, ''), files: [name], size: st.size, kind: 'safetensors' });
   }
 
   return out;
@@ -206,8 +206,9 @@ async function autoRegisterLocalModels() {
 function parseArgs(argv) {
   const cfg = {
     mode: 'local',
-    host: null,
-    port: 5210,
+    // Bind locally by default. Public/LAN exposure should always be explicit.
+    host: process.env.HOST || '127.0.0.1',
+    port: Number(process.env.PORT || 5173),
     ollamaUrl: (process.env.OLLAMA_URL || 'http://127.0.0.1:11434').replace(/\/+$/, ''),
     authToken: process.env.AUTH_TOKEN || '',
     cloudflaredPath: process.env.CLOUDFLARED_PATH || '',
@@ -231,6 +232,9 @@ function parseArgs(argv) {
     else if (a === '--cloudflared') cfg.cloudflaredPath = next() || '';
     else if (a === 'local' || a === 'tunnel') cfg.mode = a;
   }
+  if (!Number.isInteger(cfg.port) || cfg.port < 1 || cfg.port > 65535) {
+    throw new Error('Port must be an integer between 1 and 65535');
+  }
   if (!/^https?:\/\//.test(cfg.ollamaUrl)) cfg.ollamaUrl = 'http://' + cfg.ollamaUrl;
   return cfg;
 }
@@ -242,7 +246,6 @@ const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-  'Access-Control-Allow-Credentials': 'true',
 };
 const RESP_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', ...CORS };
 
@@ -255,10 +258,19 @@ function sendJSON(res, code, obj) {
   res.end(JSON.stringify(obj));
 }
 
-function readBody(req) {
+function readBody(req, maxBytes = 1_000_000) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on('data', (c) => chunks.push(c));
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > maxBytes) {
+        req.destroy();
+        reject(new Error('Request body exceeds the 1 MB limit'));
+        return;
+      }
+      chunks.push(c);
+    });
     req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
     req.on('error', reject);
   });
@@ -296,24 +308,25 @@ function authorize(req, url) {
 
 async function handle(req, res) {
   const url = new URL(req.url, 'http://localhost');
+  const p = url.pathname;
 
-  const provided = authorize(req, url);
-  if (cfg.authToken && provided !== cfg.authToken) {
-    return sendJSON(res, 401, { error: 'Unauthorized: missing or invalid AUTH_TOKEN' });
-  }
-
+  // Browsers cannot attach a bearer token to CORS preflight requests.
   if (req.method === 'OPTIONS') {
     res.writeHead(204, CORS);
     return res.end();
   }
 
-  const p = url.pathname;
-
-  // ── Chat UI ──────────────────────────────────────────────────────────────
+  // Keep the shell reachable so a user can enter AUTH_TOKEN in the UI.
+  // All dynamic routes below remain protected.
   if (req.method === 'GET' && (p === '/' || p === '/index.html')) {
     if (INDEX_HTML === null) return sendJSON(res, 500, { error: 'index.html not found' });
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
     return res.end(INDEX_HTML);
+  }
+
+  const provided = authorize(req, url);
+  if (cfg.authToken && provided !== cfg.authToken) {
+    return sendJSON(res, 401, { error: 'Unauthorized: missing or invalid AUTH_TOKEN' });
   }
 
   // ── Health probe (drives the UI connection pill) ─────────────────────────
@@ -420,7 +433,9 @@ async function handle(req, res) {
   if (p === '/api/chat' && req.method === 'POST') {
     let body;
     try { body = await readBody(req); } catch (e) { return sendJSON(res, 400, { error: e.message }); }
-    const payload = JSON.parse(body || '{}');
+    let payload;
+    try { payload = JSON.parse(body || '{}'); }
+    catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
     return streamChat(payload, res);
   }
 
@@ -454,7 +469,7 @@ function isCloudProvider() {
 // Merge Ollama's registry (/api/tags) with the local models/ folder. Local
 // .gguf files appear as first-class local models selectable in the UI.
 async function listModels(res) {
-  const local = scanModels();
+  const local = scanModels().filter((m) => m.kind === 'gguf');
   let tags = [];
   try {
     const r = await upstreamRequest('GET', '/api/tags', { timeout: 6000 });
@@ -555,8 +570,8 @@ async function proxyCloud(method, path, body, res) {
   if (!mapped) return sendJSON(res, 404, { error: 'Unsupported endpoint for provider: ' + cfg.aiProvider });
   const { url, headers } = mapped;
   try {
-    const h = { 'Content-Type': 'application/json', ...headers };
-    const r = await fetch(url, { method: 'POST', headers: h, body: mapped.body });
+    const h = { ...(mapped.body != null ? { 'Content-Type': 'application/json' } : {}), ...headers };
+    const r = await fetch(url, { method, headers: h, ...(mapped.body != null ? { body: mapped.body } : {}) });
     for (const [k, v] of ['content-type', 'cache-control', 'connection', 'transfer-encoding']) {
       const val = r.headers.get(k);
       if (val) res.setHeader(k, val);
@@ -713,19 +728,31 @@ async function streamChat(payload, res) {
   }
   let fullText = '';
   try {
-    const r = await fetch(baseUrl + '/chat/completions', { method: 'POST', headers, body });
+    const chatPath = provider === 'ollama' ? '/v1/chat/completions' : '/chat/completions';
+    const r = await fetch(baseUrl + chatPath, { method: 'POST', headers, body });
     if (!r.ok) return fail('Upstream HTTP ' + r.status + ': ' + await r.text().then(t => t.slice(0, 300)));
-    const text = await r.text();
-    for (const line of text.split('\n')) {
-      if (!line.startsWith('data: ')) continue;
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    const consumeLine = (line) => {
+      if (!line.startsWith('data: ')) return;
       const raw = line.slice(6).trim();
-      if (raw === '[DONE]') continue;
+      if (!raw || raw === '[DONE]') return;
       try {
         const parsed = JSON.parse(raw);
         const delta = parsed.choices?.[0]?.delta?.content || '';
         if (delta) { fullText += delta; sendSSE({ type: 'delta', content: delta }); }
       } catch {}
+    };
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) consumeLine(line);
     }
+    if (buffer) consumeLine(buffer);
     return finish(fullText);
   } catch (e) { return fail(e.message); }
 }
@@ -902,6 +929,11 @@ const server = createServer((req, res) => {
     log('Request error:', e);
     try { sendJSON(res, 500, { error: e.message }); } catch {}
   });
+});
+
+server.on('error', (e) => {
+  log('Server error:', e.message);
+  process.exitCode = 1;
 });
 
 server.listen(cfg.port, cfg.host, async () => {

@@ -21,7 +21,8 @@ npm run tunnel
 npm start -- --port 8080 --ollama-url http://127.0.0.1:11434
 ```
 
-Open the chat UI at <http://localhost:5173>.
+Open the chat UI at <http://localhost:5173>. The server binds to `127.0.0.1`
+by default; use `--host 0.0.0.0` only when you intentionally want LAN access.
 
 ## OpenAI-compatible endpoint
 
@@ -51,6 +52,8 @@ node tools/model-cli.mjs info llama3.2:3b
 | Variable              | Default                  | Description                          |
 | --------------------- | ------------------------ | ------------------------------------ |
 | `OLLAMA_URL`          | `http://127.0.0.1:11434`| Ollama API base URL                  |
+| `PORT`                | `5173`                 | Local AI Chat listening port         |
+| `HOST`                | `127.0.0.1`            | Bind address; use `0.0.0.0` for LAN access |
 | `OLLAMA_API_KEY`      | *(unset)*                | Upstream auth bearer (if Ollama gated) |
 | `AUTH_TOKEN`          | *(unset)*                | Require `Authorization: Bearer` on this server |
 | `CLOUDFLARED_PATH`    | *(auto-detect)*          | Path to cloudflared binary           |
@@ -64,5 +67,3 @@ GitHub Releases. The public trycloudflare URL is printed to the console.
 > Note: quick tunnels are ephemeral — the URL changes each run. Do not use
 > them for long-lived public exposure without additional security (set
 > `AUTH_TOKEN`).
-EOF
-echo "README written: $(wc -l < /home/midori-ai/git_repos/OpenClaude-Portable/chat-app/README.md) lines"
