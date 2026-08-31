@@ -8,7 +8,10 @@
     "start": "node server.mjs",
     "local": "node server.mjs --mode local",
     "tunnel": "node server.mjs --mode tunnel",
-    "models": "node tools/model-cli.mjs list"
+    "models": "node tools/model-cli.mjs list",
+    "model:balanced": "ollama pull hf.co/tostideluxekaas/Llama-3.2-3B-Instruct-uncensored-GGUF:Q4_K_M",
+    "model:portable": "ollama pull hf.co/tostideluxekaas/Llama-3.2-3B-Instruct-uncensored-GGUF:Q3_K_M",
+    "model:reasoning": "ollama pull hf.co/Lenili/DeepQwen-3B-Uncensored-GGUF:Q5_K_M"
   },
   "engines": {
     "node": ">=18"

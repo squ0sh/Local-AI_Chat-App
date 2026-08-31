@@ -24,6 +24,32 @@ The model files are usually much larger than the app itself. Use a small
 quantized 3B–4B model for a friend-friendly package; it will start and respond
 far better than a 9B model on typical laptops.
 
+### Curated local model choices
+
+The app intentionally offers choices rather than pretending there is one best
+model. Pick **one** as the default USB model, then add the others only when a
+friend's machine can handle them:
+
+| Preset | Command | Download | Best for |
+| --- | --- | ---: | --- |
+| Balanced (recommended) | `npm run model:balanced` | ~2.02 GB | General conversation, writing, everyday help |
+| Ultra-portable | `npm run model:portable` | ~1.86 GB | Older laptops and minimum USB size; lower quality |
+| Reasoning & code | `npm run model:reasoning` | ~2.3 GB | Coding, analysis, and deliberate step-by-step work |
+
+The first two presets are quantizations of the same 3B uncensored Llama 3.2
+fine-tune. The reasoning preset is a separate abliterated 3B Qwen/DeepSeek
+distill. None of these models is inherently unbiased or guaranteed accurate;
+they can still hallucinate and reflect bias. Keep the model's license and
+responsible-use notice with any USB kit you distribute.
+
+For a portable kit, run the selected command with `OLLAMA_MODELS` pointed at
+the kit before copying it, for example:
+
+```bash
+export OLLAMA_MODELS="$PWD/.portable/ollama/models"
+npm run model:balanced
+```
+
 ### Share over the web
 
 For a temporary private link, choose a strong token and run:
