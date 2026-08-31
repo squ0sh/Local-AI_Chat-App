@@ -3,6 +3,41 @@
 A local AI chat app **and** OpenAI-compatible API server for your Ollama
 models. Exposed locally, or publicly through a Cloudflare quick tunnel.
 
+## Sharing modes
+
+### Portable USB kit
+
+Use `start-portable.sh` on Linux/macOS or `start-portable.cmd` on Windows. Both
+launchers keep downloaded models, settings, logs, and tunnel tooling under
+`.portable/`, so the app does not touch your friend's existing Ollama library.
+
+For a fully offline USB kit, place these runtimes beside the launcher before
+copying it:
+
+```
+runtime/node/            # portable Node runtime
+runtime/ollama/           # portable Ollama executable
+.portable/ollama/models/ # preloaded Ollama model library
+```
+
+The model files are usually much larger than the app itself. Use a small
+quantized 3B–4B model for a friend-friendly package; it will start and respond
+far better than a 9B model on typical laptops.
+
+### Share over the web
+
+For a temporary private link, choose a strong token and run:
+
+```bash
+AUTH_TOKEN="a-long-random-secret" npm run tunnel
+```
+
+The app refuses tunnel mode without that token. Send the URL and token through
+separate channels. Quick-tunnel links are temporary; for a stable public site,
+run this app on a small VM/container with Ollama, HTTPS, a persistent Cloudflare
+Tunnel, and real user authentication in front of it. Never put provider API
+keys into a publicly shared browser build.
+
 - Zero dependencies — runs on Node's built-ins (Node 18+).
 - Clean single-file web chat UI.
 - Thin passthrough proxy to Ollama's own `/v1` OpenAI-compatible endpoints,

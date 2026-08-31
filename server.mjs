@@ -13,7 +13,7 @@
 
 import { createServer } from 'http';
 import { readFileSync, existsSync, mkdirSync, createWriteStream, copyFileSync, chmodSync, readdirSync, statSync, writeFileSync, renameSync, unlinkSync } from 'fs';
-import { join, dirname } from 'path';
+import { join, dirname, resolve } from 'path';
 import { fileURLToPath } from 'url';
 import { spawn, execSync } from 'child_process';
 import { pipeline } from 'stream/promises';
@@ -25,9 +25,11 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const HTML_FILE = join(__dirname, 'index.html');
 const INDEX_HTML = existsSync(HTML_FILE) ? readFileSync(HTML_FILE, 'utf8') : null;
 
-// Root data dir lives three levels up: chat-app -> OpenClaude-Portable/data
+// Set LOCAL_AI_DATA_DIR to make a fully self-contained portable installation.
 const ROOT_DIR = join(__dirname, '..');
-const DATA_DIR = join(ROOT_DIR, 'data');
+const DATA_DIR = process.env.LOCAL_AI_DATA_DIR
+  ? resolve(process.env.LOCAL_AI_DATA_DIR)
+  : join(ROOT_DIR, 'data');
 const ENV_FILE = join(DATA_DIR, 'ai_settings.env');
 
 // Local model drop folder — place .gguf (and Ollama Modelfile) files here to
@@ -240,6 +242,10 @@ function parseArgs(argv) {
 }
 
 const cfg = parseArgs(process.argv.slice(2));
+
+if (cfg.mode === 'tunnel' && !cfg.authToken) {
+  throw new Error('Tunnel mode requires AUTH_TOKEN. Example: AUTH_TOKEN="choose-a-long-secret" npm run tunnel');
+}
 
 // ------------------------------------------------------------------ utilities
 const CORS = {
@@ -759,7 +765,7 @@ async function streamChat(payload, res) {
 
 // ------------------------------------------------------- tunnel support
 function bundledBin() {
-  return join(__dirname, 'data', 'bin', isWin() ? 'cloudflared.exe' : 'cloudflared');
+  return join(DATA_DIR, 'bin', isWin() ? 'cloudflared.exe' : 'cloudflared');
 }
 
 function spawnCloudflared() {
@@ -780,7 +786,7 @@ function spawnCloudflared() {
 }
 
 async function downloadCloudflared() {
-  const cwd = join(__dirname, 'data', 'bin');
+  const cwd = join(DATA_DIR, 'bin');
   mkdirSync(cwd, { recursive: true });
   let asset;
   if (isWin()) asset = 'cloudflared-windows-amd64.exe';
