@@ -26,8 +26,9 @@ if not exist "%PORTABLE_DIR%\ollama\models" mkdir "%PORTABLE_DIR%\ollama\models"
 if not exist "%PORTABLE_DIR%\logs" mkdir "%PORTABLE_DIR%\logs"
 set "LOCAL_AI_DATA_DIR=%PORTABLE_DIR%\data"
 set "OLLAMA_MODELS=%PORTABLE_DIR%\ollama\models"
-set "OLLAMA_HOST=127.0.0.1:11434"
+set "OLLAMA_HOST=127.0.0.1:11435"
 
 start "Portable Ollama" /b "%OLLAMA_BIN%" serve ^> "%PORTABLE_DIR%\logs\ollama.log" 2^>^&1
 echo Starting Local AI Chat at http://127.0.0.1:5173
+set "OLLAMA_URL=http://127.0.0.1:11435"
 "%NODE_BIN%" "%APP_DIR%server.mjs" --mode local --host 127.0.0.1 --port 5173

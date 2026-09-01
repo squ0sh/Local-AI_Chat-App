@@ -5,6 +5,7 @@ set -euo pipefail
 
 APP_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 PORTABLE_DIR="$APP_DIR/.portable"
+APP_PORT="${LOCAL_AI_PORT:-5173}"
 NODE_BIN="$APP_DIR/runtime/node/bin/node"
 OLLAMA_BIN="$APP_DIR/runtime/ollama/ollama"
 
@@ -23,10 +24,13 @@ fi
 mkdir -p "$PORTABLE_DIR/ollama/models" "$PORTABLE_DIR/logs"
 export LOCAL_AI_DATA_DIR="$PORTABLE_DIR/data"
 export OLLAMA_MODELS="$PORTABLE_DIR/ollama/models"
-export OLLAMA_HOST="127.0.0.1:11434"
+# Keep the portable runtime isolated from any Ollama installation already on
+# the host. This prevents its models from being silently replaced by the host's
+# model library.
+export OLLAMA_HOST="127.0.0.1:11435"
 
 OLLAMA_PID=""
-if ! curl --silent --fail http://127.0.0.1:11434/api/version >/dev/null 2>&1; then
+if ! curl --silent --fail http://127.0.0.1:11435/api/version >/dev/null 2>&1; then
   "$OLLAMA_BIN" serve >"$PORTABLE_DIR/logs/ollama.log" 2>&1 &
   OLLAMA_PID=$!
   echo "Starting portable Ollama…"
@@ -35,5 +39,5 @@ fi
 cleanup() { [[ -n "$OLLAMA_PID" ]] && kill "$OLLAMA_PID" 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 
-echo "Starting Local AI Chat at http://127.0.0.1:5173"
-"$NODE_BIN" "$APP_DIR/server.mjs" --mode local --host 127.0.0.1 --port 5173
+echo "Starting Local AI Chat at http://127.0.0.1:$APP_PORT"
+OLLAMA_URL="http://127.0.0.1:11435" "$NODE_BIN" "$APP_DIR/server.mjs" --mode local --host 127.0.0.1 --port "$APP_PORT"

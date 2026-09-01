@@ -5,8 +5,9 @@
   "type": "module",
   "main": "server.mjs",
   "scripts": {
-    "start": "node server.mjs",
-    "local": "node server.mjs --mode local",
+    "start": "bash start-portable.sh",
+    "local": "bash start-portable.sh",
+    "server": "node server.mjs --mode local",
     "tunnel": "node server.mjs --mode tunnel",
     "models": "node tools/model-cli.mjs list",
     "model:balanced": "ollama pull hf.co/tostideluxekaas/Llama-3.2-3B-Instruct-uncensored-GGUF:Q4_K_M",
