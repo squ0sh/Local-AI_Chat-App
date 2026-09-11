@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "name": "Local AI Capsule",
+  "description": "A self-contained, offline-first personal AI workspace.",
+  "app_version": "1.0.0",
+  "integrity_manifest": "capsule-integrity.json",
+  "portable_data_dir": ".portable",
+  "runtimes": {
+    "index": "runtime/index.json",
+    "platforms": "runtime/platforms"
+  },
+  "offline_profile": {
+    "minimum_memory_gb": 8,
+    "recommended_memory_gb": 16,
+    "required_models": 1
+  },
+  "handoff": {
+    "exclude_by_default": [
+      ".portable/data",
+      ".portable/logs"
+    ],
+    "include_notice": "The tested portable model is included for offline use. Personal data, logs, Vault contents, and cloud credentials are excluded from a shared handoff."
+  }
+}

@@ -17,6 +17,7 @@
 import { readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { pullOllamaModel } from '../lib/resumable-ollama-pull.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -90,37 +91,25 @@ async function cmdList() {
 async function cmdPull(name) {
   if (!name) { console.error('Usage: node tools/model-cli.mjs pull <name>'); process.exit(1); }
   console.log(`Pulling ${name} …`);
-  let r;
-  try { r = await api('/api/pull', { method: 'POST', body: { name } }); }
-  catch (e) { console.error('✗  Cannot reach Ollama at ' + OLLAMA + ': ' + e.message); process.exit(1); }
-
-  const contentType = (r.headers.get('content-type') || '');
-  if (contentType.includes('application/json')) {
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) { console.error('✗  ' + (j.error || ('HTTP ' + r.status))); process.exit(1); }
-    console.log('✅  ' + (j.status || 'done'));
-    return;
-  }
-  // Streaming progress (NDJSON lines)
-  const reader = r.body.getReader();
-  const decoder = new TextDecoder();
-  let lastStatus = '';
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    for (const line of decoder.decode(value, { stream: true }).split('\n')) {
-      if (!line.trim()) continue;
-      let j; try { j = JSON.parse(line); } catch { continue; }
-      if (j.error) { console.error('✗  ' + j.error); process.exit(1); }
-      if (j.digest) {
+  try {
+    await pullOllamaModel({
+      baseUrl: OLLAMA,
+      model: name,
+      onUpdate(j) {
+        if (j.digest) {
         const total = j.total || 0, completed = j.completed || 0, pct = total ? (completed / total * 100).toFixed(1) : '…';
         const msg = `  ${pad(j.status || '', 14)} ${String(pct).padStart(6)}%  ${humanSize(j.completed)} / ${humanSize(total)}   `;
         process.stdout.write('\r' + msg.padEnd(60));
-      } else {
-        lastStatus = j.status || '';
-        console.log('\r' + '  ' + lastStatus.padEnd(60));
-      }
-    }
+        } else if (j.status) console.log('\r' + '  ' + String(j.status).padEnd(60));
+      },
+      onReconnect({ reconnects, maxReconnects }) {
+        console.log(`\n  Connection stalled — reconnecting ${reconnects}/${maxReconnects}. Partial data is safe.`);
+      },
+    });
+  } catch (error) {
+    console.error('\n✗  Download stopped: ' + error.message);
+    console.error('   Run the same command again to resume the saved partial download.');
+    process.exit(1);
   }
   process.stdout.write('\n✅  Done — model ready: ' + name + '\n');
 }
