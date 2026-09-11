@@ -73,6 +73,11 @@ web_modules/
 .env.*
 !.env.example
 
+# Signing keys — the private key must never be committed. Kept in
+# ~/.capsule-signing/key.pem by default; pin the public half only.
+.capsule-signing/
+*.signing-key.pem
+
 # parcel-bundler cache (https://parceljs.org/)
 .cache
 .parcel-cache

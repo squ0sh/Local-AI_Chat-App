@@ -12,7 +12,7 @@
  */
 
 import { createServer } from 'http';
-import { readFileSync, existsSync, mkdirSync, createReadStream, createWriteStream, copyFileSync, chmodSync, readdirSync, rmdirSync, statSync, statfsSync, writeFileSync, renameSync, unlinkSync, accessSync, constants as fsConstants } from 'fs';
+import { readFileSync, existsSync, mkdirSync, createReadStream, createWriteStream, copyFileSync, chmodSync, readdirSync, rmdirSync, statSync, statfsSync, writeFileSync, renameSync, unlinkSync, accessSync, constants as fsConstants, appendFileSync } from 'fs';
 import { join, dirname, resolve, relative, sep, basename } from 'path';
 import { fileURLToPath } from 'url';
 import { spawn, execSync, execFileSync } from 'child_process';
@@ -25,6 +25,11 @@ import { portableIntegrityReport } from './lib/capsule-integrity.mjs';
 import { sealVault, openVault } from './lib/capsule-vault.mjs';
 import { ResearchEngine } from './lib/research-engine.mjs';
 import { pullOllamaModel } from './lib/resumable-ollama-pull.mjs';
+import { RateLimiter, rateLimitResponse } from './lib/rate-limit.mjs';
+import { ChatStore } from './lib/chat-store.mjs';
+import { McpClient } from './lib/mcp-client.mjs';
+import { UserStore } from './lib/user-store.mjs';
+import { runAgentLoop, AGENT_TOOLS, SKILL_PROMPTS, webSearch, webFetchPage } from './lib/agent-loop.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -33,6 +38,13 @@ const HTML_FILE = join(__dirname, 'index.html');
 const INDEX_HTML = existsSync(HTML_FILE) ? readFileSync(HTML_FILE, 'utf8') : null;
 const CAPSULE_UI_FILE = join(__dirname, 'capsule-ui.js');
 const CAPSULE_UI = existsSync(CAPSULE_UI_FILE) ? readFileSync(CAPSULE_UI_FILE, 'utf8') : null;
+// CSP needs the single inline <script> block in index.html to be hashed, not
+// allowed with 'unsafe-inline'. The hash is derived from the exact file we
+// serve, so it stays correct as the UI evolves.
+const INLINE_SCRIPT_SHA = (() => {
+  const match = (INDEX_HTML || '').match(/<script>([\s\S]*?)<\/script>/);
+  return match && match[1] ? 'sha256-' + createHash('sha256').update(match[1]).digest('base64') : '';
+})();
 const CAPSULE_FILE = join(__dirname, 'capsule.json');
 const SKILLS_FILE = join(__dirname, 'skills.json');
 const INTEGRITY_FILE = join(__dirname, 'capsule-integrity.json');
@@ -49,6 +61,7 @@ const CLOUD_VAULT_FILE = join(DATA_DIR, 'capsule-cloud-vault.json');
 const MODEL_VERIFICATIONS_FILE = join(DATA_DIR, 'model-verifications.json');
 const MODEL_IMPORTS_FILE = join(DATA_DIR, 'model-imports.json');
 const RESEARCH_DIR = join(DATA_DIR, 'research');
+const CHATS_DIR = join(DATA_DIR, 'chats');
 const PORTABLE_ROOT = join(__dirname, '.portable');
 const PORTABLE_MODELS_DIR = join(PORTABLE_ROOT, 'ollama', 'models');
 const OLLAMA_MODELS_DIR = resolve(process.env.OLLAMA_MODELS || join(homedir(), '.ollama', 'models'));
@@ -79,6 +92,14 @@ let downloadSeq = 0;
 let modelRegistrationActive = null;
 let modelUnloadActive = false;
 const activeOllamaGenerations = new Map();
+// Cap concurrent model generations so a misbehaving client cannot exhaust
+// Ollama (and RAM) by opening parallel requests faster than models can back off.
+const MAX_CONCURRENT_GENERATIONS = 4;
+// Agent loop state: active loops for cancellation and pending approvals for gate-based execution
+const activeAgentLoops = new Map();
+const pendingApprovalsGlobal = new Map();
+// Requests asking for more output than this are clamped, not rejected.
+const MAX_REQUEST_TOKENS = 8192;
 let remoteTunnel = { child: null, url: '', token: '', expiresAt: 0, timer: null };
 let tunnelStartPromise = null;
 // Held only while this app is running after the user has unlocked their Vault.
@@ -91,6 +112,7 @@ const CURATED_MODELS = [
     agent_fit: { level: 'basic', label: 'Agent: basic', detail: 'Very small and fast; keep agent tasks short and supervised because 1B models have limited planning capacity.' },
     source_url: 'https://ollama.com/huihui_ai/gemma3-abliterated',
     description: 'A tiny abliterated Gemma model for quick text chat on low-memory computers and compact USB kits.',
+    expected_sha256: '',
   },
   {
     id: 'balanced', name: 'Balanced', model: 'hf.co/prithivMLmods/Qwen3-4B-2507-abliterated-GGUF:Q4_K_M',
@@ -98,6 +120,7 @@ const CURATED_MODELS = [
     agent_fit: { level: 'good', label: 'Agent: good', detail: 'A good everyday fit for supervised planning, file context, and short command workflows.' },
     source_url: 'https://huggingface.co/prithivMLmods/Qwen3-4B-2507-abliterated-GGUF',
     description: 'An abliterated Qwen model for uncensored conversation, writing, and everyday help.',
+    expected_sha256: '',
   },
   {
     id: 'reasoning', name: 'Strong', model: 'dolphin3:8b-llama3.1-q4_K_M',
@@ -105,6 +128,7 @@ const CURATED_MODELS = [
     agent_fit: { level: 'strong', label: 'Agent: strong', detail: 'Designed for general, coding, math, function-calling, and agentic work, with more memory required.' },
     source_url: 'https://ollama.com/library/dolphin3',
     description: 'A stronger uncensored general model designed for coding, math, and agentic workflows.',
+    expected_sha256: '',
   },
   {
     id: 'coding', name: 'Coding', model: 'dolphin-mistral:7b',
@@ -112,6 +136,7 @@ const CURATED_MODELS = [
     agent_fit: { level: 'good', label: 'Agent: good', detail: 'An uncensored coding-focused model for supervised plans, workspace context, and command results.' },
     source_url: 'https://ollama.com/library/dolphin-mistral',
     description: 'An uncensored Dolphin model built for code explanation, writing, and debugging.',
+    expected_sha256: '',
   },
   {
     id: 'vision', name: 'Vision', model: 'huihui_ai/gemma3-abliterated:4b',
@@ -119,6 +144,7 @@ const CURATED_MODELS = [
     agent_fit: { level: 'basic', label: 'Agent: basic', detail: 'Optimized for visual work; use a general or coding model for longer agent workflows.' },
     source_url: 'https://ollama.com/huihui_ai/gemma3-abliterated',
     description: 'An abliterated image-and-document model for screenshots, charts, tables, and diagrams.',
+    expected_sha256: '',
   },
   {
     id: 'qwythos', name: 'Qwythos 9B', model: 'hf.co/huihui-ai/Huihui-Qwythos-9B-Claude-Mythos-5-1M-abliterated-GGUF:Q6_K',
@@ -126,6 +152,7 @@ const CURATED_MODELS = [
     agent_fit: { level: 'strong', label: 'Agent: strong', detail: 'A portable reasoning and tool-use model, but still supervise commands and verify long workflows.' },
     source_url: 'https://huggingface.co/huihui-ai/Huihui-Qwythos-9B-Claude-Mythos-5-1M-abliterated-GGUF',
     description: 'A portable Qwen-based reasoning model trained on Claude Mythos-style traces, then abliterated for fewer refusals.',
+    expected_sha256: '',
   },
   {
     id: 'deepseek-r1', name: 'DeepSeek R1 14B', model: 'hf.co/tensorblock/DeepSeek-R1-Distill-Qwen-14B-abliterated-v2-GGUF:Q4_K_M',
@@ -133,6 +160,7 @@ const CURATED_MODELS = [
     agent_fit: { level: 'strong', label: 'Agent: strong', detail: 'Reasoning-focused and capable of multi-step work; its dense 14B architecture may be slower than similarly sized MoE choices.' },
     source_url: 'https://huggingface.co/tensorblock/DeepSeek-R1-Distill-Qwen-14B-abliterated-v2-GGUF',
     description: 'A recommended Q4 build of the abliterated DeepSeek R1 Qwen distill for deeper local reasoning.',
+    expected_sha256: '',
   },
   {
     id: 'gpt-oss-heretic', name: 'GPT-OSS 20B Heretic', model: 'hf.co/mradermacher/gpt-oss-20b-heretic-ara-v3-GGUF:MXFP4_MOE',
@@ -140,6 +168,7 @@ const CURATED_MODELS = [
     agent_fit: { level: 'strong', label: 'Agent: strong', detail: 'Retains GPT-OSS reasoning and tool-use behavior with substantially reduced refusals; 16 GB systems should use modest context.' },
     source_url: 'https://huggingface.co/mradermacher/gpt-oss-20b-heretic-ara-v3-GGUF',
     description: 'The evidence-backed ARA v3 uncensored GPT-OSS build, preserving its native compact MoE expert format.',
+    expected_sha256: '',
   },
   {
     id: 'qwen36-moe', name: 'Qwen3.6 35B-A3B Heretic', model: 'hf.co/llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-GGUF:Q3_K_M',
@@ -147,6 +176,7 @@ const CURATED_MODELS = [
     agent_fit: { level: 'strong', label: 'Agent: strong', detail: 'A newer sparse model for demanding reasoning, coding, and agent workflows on higher-memory systems.' },
     source_url: 'https://huggingface.co/llmfan46/Qwen3.6-35B-A3B-uncensored-heretic-GGUF',
     description: 'A modern 35B-total, 3B-active uncensored MoE for capable 24 GB-and-up computers; vision needs its separate projector.',
+    expected_sha256: '',
   },
   {
     id: 'qwopus', name: 'Qwopus3.6 27B Preview', model: 'hf.co/mradermacher/Qwopus3.6-27B-v1-Abliterated-preview-GGUF:Q4_K_M',
@@ -154,6 +184,7 @@ const CURATED_MODELS = [
     agent_fit: { level: 'unknown', label: 'Agent: experimental', detail: 'An early preview trained for structured reasoning style; evaluate it carefully before relying on agent or coding output.' },
     source_url: 'https://huggingface.co/mradermacher/Qwopus3.6-27B-v1-Abliterated-preview-GGUF',
     description: 'An experimental dense Qwen fine-tune using Claude-, GLM-, and Kimi-style reasoning traces; it is not Claude Opus.',
+    expected_sha256: '',
   },
   {
     id: 'dolphin-mixtral', name: 'Dolphin Mixtral 8x7B', model: 'dolphin-mixtral:8x7b-v2.7-q2_K',
@@ -161,6 +192,7 @@ const CURATED_MODELS = [
     agent_fit: { level: 'good', label: 'Agent: good', detail: 'An established uncensored MoE, though newer models usually offer a better portability-to-capability tradeoff.' },
     source_url: 'https://ollama.com/library/dolphin-mixtral/tags',
     description: 'The established Dolphin Mixtral option retained for comparison and variety; large even at its Q2 build.',
+    expected_sha256: '',
   },
 ];
 
@@ -387,6 +419,8 @@ function modelNamesMatch(a, b) {
 
 function beginOllamaGeneration(model) {
   const key = normalizedModelName(model) || '*';
+  const activeTotal = [...activeOllamaGenerations.values()].reduce((sum, count) => sum + count, 0);
+  if (activeTotal >= MAX_CONCURRENT_GENERATIONS) return null;
   activeOllamaGenerations.set(key, Number(activeOllamaGenerations.get(key) || 0) + 1);
   let released = false;
   return () => {
@@ -548,6 +582,25 @@ async function ollamaJSON(method, path, payload, timeout = 8000) {
 
 async function ollamaTags() {
   return (await ollamaJSON('GET', '/api/tags')).models || [];
+}
+
+const ollamaContextCache = new Map();
+async function ollamaContextFor(model) {
+  const name = String(model || '');
+  if (!name) return 4096;
+  if (ollamaContextCache.has(name)) return ollamaContextCache.get(name);
+  let context = 4096;
+  try {
+    const info = await ollamaJSON('POST', '/api/show', { model: name }, 12000);
+    let detected = info?.details?.context_length;
+    if (!detected && info?.model_info) {
+      const key = Object.keys(info.model_info).find((candidate) => /^[a-z0-9_-]+\.context_length$/.test(candidate));
+      if (key) detected = info.model_info[key];
+    }
+    if (detected) context = Math.max(1024, Math.min(Number(detected) || 4096, 32768));
+  } catch {}
+  ollamaContextCache.set(name, context);
+  return context;
 }
 
 async function ollamaLoadedModels() {
@@ -728,6 +781,8 @@ async function buildModelLibrary() {
       running: Boolean(runtime),
       runtime,
       curated_id: curated?.id || '',
+      expected_sha256: curated?.expected_sha256 || '',
+      provenance_match: curated?.expected_sha256 ? (tag.digest || quick.manifest_digest || '') === curated.expected_sha256 : null,
       agent_fit: curated?.agent_fit || { level: 'unknown', label: 'Agent: not evaluated', detail: 'This model has not been evaluated for instruction following in Capsule Agent mode. It can still be used with supervision.' },
       verification: deeplyVerified
         ? { ...quickPublic, ok: true, status: 'verified', method: deep.method, verified_at: deep.verified_at, issues: [] }
@@ -831,6 +886,13 @@ function saveConfig(updates) {
   }
   mkdirSync(dirname(ENV_FILE), { recursive: true });
   writeFileSync(ENV_FILE, lines.filter(Boolean).join('\n') + '\n', 'utf8');
+  hardenFilePermissions(ENV_FILE);
+}
+
+// Secrets and vault files must never be world-readable on a shared machine.
+function hardenFilePermissions(file) {
+  if (process.platform === 'win32') return;
+  try { chmodSync(file, 0o600); } catch {}
 }
 
 function cloudCredentials() {
@@ -857,6 +919,7 @@ function saveCloudVault() {
   if (!vaultPassphrase) throw new Error('Unlock the Capsule Vault before remembering a cloud connection');
   mkdirSync(dirname(CLOUD_VAULT_FILE), { recursive: true });
   writeFileSync(CLOUD_VAULT_FILE, JSON.stringify(sealVault(JSON.stringify(cloudCredentials()), vaultPassphrase)), 'utf8');
+  hardenFilePermissions(CLOUD_VAULT_FILE);
   // Keep only non-secret display settings outside the vault.
   saveConfig({ AI_PROVIDER: cfg.aiProvider, AI_DISPLAY_MODEL: cfg.model, OPENAI_BASE_URL: cfg.openaiBaseUrl, OPENAI_API_KEY: '', ANTHROPIC_API_KEY: '', GEMINI_API_KEY: '' });
 }
@@ -1055,12 +1118,14 @@ async function autoRegisterLocalModels() {
 function parseArgs(argv) {
   const cfg = {
     mode: 'local',
-    // Bind locally by default. Public/LAN exposure should always be explicit.
     host: process.env.HOST || '127.0.0.1',
     port: Number(process.env.PORT || 5173),
     ollamaUrl: (process.env.OLLAMA_URL || 'http://127.0.0.1:11434').replace(/\/+$/, ''),
     authToken: process.env.AUTH_TOKEN || '',
     cloudflaredPath: process.env.CLOUDFLARED_PATH || '',
+    tunnelType: (process.env.TUNNEL_TYPE || 'quick').toLowerCase(),
+    tunnelName: process.env.TUNNEL_NAME || '',
+    denyEgress: process.env.CAPSULE_DENY_EGRESS === '1',
   };
   // Merge saved provider config (data/ai_settings.env) for cross-provider support.
   const env = readConfig();
@@ -1079,6 +1144,9 @@ function parseArgs(argv) {
     else if (a === '--ollama-url' || a === '-u') cfg.ollamaUrl = (next() || cfg.ollamaUrl).replace(/\/+$/, '');
     else if (a === '--auth-token') cfg.authToken = next() || '';
     else if (a === '--cloudflared') cfg.cloudflaredPath = next() || '';
+    else if (a === '--tunnel-type') cfg.tunnelType = (next() || 'quick').toLowerCase();
+    else if (a === '--tunnel-name') cfg.tunnelName = next() || '';
+    else if (a === '--deny-egress') cfg.denyEgress = true;
     else if (a === 'local' || a === 'tunnel') cfg.mode = a;
   }
   if (!Number.isInteger(cfg.port) || cfg.port < 1 || cfg.port > 65535) {
@@ -1089,14 +1157,39 @@ function parseArgs(argv) {
 }
 
 const cfg = parseArgs(process.argv.slice(2));
+// Generous ceilings: enough for interactive use and modest API clients, tight
+// enough to stop an abusive caller from pinning the machine or Ollama.
+const sharedRateLimiter = new RateLimiter({ globalCapacity: 600, perIpCapacity: 150, windowMs: 60_000 });
 const researchEngine = new ResearchEngine({
   dataDir: RESEARCH_DIR,
   complete: researchModelCompletion,
   searxngUrl: process.env.RESEARCH_SEARXNG_URL || '',
+  denyEgress: cfg.denyEgress,
 });
+const chatStore = new ChatStore(CHATS_DIR);
+const mcpClients = new Map();
+const usersFile = process.env.CAPSULE_USERS_FILE || join(DATA_DIR, 'users.json');
+const userStore = new UserStore(usersFile);
+const multiUser = userStore.enabled();
+const USER_CHATS_DIR = join(DATA_DIR, 'users');
+function chatStoreFor(username) {
+  return username ? new ChatStore(join(USER_CHATS_DIR, String(username), 'chats')) : chatStore;
+}
+initEgressLog();
 
 if (cfg.mode === 'tunnel' && !cfg.authToken) {
   throw new Error('Tunnel mode requires AUTH_TOKEN. Example: AUTH_TOKEN="choose-a-long-secret" npm run tunnel');
+}
+
+// A tokenless server must never be reachable beyond loopback. Binding to
+// 0.0.0.0/LAN without a token hands the whole /v1 surface and agent tools to
+// anyone on the network. Fail closed unless the operator explicitly opts out.
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost', '']);
+if (cfg.host && !LOOPBACK_HOSTS.has(String(cfg.host).toLowerCase()) && !cfg.authToken) {
+  if (!process.env.CAPSULE_ALLOW_INSECURE_BIND) {
+    throw new Error(`Refusing to bind a tokenless server on ${cfg.host}. Set AUTH_TOKEN, keep the default loopback host, or set CAPSULE_ALLOW_INSECURE_BIND=1 to take the risk explicitly.`);
+  }
+  console.warn('  ⚠ Binding a tokenless server to ' + cfg.host + ' (CAPSULE_ALLOW_INSECURE_BIND=1). The /v1 API and agent tools will be open to this network.');
 }
 
 // ------------------------------------------------------------------ utilities
@@ -1107,12 +1200,86 @@ const CORS = {
 };
 const RESP_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', ...CORS };
 
+// Defense-in-depth response headers applied to every reply, including proxied
+// streams. The UI is fully self-contained, so a strict CSP costs nothing.
+function securityHeaders() {
+  const scriptSrc = INLINE_SCRIPT_SHA ? `'${INLINE_SCRIPT_SHA}'` : `'self'`;
+  return {
+    'Content-Security-Policy': [
+      `default-src 'self'`,
+      `script-src 'self' ${scriptSrc}`,
+      `style-src 'self' 'unsafe-inline'`,
+      `img-src 'self' data: blob:`,
+      `media-src 'self' blob:`,
+      `connect-src 'self'`,
+      `font-src 'self'`,
+      `object-src 'none'`,
+      `base-uri 'self'`,
+      `form-action 'self'`,
+      `frame-ancestors 'none'`,
+    ].join('; '),
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'no-referrer',
+    'X-Content-Type-Options': 'nosniff',
+    'Cross-Origin-Opener-Policy': 'same-origin',
+  };
+}
+
+// ── Egress logging and deny-egress ────────────────────────────────────────
+let egressLogFile = null;
+function initEgressLog() {
+  if (cfg.mode !== 'tunnel') return;
+  const logDir = join(PORTABLE_ROOT, 'logs');
+  mkdirSync(logDir, { recursive: true });
+  egressLogFile = join(logDir, 'egress.log');
+}
+function logEgress(entry) {
+  if (!egressLogFile) return;
+  try { appendFileSync(egressLogFile, JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n'); } catch {}
+}
+function assertEgressAllowed(targetUrl) {
+  if (!cfg.denyEgress) return;
+  let host;
+  try { host = new URL(targetUrl).hostname; } catch { return; }
+  if (!LOOPBACK_HOSTS.has(host) && host !== 'localhost') throw new Error('Egress denied: CAPSULE_DENY_EGRESS=1 and the target ' + host + ' is not on loopback');
+}
+
 const isWin = () => process.platform === 'win32';
 
 function log(...args) { console.log(new Date().toISOString(), ...args); }
 
+function runChild(cmd, args, { input } = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, { stdio: input != null ? ['pipe', 'ignore', 'pipe'] : ['ignore', 'ignore', 'pipe'] });
+    let err = '';
+    child.stderr.on('data', (d) => { err += d.toString(); });
+    child.on('error', () => resolve(-1));
+    child.on('exit', (code) => { if (err && code !== 0) log(cmd + ' stderr:', err.slice(0, 400)); resolve(code ?? -1); });
+    if (input != null) { child.stdin.end(input + '\n'); }
+  });
+}
+
+// ── Offline speech: whisper.cpp + piper (optional, detected at runtime) ────
+let speechInfo = null;
+function speechSupport() {
+  if (speechInfo) return speechInfo;
+  const whisper = process.env.WHISPER_CLI || findOnPath('whisper-cli') || findOnPath('whisper-cpp') || findOnPath('whisper');
+  const piper = process.env.PIPER_CLI || findOnPath('piper');
+  const whisperModel = process.env.WHISPER_MODEL || join(__dirname, 'models', 'whisper', 'ggml-base.bin');
+  const piperVoice = process.env.PIPER_VOICE || join(__dirname, 'models', 'piper', 'voice.onnx');
+  speechInfo = {
+    whisper: Boolean(whisper && existsSync(whisperModel)),
+    whisper_cli: whisper ? whisper : '',
+    whisper_model: existsSync(whisperModel) ? whisperModel : '',
+    piper: Boolean(piper && existsSync(piperVoice)),
+    piper_cli: piper ? piper : '',
+    piper_voice: existsSync(piperVoice) ? piperVoice : '',
+  };
+  return speechInfo;
+}
+
 function sendJSON(res, code, obj) {
-  res.writeHead(code, RESP_HEADERS);
+  res.writeHead(code, { ...RESP_HEADERS, ...securityHeaders() });
   res.end(JSON.stringify(obj));
 }
 
@@ -1130,6 +1297,20 @@ function readBody(req, maxBytes = 1_000_000) {
       chunks.push(c);
     });
     req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    req.on('error', reject);
+  });
+}
+
+function readRawBody(req, maxBytes = 50_000_000) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    req.on('data', (c) => {
+      size += c.length;
+      if (size > maxBytes) { req.destroy(); reject(new Error('Request body exceeds the 50 MB limit')); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
@@ -1208,6 +1389,22 @@ function findOnPath(name) {
 }
 
 // ------------------------------------------------------------------ handlers
+function extractSessionToken(req) {
+  const header = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+  let cookie = '';
+  try {
+    for (const pair of String(req.headers.cookie || '').split(';').map((s) => s.trim())) {
+      if (pair.startsWith('capsule_session=')) cookie = decodeURIComponent(pair.slice('capsule_session='.length));
+    }
+  } catch {}
+  return header || cookie || '';
+}
+
+function sessionUsername(req) {
+  if (!multiUser) return '';
+  return userStore.resolve(extractSessionToken(req)) || '';
+}
+
 function authorize(req, url) {
   if (!cfg.authToken) return [];
   const header = (req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
@@ -1217,18 +1414,75 @@ function authorize(req, url) {
       if (pair.startsWith('capsule_remote_token=')) cookies.push(decodeURIComponent(pair.slice('capsule_remote_token='.length)));
     }
   } catch {}
-  const query = url.searchParams.get('auth_token') || '';
-  return [header, ...cookies, query].filter(Boolean);
+  // Note: query-string tokens were removed on purpose. A token in the URL
+  // leaks into access logs, browser history, and Referer headers. The bearer
+  // header and the HttpOnly cookie are the only accepted channels now.
+  return [header, ...cookies].filter(Boolean);
 }
 
 async function handle(req, res) {
   const url = new URL(req.url, 'http://localhost');
   const p = url.pathname;
 
+  // Rate-limit the sensitive surfaces. Local interactive use has generous
+  // headroom; shared Remote /v1 access is the main thing we are throttling.
+  const rateLimited =
+    p.startsWith('/api/agent/')
+    || (req.method === 'POST'
+      && (p === '/api/auth/login' || p === '/api/chat' || p === '/api/research' || p === '/api/chatstate' || p.startsWith('/api/speech/') || p.startsWith('/api/models/') || p.startsWith('/api/vault/') || p.startsWith('/api/cloud/') || p.startsWith('/api/agent/') || p.startsWith('/v1/')));
+  if (rateLimited) {
+    const verdict = sharedRateLimiter.check(req);
+    if (!verdict.allowed) return rateLimitResponse(res, verdict.retryAfter);
+  }
+
   // Browsers cannot attach a bearer token to CORS preflight requests.
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, CORS);
+    res.writeHead(204, { ...CORS, ...securityHeaders() });
     return res.end();
+  }
+
+  // ── Multi-user auth (optional) ─────────────────────────────────────────
+  // Off by default: without data/users.json every existing flow is unchanged.
+  // When enabled, /api/auth/* are the only unauthenticated API routes.
+  if (multiUser && p === '/api/auth/login' && req.method === 'POST') {
+    let payload;
+    try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const username = String(payload.username || '').trim().toLowerCase();
+    if (!userStore.verifyLogin(username, payload.password)) return sendJSON(res, 401, { error: 'Invalid username or password' });
+    const token = userStore.issueSession(username);
+    const secure = req.headers['x-forwarded-proto'] === 'https' ? '; Secure' : '';
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Set-Cookie': 'capsule_session=' + encodeURIComponent(token) + '; Path=/; Max-Age=36000; HttpOnly; SameSite=Lax' + secure,
+      ...securityHeaders(),
+    });
+    return res.end(JSON.stringify({ ok: true, username, token }));
+  }
+  if (multiUser && p === '/api/auth/logout' && req.method === 'POST') {
+    const token = extractSessionToken(req);
+    if (token) userStore.invalidate(token);
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Set-Cookie': 'capsule_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax',
+      ...securityHeaders(),
+    });
+    return res.end(JSON.stringify({ ok: true }));
+  }
+  if (multiUser && p === '/api/auth/status' && req.method === 'GET') {
+    return sendJSON(res, 200, { multiUser: true, username: sessionUsername(req) });
+  }
+  if (multiUser && p === '/api/auth/me' && req.method === 'GET') {
+    const username = sessionUsername(req);
+    if (!username) return sendJSON(res, 401, { error: 'Not logged in' });
+    return sendJSON(res, 200, { username });
+  }
+  if (multiUser && (p.startsWith('/remote/') || url.searchParams.has('capsule_key'))) {
+    return sendJSON(res, 403, { error: 'Capsule Remote is disabled when user accounts are enabled' });
+  }
+  if (multiUser && (p.startsWith('/api/') || p.startsWith('/v1/') || p === '/health')) {
+    const username = sessionUsername(req);
+    if (!username) return sendJSON(res, 401, { error: 'Login required', code: 'login_required' });
+    req.username = username;
   }
 
   // Path-based Remote links survive Safari, Messages, email clients, and QR
@@ -1254,6 +1508,7 @@ async function handle(req, res) {
       'Content-Type': 'text/html; charset=utf-8',
       'Set-Cookie': cookie,
       'Cache-Control': 'no-store',
+      ...securityHeaders(),
     });
     return res.end(html);
   }
@@ -1276,6 +1531,7 @@ async function handle(req, res) {
       'Content-Type': 'text/html; charset=utf-8',
       'Set-Cookie': cookie,
       'Cache-Control': 'no-store',
+      ...securityHeaders(),
     });
     return res.end(INDEX_HTML);
   }
@@ -1283,7 +1539,7 @@ async function handle(req, res) {
   // A tunnel hostname by itself is not the private share link. Fail clearly
   // instead of loading a chat shell that can only report a later 401.
   if (req.method === 'GET' && (p === '/' || p === '/index.html') && cfg.authToken && !isDirectLocalRequest(req)) {
-    res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', ...securityHeaders() });
     return res.end('<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1"><title>Incomplete Capsule Remote link</title><body style="margin:0;background:#090b10;color:#edf2fb;font:16px/1.5 system-ui"><main style="max-width:560px;margin:15vh auto;padding:24px"><h1>Incomplete Remote link</h1><p>This is only the Cloudflare address. Open the complete <strong>Private chat link</strong> copied from Capsule Remote on the home computer.</p></main></body>');
   }
 
@@ -1291,12 +1547,12 @@ async function handle(req, res) {
   // All dynamic routes below remain protected.
   if (req.method === 'GET' && (p === '/' || p === '/index.html')) {
     if (INDEX_HTML === null) return sendJSON(res, 500, { error: 'index.html not found' });
-    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', ...securityHeaders() });
     return res.end(INDEX_HTML);
   }
   if (req.method === 'GET' && p === '/capsule-ui.js') {
     if (CAPSULE_UI === null) return sendJSON(res, 500, { error: 'capsule-ui.js not found' });
-    res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store', ...securityHeaders() });
     return res.end(CAPSULE_UI);
   }
 
@@ -1320,6 +1576,76 @@ async function handle(req, res) {
   }
   if ((p.startsWith('/api/cloud/') || p.startsWith('/api/vault/') || p.startsWith('/api/portable/') || p.startsWith('/api/research')) && !isDirectLocalRequest(req)) {
     return sendJSON(res, 403, { error: 'This Capsule control is available only from the local app' });
+  }
+
+  // ── Encrypted chat history store ─────────────────────────────────────────
+  // History belongs to the machine that owns it. A Remote session (tunnel /
+  // shared link) never sees the operator's local conversations: only the
+  // loopback, same-origin app may read or write the chat store. At rest the
+  // workspace is AES-256-GCM sealed with the per-install key under ./data/chats.
+  if (p === '/api/chatstate' && !localControlAllowed(req)) {
+    return sendJSON(res, 403, { error: 'Chat history is available only in the local app' });
+  }
+  if (req.method === 'GET' && p === '/api/chatstate') {
+    const workspace = chatStoreFor(req.username).get();
+    return sendJSON(res, 200, { workspace: workspace ?? { chats: [], projects: [], activeId: '' } });
+  }
+  if (req.method === 'POST' && p === '/api/chatstate') {
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    let payload;
+    try { payload = JSON.parse(body || '{}'); }
+    catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    try {
+      chatStoreFor(req.username).save(payload.workspace);
+      return sendJSON(res, 200, { ok: true });
+    } catch (e) {
+      return sendJSON(res, 400, { error: e.message });
+    }
+  }
+
+  // ── Offline speech: whisper.cpp (STT) and piper (TTS), local-only ─────────
+  if (p.startsWith('/api/speech/') && !localControlAllowed(req)) {
+    return sendJSON(res, 403, { error: 'Speech tools are available only in the local app' });
+  }
+  if (req.method === 'GET' && p === '/api/speech/status') {
+    return sendJSON(res, 200, speechSupport());
+  }
+  if (req.method === 'POST' && p === '/api/speech/transcribe') {
+    const s = speechSupport();
+    if (!s.whisper) return sendJSON(res, 400, { error: 'whisper.cpp not detected. Install whisper-cli and set WHISPER_MODEL.' });
+    let audio = null, lang = 'en';
+    const raw = await readRawBody(req, 50_000_000);
+    try { const j = JSON.parse(raw.toString('utf8')); if (j && typeof j === 'object') { audio = j.audioBase64 ? Buffer.from(j.audioBase64, 'base64') : null; lang = j.lang || lang; } } catch {}
+    if (!audio) audio = raw;
+    if (!audio || !audio.length) return sendJSON(res, 400, { error: 'No audio received' });
+    const tmpRoot = join(DATA_DIR, 'tmp'); mkdirSync(tmpRoot, { recursive: true });
+    const inFile = join(tmpRoot, 'speech-in-' + process.pid + '-' + randomBytes(4).toString('hex') + '.wav');
+    writeFileSync(inFile, audio);
+    try {
+      const outFile = join(tmpRoot, 'speech-out-' + process.pid + '-' + randomBytes(4).toString('hex'));
+      const code = await runChild(s.whisper_cli, ['-m', s.whisper_model, '-f', inFile, '-l', lang, '-otxt', '-of', outFile]);
+      if (code !== 0) return sendJSON(res, 500, { error: 'whisper-cli failed with exit code ' + code });
+      const text = readFileSync(outFile + '.txt', 'utf8').trim();
+      return sendJSON(res, 200, { text });
+    } finally { try { unlinkSync(inFile); } catch {} }
+  }
+  if (req.method === 'POST' && p === '/api/speech/tts') {
+    const s = speechSupport();
+    if (!s.piper) return sendJSON(res, 400, { error: 'piper not detected. Install piper and set PIPER_VOICE.' });
+    let body; try { body = JSON.parse(await readBody(req, 20_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const text = String(body.text || '').trim();
+    if (!text || text.length > 4000) return sendJSON(res, 400, { error: 'text up to 4000 chars required' });
+    const tmpRoot = join(DATA_DIR, 'tmp'); mkdirSync(tmpRoot, { recursive: true });
+    const outFile = join(tmpRoot, 'tts-' + process.pid + '-' + randomBytes(4).toString('hex') + '.wav');
+    try {
+      const code = await runChild(s.piper_cli, ['--model', s.piper_voice, '--output_file', outFile], { input: text });
+      if (code !== 0) return sendJSON(res, 500, { error: 'piper failed with exit code ' + code });
+      const wav = readFileSync(outFile);
+      res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': wav.length, 'Cache-Control': 'no-store' });
+      res.end(wav);
+      return;
+    } finally { try { unlinkSync(outFile); } catch {} }
   }
 
   // ── Health probe (drives the UI connection pill) ─────────────────────────
@@ -1348,7 +1674,7 @@ async function handle(req, res) {
   if (req.method === 'POST' && p === '/api/vault/save') {
     let payload; try { payload = JSON.parse(await readBody(req, 2_000_000)); } catch { return sendJSON(res, 400, { error: 'Invalid vault data' }); }
     if (typeof payload.passphrase !== 'string' || payload.passphrase.length < 12 || typeof payload.data !== 'string') return sendJSON(res, 400, { error: 'Use a passphrase of at least 12 characters' });
-    mkdirSync(dirname(VAULT_FILE), { recursive: true }); writeFileSync(VAULT_FILE, JSON.stringify(sealVault(payload.data, payload.passphrase)), 'utf8');
+    mkdirSync(dirname(VAULT_FILE), { recursive: true }); writeFileSync(VAULT_FILE, JSON.stringify(sealVault(payload.data, payload.passphrase)), 'utf8'); hardenFilePermissions(VAULT_FILE);
     vaultPassphrase = payload.passphrase;
     if (hasCloudCredentials() && !existsSync(CLOUD_VAULT_FILE)) saveCloudVault();
     return sendJSON(res, 200, { ok: true });
@@ -1398,7 +1724,7 @@ async function handle(req, res) {
     const portableModelStorage = Boolean(modelStorage) && pathIsInside(portableModels, modelStorage);
     const storageWritable = writableDirectory(portableRoot) && writableDirectory(DATA_DIR);
     const requiredModels = manifest?.offline_profile?.required_models || 1;
-    const integrity = portableIntegrityReport(__dirname, INTEGRITY_FILE, { platform: runtimeId });
+    const integrity = portableIntegrityReport(__dirname, INTEGRITY_FILE, { platform: runtimeId, allowUnsigned: process.env.CAPSULE_ALLOW_UNSIGNED === '1' });
     let runtimeIndex = null;
     try { runtimeIndex = JSON.parse(readFileSync(RUNTIME_INDEX_FILE, 'utf8')); } catch {}
     const supportedPlatforms = Array.isArray(runtimeIndex?.platforms) ? runtimeIndex.platforms : [];
@@ -1453,7 +1779,7 @@ async function handle(req, res) {
     });
   }
   if (req.method === 'GET' && p === '/api/portable/integrity') {
-    return sendJSON(res, 200, portableIntegrityReport(__dirname, INTEGRITY_FILE));
+    return sendJSON(res, 200, portableIntegrityReport(__dirname, INTEGRITY_FILE, { allowUnsigned: process.env.CAPSULE_ALLOW_UNSIGNED === '1' }));
   }
   if (req.method === 'GET' && p === '/api/portable/handoff-preview') {
     let manifest = {};
@@ -1491,6 +1817,7 @@ async function handle(req, res) {
       'Content-Type': 'image/svg+xml; charset=utf-8',
       'Cache-Control': 'no-store',
       'X-Content-Type-Options': 'nosniff',
+      ...securityHeaders(),
     });
     return res.end(svg);
   }
@@ -1530,11 +1857,20 @@ async function handle(req, res) {
     return sendJSON(res, 200, { reports: researchEngine.list() });
   }
   if (p.startsWith('/api/research/')) {
-    const id = p.slice('/api/research/'.length);
+    let rest = p.slice('/api/research/'.length);
+    const resumeId = rest.endsWith('/resume') ? rest.slice(0, -'/resume'.length) : '';
+    if (resumeId) rest = resumeId;
+    const id = rest;
     if (!/^[a-f0-9-]{30,50}$/i.test(id)) return sendJSON(res, 400, { error: 'Invalid research id' });
     if (req.method === 'DELETE') {
       const cancelled = researchEngine.cancel(id);
       return sendJSON(res, cancelled ? 202 : 409, cancelled ? { ok: true } : { error: 'Research is not running' });
+    }
+    if (resumeId && req.method === 'POST') {
+      if (!localControlAllowed(req)) return sendJSON(res, 403, { error: 'Deep Research is available only in the local app' });
+      if ([...researchEngine.jobs.values()].some((job) => job.status === 'running')) return sendJSON(res, 409, { error: 'Finish or cancel the current research run before starting another' });
+      const resumed = researchEngine.resume(resumeId);
+      return resumed ? sendJSON(res, 202, resumed) : sendJSON(res, 409, { error: 'This report is complete or is not resumable' });
     }
     if (req.method === 'GET') {
       const result = researchEngine.get(id, url.searchParams.get('include') === 'report');
@@ -1602,6 +1938,20 @@ async function handle(req, res) {
   if (p.startsWith('/api/agent/')) {
     if (!agentToolsAllowed(req)) return sendJSON(res, 403, { error: 'Agent tools are available only from the local app, never through a tunnel.' });
 
+    if (req.method === 'GET' && p === '/api/agent/tools') {
+      const mcpTools = [];
+      for (const [clientId, client] of mcpClients) {
+        for (const t of client.tools) mcpTools.push({ clientId, server: client.serverInfo?.name || clientId, name: t.name, description: t.description });
+      }
+      const brief = [];
+      brief.push('Available agent tools (each requires explicit human approval in the UI):');
+      brief.push('  /api/agent/files   GET  read a file or list a folder inside the workspace');
+      brief.push('  /api/agent/write   POST write a file inside the workspace (approval: write)');
+      brief.push('  /api/agent/command POST run a shell command (approval: run, 30s cap)');
+      for (const t of mcpTools) brief.push('  MCP ' + t.name + ' via ' + t.server + (t.description ? ' — ' + t.description : ''));
+      return sendJSON(res, 200, { tools: { files: 'read a file or list a folder in the workspace', write: 'write a file in the workspace', command: 'run a shell command' }, mcp: mcpTools, brief: brief.join('\n') });
+    }
+
     if (req.method === 'GET' && p === '/api/agent/files') {
       try {
         const target = agentWorkspacePath(url.searchParams.get('path') || '');
@@ -1647,6 +1997,236 @@ async function handle(req, res) {
         proc.on('close', (code) => { clearTimeout(timer); resolve({ ok: !timedOut && code === 0, code, timedOut, stdout, stderr }); });
       });
       return sendJSON(res, 200, output);
+    }
+
+    // ── MCP: Model Context Protocol servers (stdio) ──────────────────────
+    if (p === '/api/agent/mcp/register') {
+      let payload;
+      try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      const { command, args = [], env = {}, id: requestedId } = payload;
+      if (!command || typeof command !== 'string') return sendJSON(res, 400, { error: 'command is required' });
+      const clientId = requestedId || 'mcp-' + randomBytes(4).toString('hex');
+      if (mcpClients.has(clientId)) return sendJSON(res, 409, { error: 'Client ID already registered. Use /api/agent/mcp/unregister first.' });
+      const client = new McpClient({ command, args, env });
+      try {
+        await client.connect();
+        mcpClients.set(clientId, client);
+        return sendJSON(res, 200, { id: clientId, serverInfo: client.serverInfo, tools: client.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) });
+      } catch (e) {
+        try { await client.close(); } catch {}
+        return sendJSON(res, 502, { error: 'MCP server failed to start: ' + e.message });
+      }
+    }
+    if (p === '/api/agent/mcp/list') {
+      const result = [];
+      for (const [id, client] of mcpClients) {
+        result.push({ id, serverInfo: client.serverInfo, tools: client.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) });
+      }
+      return sendJSON(res, 200, { clients: result });
+    }
+    if (p === '/api/agent/mcp/call') {
+      let payload;
+      try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      const { clientId, tool, arguments: args = {} } = payload;
+      if (!clientId || !tool) return sendJSON(res, 400, { error: 'clientId and tool are required' });
+      const client = mcpClients.get(clientId);
+      if (!client) return sendJSON(res, 404, { error: 'MCP client not found: ' + clientId });
+      try {
+        const result = await client.callTool(tool, args);
+        return sendJSON(res, 200, { result });
+      } catch (e) { return sendJSON(res, 502, { error: e.message }); }
+    }
+    if (p === '/api/agent/mcp/unregister') {
+      let payload;
+      try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      const { id: clientId } = payload;
+      if (!clientId) return sendJSON(res, 400, { error: 'id is required' });
+      const client = mcpClients.get(clientId);
+      if (!client) return sendJSON(res, 404, { error: 'MCP client not found: ' + clientId });
+      await client.close();
+      mcpClients.delete(clientId);
+      return sendJSON(res, 200, { ok: true });
+    }
+
+    // ── Agent loop: autonomous observe→think→act cycle ────────────────────
+    if (req.method === 'POST' && p === '/api/agent/loop') {
+      let payload;
+      try { payload = JSON.parse(await readBody(req, 50_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      const task = String(payload.task || '').trim();
+      if (!task) return sendJSON(res, 400, { error: 'task is required' });
+      if (task.length > 20_000) return sendJSON(res, 400, { error: 'task too long (max 20000 chars)' });
+      const model = String(payload.model || cfg.model || '').trim();
+      if (!model) return sendJSON(res, 400, { error: 'model is required' });
+      const autonomy = ['supervised', 'selective', 'auto'].includes(payload.autonomy) ? payload.autonomy : 'selective';
+      const skillPrompt = String(payload.skill_prompt || '').trim();
+
+      // Set up SSE response
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        ...CORS,
+        ...securityHeaders(),
+      });
+      const sendSSE = (data) => { try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch {} };
+
+      // Track active agent loops for cancellation
+      const loopId = 'agent-' + randomBytes(8).toString('hex');
+      const controller = new AbortController();
+      activeAgentLoops.set(loopId, controller);
+      sendSSE({ type: 'loop_started', loop_id: loopId });
+
+      // Approval tracking (shared with /api/agent/approve endpoint)
+      let approvalIdCounter = 0;
+
+      // LLM call function
+      const llmCall = async (messages, tools) => {
+        const headers = { 'Content-Type': 'application/json' };
+        if (process.env.OLLAMA_API_KEY) headers.Authorization = 'Bearer ' + process.env.OLLAMA_API_KEY;
+        const numCtx = await ollamaContextFor(model);
+        const response = await fetch(cfg.ollamaUrl + '/api/chat', {
+          method: 'POST', headers, signal: controller.signal,
+          body: JSON.stringify({
+            model, messages, stream: false, temperature: 0.3, options: { num_ctx: numCtx },
+            tools: tools.map(t => ({ type: 'function', function: t.function })),
+          }),
+        });
+        if (!response.ok) throw new Error(`Model returned HTTP ${response.status}`);
+        const data = await response.json();
+        const message = data.message || {};
+        return {
+          content: message.content || '',
+          tool_calls: (message.tool_calls || []).map(tc => {
+            const raw = tc.function?.arguments;
+            let arguments_ = {};
+            if (typeof raw === 'string') { try { arguments_ = JSON.parse(raw); } catch {} }
+            else if (raw && typeof raw === 'object') arguments_ = raw;
+            return { name: tc.function?.name || tc.name, arguments: arguments_ };
+          }),
+        };
+      };
+
+      // Event handler
+      const onEvent = (event) => {
+        if (event.type === 'waiting_approval') {
+          const approvalId = 'appr-' + (++approvalIdCounter);
+          pendingApprovalsGlobal.set(approvalId, event.resolve);
+          sendSSE({
+            type: 'approval_needed',
+            approval_id: approvalId,
+            name: event.name,
+            arguments: event.arguments,
+          });
+          return;
+        }
+        sendSSE(event);
+      };
+
+      // Run the loop
+      try {
+        const result = await runAgentLoop({
+          task, model, workspaceRoot: __dirname, autonomy, skillPrompt,
+          onEvent, llmCall, signal: controller.signal,
+        });
+        sendSSE({ type: 'loop_complete', ...result });
+      } catch (e) {
+        if (e?.name === 'AbortError' || controller.signal.aborted) {
+          sendSSE({ type: 'loop_complete', status: 'cancelled' });
+        } else {
+          sendSSE({ type: 'loop_complete', status: 'error', error: e.message });
+        }
+      } finally {
+        activeAgentLoops.delete(loopId);
+        res.end();
+      }
+      return;
+    }
+
+    // ── Agent loop approval endpoint ────────────────────────────────────────
+    if (req.method === 'POST' && p === '/api/agent/approve') {
+      let payload;
+      try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      const { approval_id, approved } = payload;
+      if (!approval_id) return sendJSON(res, 400, { error: 'approval_id is required' });
+      const resolve = pendingApprovalsGlobal.get(approval_id);
+      if (!resolve) return sendJSON(res, 404, { error: 'Approval not found or already resolved' });
+      pendingApprovalsGlobal.delete(approval_id);
+      resolve(Boolean(approved));
+      return sendJSON(res, 200, { ok: true });
+    }
+
+    // ── Agent loop cancellation ─────────────────────────────────────────────
+    if (req.method === 'POST' && p === '/api/agent/cancel') {
+      let payload;
+      try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      const { loop_id } = payload;
+      if (loop_id) {
+        const ctrl = activeAgentLoops.get(loop_id);
+        if (ctrl) { ctrl.abort(); activeAgentLoops.delete(loop_id); return sendJSON(res, 200, { ok: true }); }
+      }
+      return sendJSON(res, 404, { error: 'Loop not found' });
+    }
+
+    // ── Agent: web search tool ──────────────────────────────────────────────
+    if (req.method === 'POST' && p === '/api/agent/web-search') {
+      let payload;
+      try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      const results = await webSearch(payload.query || '', payload.num_results || 5);
+      return sendJSON(res, 200, { results });
+    }
+
+    // ── Agent: web fetch tool ───────────────────────────────────────────────
+    if (req.method === 'POST' && p === '/api/agent/web-fetch') {
+      let payload;
+      try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      const result = await webFetchPage(payload.url || '');
+      return sendJSON(res, 200, result);
+    }
+
+    // ── Agent: grep search tool ─────────────────────────────────────────────
+    if (req.method === 'POST' && p === '/api/agent/grep') {
+      let payload;
+      try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      try {
+        const target = agentWorkspacePath(payload.path || '');
+        const regex = new RegExp(payload.pattern || '', 'i');
+        const { readdirSync: rs, readFileSync: rf } = await import('fs');
+        const results = [];
+        function walk(dir) {
+          let entries;
+          try { entries = rs(dir, { withFileTypes: true }); } catch { return; }
+          for (const e of entries) {
+            if (e.name === '.git' || e.name === 'node_modules' || e.name === '.portable') continue;
+            const full = join(dir, e.name);
+            const rel = relative(__dirname, full);
+            if (e.isDirectory()) { walk(full); continue; }
+            if (payload.include) {
+              const incRegex = new RegExp('^' + payload.include.replace(/\*/g, '.*').replace(/\?/g, '.') + '$');
+              if (!incRegex.test(e.name)) continue;
+            }
+            try {
+              const content = rf(full, 'utf8');
+              const lines = content.split('\n');
+              const matches = [];
+              for (let i = 0; i < lines.length; i++) {
+                if (regex.test(lines[i])) {
+                  matches.push({ line: i + 1, text: lines[i].trim().slice(0, 200) });
+                  if (matches.length >= 15) break;
+                }
+              }
+              if (matches.length) results.push({ file: rel, matches });
+              if (results.length >= 25) return;
+            } catch {}
+          }
+        }
+        walk(target);
+        return sendJSON(res, 200, { results });
+      } catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    }
+
+    // ── Agent: skills list ──────────────────────────────────────────────────
+    if (req.method === 'GET' && p === '/api/agent/skills') {
+      return sendJSON(res, 200, { skills: Object.entries(SKILL_PROMPTS).map(([id, prompt]) => ({ id, prompt })) });
     }
 
     return sendJSON(res, 404, { error: 'Unknown agent tool' });
@@ -2130,6 +2710,19 @@ async function handle(req, res) {
     if (isCloudProvider()) return proxyCloud(req.method, p, body, res);
     return proxyV1(req.method, p, body, res);
   }
+  if (req.method === 'POST' && p === '/v1/responses') {
+    if (isCloudProvider() && cfg.aiProvider === 'openai') {
+      let cloudBody;
+      try { cloudBody = await readBody(req); } catch (e) { return sendJSON(res, 400, { error: e.message }); }
+      return proxyCloud(req.method, p, cloudBody, res);
+    }
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    let payload;
+    try { payload = JSON.parse(body || '{}'); }
+    catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    return streamResponsesLocal(payload, res);
+  }
   if (p.startsWith('/v1/')) {
     let body = null;
     if (req.method !== 'GET') { try { body = await readBody(req); } catch {} }
@@ -2151,16 +2744,18 @@ async function researchModelCompletion({ model, messages, signal }) {
   const abort = () => controller.abort();
   signal?.addEventListener('abort', abort, { once: true });
   const releaseGeneration = beginOllamaGeneration(model);
+  if (!releaseGeneration) throw new Error('The local model has reached its concurrent-generation limit. Try research again in a moment.');
   try {
     const headers = { 'Content-Type': 'application/json' };
     if (process.env.OLLAMA_API_KEY) headers.Authorization = 'Bearer ' + process.env.OLLAMA_API_KEY;
-    const response = await fetch(cfg.ollamaUrl + '/v1/chat/completions', {
+    const numCtx = await ollamaContextFor(model);
+    const response = await fetch(cfg.ollamaUrl + '/api/chat', {
       method: 'POST', headers, signal: controller.signal,
-      body: JSON.stringify({ model, messages, stream: false, temperature: 0.2 }),
+      body: JSON.stringify({ model, messages, stream: false, temperature: 0.2, options: { num_ctx: numCtx } }),
     });
     if (!response.ok) throw new Error(`Local model returned HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`);
     const data = await response.json();
-    const content = data.choices?.[0]?.message?.content;
+    const content = data.message?.content;
     if (!content) throw new Error('The local model returned an empty research step');
     return content;
   } catch (error) {
@@ -2204,8 +2799,20 @@ async function proxyV1(method, path, body, res) {
   if (inferenceRequest) {
     try { requestedModel = JSON.parse(body || '{}').model || ''; } catch {}
     if (modelUnloadActive) return sendJSON(res, 409, { error: 'A model memory operation is running. Try the request again in a moment.' });
+    // Clamp token ceilings so a client cannot spike context far beyond what the
+    // local machine can fit in memory.
+    try {
+      const parsed = JSON.parse(body || '{}');
+      if (parsed && Number.isFinite(Number(parsed.max_tokens))) {
+        parsed.max_tokens = Math.min(Math.max(1, Math.round(Number(parsed.max_tokens))), MAX_REQUEST_TOKENS);
+        body = JSON.stringify(parsed);
+      }
+    } catch {}
   }
   const releaseGeneration = inferenceRequest ? beginOllamaGeneration(requestedModel) : () => {};
+  if (inferenceRequest && !releaseGeneration) {
+    return sendJSON(res, 429, { error: 'The local model has reached its concurrent-generation limit. Try again shortly.' });
+  }
   try {
     const headers = { Accept: '*/*' };
     const upKey = process.env.OLLAMA_API_KEY;
@@ -2222,6 +2829,7 @@ async function proxyV1(method, path, body, res) {
       if (val) res.setHeader(k, val);
     }
     for (const [k, v] of Object.entries(CORS)) res.setHeader(k, v);
+    for (const [k, v] of Object.entries(securityHeaders())) res.setHeader(k, v);
     res.writeHead(r.status);
     await pipeline(Readable.fromWeb(r.body), res);
   } catch (e) {
@@ -2240,7 +2848,13 @@ function anthropicBase() {
 function geminiUrl(model, stream) {
   const m = model || 'gemini-2.0-pro-exp-02-05';
   const op = stream ? 'streamGenerateContent' : 'generateContent';
-  return `https://generativelanguage.googleapis.com/v1beta/models/${m}:${op}?key=${cfg.geminiApiKey}`;
+  // Key deliberately NOT in the URL: query strings survive proxy and gateway
+  // logs. Gemini accepts it as the x-goog-api-key header instead.
+  return `https://generativelanguage.googleapis.com/v1beta/models/${m}:${op}`;
+}
+
+function geminiHeaders() {
+  return cfg.geminiApiKey ? { 'x-goog-api-key': cfg.geminiApiKey } : {};
 }
 
 function openaiBase() {
@@ -2276,8 +2890,10 @@ async function proxyCloud(method, path, body, res) {
   if (!mapped) return sendJSON(res, 404, { error: 'Unsupported endpoint for provider: ' + cfg.aiProvider });
   const { url, headers } = mapped;
   try {
+    assertEgressAllowed(url);
     const h = { ...(mapped.body != null ? { 'Content-Type': 'application/json' } : {}), ...headers };
     const r = await fetch(url, { method, headers: h, ...(mapped.body != null ? { body: mapped.body } : {}) });
+    logEgress({ provider: cfg.aiProvider, path, status: r.status, target: url });
     for (const [k, v] of ['content-type', 'cache-control', 'connection', 'transfer-encoding']) {
       const val = r.headers.get(k);
       if (val) res.setHeader(k, val);
@@ -2326,8 +2942,8 @@ function mapProviderPath(path, method, body) {
   if (cfg.aiProvider === 'gemini') {
     if (path === '/v1/models') {
       return {
-        url: `https://generativelanguage.googleapis.com/v1beta/models?key=${cfg.geminiApiKey}`,
-        headers: {},
+        url: `https://generativelanguage.googleapis.com/v1beta/models`,
+        headers: geminiHeaders(),
         body: null,
       };
     }
@@ -2336,15 +2952,66 @@ function mapProviderPath(path, method, body) {
     const { contents, system } = toGeminiContents(payload.messages || []);
     const gp = { contents };
     if (system) gp.system_instruction = { parts: [{ text: system }] };
-    return { url: geminiUrl(model, stream), headers: {}, body: JSON.stringify(gp) };
+    return { url: geminiUrl(model, stream), headers: geminiHeaders(), body: JSON.stringify(gp) };
   }
 
   return null;
 }
 
+// Read an SSE response incrementally instead of buffering the whole body.
+// `onLine` receives each parsed `data:` payload; returning true stops the read.
+// Returns true when an onLine handler asked to stop.
+async function consumeSseLines(response, byteLimit, onLine) {
+  if (!response.body?.getReader) {
+    const text = await response.text();
+    if (Buffer.byteLength(text) > byteLimit) throw new Error('Streamed response exceeded the size limit');
+    for (const line of text.split('\n')) {
+      if (!line.startsWith('data: ')) continue;
+      const raw = line.slice(6).trim();
+      if (raw && onLine(raw)) return true;
+    }
+    return false;
+  }
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '',
+    total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > byteLimit) {
+      await reader.cancel();
+      throw new Error('Streamed response exceeded the size limit');
+    }
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const raw = line.slice(6).trim();
+      if (raw && onLine(raw)) {
+        await reader.cancel();
+        return true;
+      }
+    }
+  }
+  if (buffer) {
+    const line = buffer.trim();
+    if (line.startsWith('data: ')) {
+      const raw = line.slice(6).trim();
+      if (raw) onLine(raw);
+    }
+  }
+  return false;
+}
+
 // Native streaming chat for the bundled UI. Emits OpenAI-style SSE tokens.
 async function streamChat(payload, res) {
   const provider = payload.mode === 'local' ? 'ollama' : (cfg.aiProvider || 'ollama');
+  if (payload.privacy === 'local' && provider !== 'ollama') {
+    return sendJSON(res, 403, { error: 'This chat is set to local-only. Cloud requests are blocked.' });
+  }
   // Cloud mode is a clean-room boundary: only the current user message may
   // leave the Capsule. Local history, project excerpts, prompts, and tool
   // output are discarded server-side even if a browser misbehaves.
@@ -2362,6 +3029,7 @@ async function streamChat(payload, res) {
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
     ...CORS,
+    ...securityHeaders(),
   });
   const sendSSE = (data) => { try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch {} };
   const finish = (fullText) => { sendSSE({ type: 'done', fullText }); res.end(); };
@@ -2386,45 +3054,41 @@ async function streamChat(payload, res) {
     try {
       const r = await fetch(anthropicBase() + '/messages', { method: 'POST', headers, body });
       if (!r.ok) return fail('Anthropic HTTP ' + r.status + ': ' + await r.text().then(t => t.slice(0, 300)));
-      const text = await r.text();
-      for (const line of text.split('\n')) {
-        if (!line.startsWith('data: ')) continue;
-        const raw = line.slice(6).trim();
-        if (raw === '[DONE]') continue;
+      const aborted = await consumeSseLines(r, 50_000_000, (raw) => {
+        if (raw === '[DONE]') return;
         try {
           const parsed = JSON.parse(raw);
           const delta = parsed.delta?.text || '';
-          if (parsed.type === 'error') return fail(parsed.error?.message || 'Anthropic stream error');
+          if (parsed.type === 'error') { fail(parsed.error?.message || 'Anthropic stream error'); return true; }
           if (delta) { fullText += delta; sendSSE({ type: 'delta', content: delta }); }
         } catch {}
-      }
-      return finish(fullText);
+      });
+      if (!aborted) return finish(fullText);
     } catch (e) { return fail(e.message); }
+    return;
   }
 
   if (provider === 'gemini') {
     const model = payload.model || cfg.model || 'gemini-2.0-pro-exp-02-05';
     const { contents, system } = toGeminiContents(messages);
     const body = JSON.stringify({ contents, ...(system ? { system_instruction: { parts: [{ text: system }] } } : {}) });
-    const headers = { 'Content-Type': 'application/json' };
+    const headers = { 'Content-Type': 'application/json', ...geminiHeaders() };
     let fullText = '';
     try {
       const r = await fetch(geminiUrl(model, true), { method: 'POST', headers, body });
       if (!r.ok) return fail('Gemini HTTP ' + r.status + ': ' + await r.text().then(t => t.slice(0, 300)));
-      const chunks = await r.text();
-      // Gemini SSE: each data line is a JSON object; text lives in candidates[].content.parts[].text
-      for (const line of chunks.split('\n')) {
-        if (!line.startsWith('data: ')) continue;
+      const aborted = await consumeSseLines(r, 50_000_000, (raw) => {
         try {
-          const parsed = JSON.parse(line.slice(6).trim());
+          const parsed = JSON.parse(raw);
           const parts = parsed.candidates?.[0]?.content?.parts || [];
           for (const prt of parts) {
             if (prt.text) { fullText += prt.text; sendSSE({ type: 'delta', content: prt.text }); }
           }
         } catch {}
-      }
-      return finish(fullText);
+      });
+      if (!aborted) return finish(fullText);
     } catch (e) { return fail(e.message); }
+    return;
   }
 
   // OpenAI-compatible: OpenAI / OpenRouter / Ollama / LM Studio / custom API.
@@ -2433,7 +3097,9 @@ async function streamChat(payload, res) {
     : openaiBase();
   const apiKey = provider === 'ollama' ? (process.env.OLLAMA_API_KEY || '') : cfg.openaiApiKey;
   const model = payload.model || cfg.model || '';
-  const body = JSON.stringify({ model, messages, stream: true });
+  // Clamp requested output length; huge contexts are multigigabyte in RAM.
+  const maxTokens = Math.min(Math.max(1, Math.round(Number(payload.max_tokens) || 1024)), MAX_REQUEST_TOKENS);
+  const body = JSON.stringify({ model, messages, stream: true, max_tokens: maxTokens });
   const headers = {
     'Content-Type': 'application/json',
     ...(apiKey ? { 'Authorization': 'Bearer ' + apiKey } : {}),
@@ -2444,6 +3110,7 @@ async function streamChat(payload, res) {
   }
   let fullText = '';
   const releaseGeneration = provider === 'ollama' ? beginOllamaGeneration(model) : () => {};
+  if (provider === 'ollama' && !releaseGeneration) return fail('The local model is busy. Try again in a moment.');
   const upstreamController = provider === 'ollama' ? new AbortController() : null;
   const abortUpstream = () => upstreamController?.abort();
   if (upstreamController) res.once('close', abortUpstream);
@@ -2485,14 +3152,144 @@ async function streamChat(payload, res) {
 }
 
 // ------------------------------------------------------- tunnel support
+// OpenAI Responses API → local Ollama chat-completions for agent backends.
+async function streamResponsesLocal(payload, res) {
+  const model = payload.model || cfg.model;
+  const messages = [];
+  if (payload.instructions) messages.push({ role: 'system', content: String(payload.instructions).slice(0, 20_000) });
+  const input = payload.input;
+  if (typeof input === 'string') {
+    if (input.trim()) messages.push({ role: 'user', content: input.slice(0, 200_000) });
+  } else if (Array.isArray(input)) {
+    for (const item of input) {
+      if (!item || typeof item !== 'object') continue;
+      if (item.type === 'message' && (item.role === 'user' || item.role === 'assistant')) {
+        const text = (Array.isArray(item.content) ? item.content
+          .filter((p) => p && (p.type === 'input_text' || p.type === 'output_text' || p.type === 'text'))
+          .map((p) => p.text || '') : [])
+          .join('');
+        if (text.trim()) messages.push({ role: item.role, content: text.slice(0, 200_000) });
+      } else if (item.type === 'function_call' && item.name) {
+        messages.push({ role: 'assistant', content: '', tool_calls: [{ id: item.call_id || item.id || item.name, type: 'function', function: { name: item.name, arguments: JSON.stringify(item.arguments || {}) } }] });
+      } else if (item.type === 'function_call_output') {
+        messages.push({ role: 'tool', tool_call_id: String(item.call_id || ''), content: String(item.output ?? '').slice(0, 100_000) });
+      }
+    }
+  }
+  if (!messages.length) return sendJSON(res, 400, { error: 'Responses input produced no messages' });
+  const tools = (payload.tools || [])
+    .filter((t) => t && t.type === 'function' && t.name)
+    .map((t) => ({ type: 'function', function: { name: t.name, description: t.description || '', parameters: t.parameters || { type: 'object', properties: {} } } }));
+  const body = JSON.stringify({ model, messages, stream: payload.stream === true, temperature: payload.temperature ?? 0.7, top_p: payload.top_p, ...(tools.length ? { tools } : {}) });
+  const headers = { 'Content-Type': 'application/json' };
+  if (process.env.OLLAMA_API_KEY) headers.Authorization = 'Bearer ' + process.env.OLLAMA_API_KEY;
+
+  const release = beginOllamaGeneration(model);
+  if (!release) return sendJSON(res, 503, { error: 'The local model is busy. Try again in a moment.' });
+  try {
+    const r = await upstreamRequest('POST', '/v1/chat/completions', { body, headers, timeout: 300_000 });
+    if (!r.ok) return sendJSON(res, 502, { error: 'Local model HTTP ' + r.status + ': ' + (await r.text()).slice(0, 300) });
+    const responseId = 'resp_' + randomBytes(8).toString('hex');
+    const sendSSE = (data) => { try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch {} };
+    const done = () => { sendSSE({ type: 'done' }); res.end(); };
+
+    if (payload.stream === true) {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', ...CORS, ...securityHeaders() });
+      sendSSE({ type: 'response.created', response: { id: responseId, object: 'response', model, status: 'in_progress' } });
+      sendSSE({ type: 'response.output_item.added', item: { id: 'msg_' + randomBytes(8).toString('hex'), type: 'message', role: 'assistant' } });
+      sendSSE({ type: 'response.content_part.added', part: { type: 'output_text', text: '' } });
+      const reader = r.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '', full = '', toolCalls = [];
+      const emitTool = (parts) => {
+        for (const tc of parts) {
+          let entry = toolCalls.find((x) => x.index === tc.index);
+          if (!entry) { entry = { index: tc.index, id: 'fc_' + randomBytes(6).toString('hex'), name: '', arguments: '' }; toolCalls.push(entry); }
+          if (tc.id) entry.id = tc.id;
+          if (tc.function?.name) entry.name = tc.function.name;
+          if (tc.function?.arguments) entry.arguments += tc.function.arguments;
+        }
+      };
+      for (;;) {
+        const { done: dn, value } = await reader.read();
+        if (dn) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n'); buffer = lines.pop() || '';
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const raw = line.slice(6).trim();
+          if (!raw || raw === '[DONE]') continue;
+          try {
+            const parsed = JSON.parse(raw);
+            const delta = parsed.choices?.[0]?.delta || {};
+            if (delta.content) {
+              full += delta.content;
+              sendSSE({ type: 'response.output_text.delta', delta: delta.content });
+            }
+            if (delta.tool_calls?.length) emitTool(delta.tool_calls);
+          } catch {}
+        }
+      }
+      if (buffer) {
+        const raw = buffer.replace(/^data: /, '').trim();
+        if (raw && raw !== '[DONE]') { try { const parsed = JSON.parse(raw); const delta = parsed.choices?.[0]?.delta || {}; if (delta.content) { full += delta.content; sendSSE({ type: 'response.output_text.delta', delta: delta.content }); } if (delta.tool_calls?.length) emitTool(delta.tool_calls); } catch {} }
+      }
+      sendSSE({ type: 'response.content_part.done', part: { type: 'output_text', text: full } });
+      if (toolCalls.length) {
+        for (const tc of toolCalls) sendSSE({ type: 'response.output_item.added', item: { id: tc.id, call_id: tc.id, type: 'function_call', status: 'completed', name: tc.name, arguments: tc.arguments, output: null } });
+      }
+      sendSSE({ type: 'response.output_item.done' });
+      sendSSE({ type: 'response.completed', response: { id: responseId, object: 'response', model, status: 'completed', output: toolCalls.length ? [{ type: 'function_call', name: toolCalls.map((t) => t.name).join(', ') }] : [{ type: 'message', role: 'assistant', content: [{ type: 'output_text', text: full }] }] } });
+      return done();
+    }
+
+    const data = await r.json();
+    const choice = data.choices?.[0];
+    const text = choice?.message?.content || '';
+    const toolCalls = choice?.message?.tool_calls || [];
+    const output = [];
+    if (toolCalls.length) {
+      for (const tc of toolCalls) output.push({ id: tc.id || 'fc_' + randomBytes(6).toString('hex'), call_id: tc.id || tc.function?.name, type: 'function_call', status: 'completed', name: tc.function?.name, arguments: JSON.stringify(tc.function?.arguments || {}), output: null });
+    } else if (text) {
+      output.push({ id: 'msg_' + randomBytes(8).toString('hex'), type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text }] });
+    }
+    return sendJSON(res, 200, { id: responseId, object: 'response', model, status: 'completed', output, usage: data.usage || {} });
+  } catch (e) {
+    return sendJSON(res, 502, { error: 'Responses proxy error: ' + e.message });
+  } finally { release(); }
+}
+
+// ------------------------------------------------------- tunnel support
 function bundledBin() {
   return join(DATA_DIR, 'bin', isWin() ? 'cloudflared.exe' : 'cloudflared');
 }
 
-function spawnCloudflared() {
+function spawnTunnel() {
+  if (cfg.tunnelType === 'tailscale') {
+    const tailscale = findOnPath('tailscale');
+    if (!tailscale) return null;
+    const child = spawn(tailscale, ['funnel', String(cfg.port)], { stdio: ['ignore', 'pipe', 'pipe'] });
+    child.stdout.on('data', (d) => {
+      const line = d.toString();
+      const m = line.match(/https?:\/\/[a-z0-9.-]+\.ts\.net[^\s]*/i);
+      if (m) { remoteTunnel.url = m[0]; console.log('\n  🌍 Public URL (Tailscale Funnel): ' + m[0] + '\n'); }
+      process.stdout.write(line);
+    });
+    child.stderr.on('data', (d) => { const line = d.toString(); const m = line.match(/https?:\/\/[a-z0-9.-]+\.ts\.net[^\s]*/i); if (m) remoteTunnel.url = m[0]; process.stderr.write(line); });
+    child.on('error', (e) => log('tailscale error:', e.message));
+    child.on('exit', (c) => { if (remoteTunnel.child === child) stopRemote('ended'); log('tailscale exited with code', c); });
+    remoteTunnel.child = child;
+    return child;
+  }
+
   const found = cfg.cloudflaredPath || findOnPath('cloudflared') || (existsSync(bundledBin()) ? bundledBin() : '');
   if (!found) return null;
+
   const args = ['tunnel', '--url', 'http://localhost:' + cfg.port, '--no-autoupdate'];
+  if (cfg.tunnelType === 'named') {
+    if (!cfg.tunnelName) { console.log('⚠ Named tunnel requires --tunnel-name or TUNNEL_NAME env'); return null; }
+    args.push(cfg.tunnelName);
+  }
   const child = spawn(found, args, { stdio: ['ignore', 'pipe', 'pipe'] });
   child.stdout.on('data', (d) => {
     const line = d.toString();
@@ -2513,21 +3310,34 @@ function spawnCloudflared() {
 async function downloadCloudflared() {
   const cwd = join(DATA_DIR, 'bin');
   mkdirSync(cwd, { recursive: true });
-  let asset;
-  if (isWin()) asset = 'cloudflared-windows-amd64.exe';
-  else if (process.platform === 'darwin')
-    asset = process.arch === 'arm64' ? 'cloudflared-darwin-arm64.tgz' : 'cloudflared-darwin-amd64.tgz';
-  else asset = process.arch === 'arm64' ? 'cloudflared-linux-arm64' : 'cloudflared-linux-amd64';
-
-  const url = 'https://github.com/cloudflare/cloudflared/releases/latest/download/' + asset;
+  const manifestPath = join(__dirname, 'cloud', 'cloudflared-manifest.json');
+  let manifest;
+  try {
+    manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  } catch {
+    throw new Error('cloudflared manifest missing or invalid at ' + manifestPath + ' — refusing to download an unpinned binary. Run tools/update-cloudflared-manifest.mjs to pin a release.');
+  }
+  const key = process.platform + '-' + (process.arch === 'x64' ? 'x64' : process.arch);
+  const entry = manifest.assets && manifest.assets[key];
+  if (!entry || !entry.sha256) throw new Error('No pinned cloudflared asset for ' + key + ' in ' + manifestPath + ' — refusing an unpinned download.');
   const dest = bundledBin();
   const downloadTmp = dest + '.download-' + process.pid + '-' + randomBytes(6).toString('hex');
   const executableTmp = process.platform === 'darwin' ? downloadTmp + '.executable' : downloadTmp;
-  console.log('  ⬇  Downloading Cloudflare tunnel binary (' + asset + ') …');
+  console.log('  ⬇  Downloading Cloudflare tunnel binary ' + manifest.version + ' (' + entry.asset + ') …');
+  const url = manifest.base_url.replace('{version}', manifest.version).replace('{asset}', entry.asset);
   try {
     const r = await fetch(url);
     if (!r.ok) throw new Error('Download failed: HTTP ' + r.status);
     await pipeline(Readable.fromWeb(r.body), createWriteStream(downloadTmp));
+    const reporter = createHash('sha256');
+    await pipeline(createReadStream(downloadTmp), new Transform({
+      transform(chunk, _enc, cb) { reporter.update(chunk); cb(); }
+    }));
+    const digest = reporter.digest('hex');
+    if (digest !== entry.sha256) throw new Error(
+      'SHA-256 mismatch for ' + entry.asset + '\n  got      ' + digest + '\n  expected ' + entry.sha256 +
+      '\nRefusing to use an unverified binary. Re-run tools/update-cloudflared-manifest.mjs if upstream re-released.'
+    );
     if (process.platform === 'darwin') {
       const extractDir = downloadTmp + '.dir';
       mkdirSync(extractDir, { recursive: true });
@@ -2547,7 +3357,7 @@ async function downloadCloudflared() {
       try { existsSync(executableTmp) && unlinkSync(executableTmp); } catch {}
     }
   }
-  console.log('  ✅  Saved to ' + dest);
+  console.log('  ✅  Saved to ' + dest + ' (sha256 verified, ' + entry.sha256.slice(0, 16) + '…)');
   return dest;
 }
 
@@ -2688,12 +3498,12 @@ async function startTunnel() {
   if (remoteTunnel.child) return remoteTunnel.child;
   if (tunnelStartPromise) return tunnelStartPromise;
   tunnelStartPromise = (async () => {
-    const existing = spawnCloudflared();
+    const existing = spawnTunnel();
     if (existing) return existing;
     console.log('\n  ⚠  cloudflared not found — starting LOCAL while downloading it…');
     try {
       cfg.cloudflaredPath = await downloadCloudflared();
-      return spawnCloudflared();
+      return spawnTunnel();
     } catch (e) {
       console.log('  ⚠  Could not download cloudflared: ' + e.message);
       console.log('     Install it, then run:  npm run tunnel');
