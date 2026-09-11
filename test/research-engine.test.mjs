@@ -201,3 +201,32 @@ test('research can resume from a saved checkpoint without replanning', async () 
     assert.equal(final.round_findings['1'], 'Checkpointed finding [S1].');
   } finally { rmSync(directory, { recursive: true, force: true }); }
 });
+
+test('quick research streams write-phase deltas to onToken', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'capsule-research-stream-'));
+  const searchHtml = '<a class="result__a" href="https://stream.test/one">stream source</a>';
+  const fetchImpl = async (input) => {
+    if (String(input).includes('duckduckgo.com')) return new Response(searchHtml, { headers: { 'content-type': 'text/html' } });
+    return new Response(`<html><title>stream page</title><article>${'Streaming evidence worth repeating. '.repeat(40)}</article></html>`, { headers: { 'content-type': 'text/html' } });
+  };
+  let writeOnTokenCalls = 0;
+  const complete = async ({ messages, onToken }) => {
+    const system = messages[0].content;
+    if (system.startsWith('You plan')) return '["one"]';
+    if (system.startsWith('Extract')) return 'Streamed finding [S1].';
+    if (system.startsWith('Write a clear')) { writeOnTokenCalls += 1; if (onToken) { onToken('stream chunk '); onToken('two'); } return '# Stream report\n\nDraft [S1].'; }
+    return 'done';
+  };
+  const engine = new ResearchEngine({ dataDir: directory, complete, fetchImpl, resolveHost: async () => [{ address: '93.184.216.34' }] });
+  try {
+    const started = engine.start({ query: 'Test streaming', model: 'test-model', mode: 'quick' });
+    let result;
+    for (let attempt = 0; attempt < 300; attempt += 1) {
+      result = engine.get(started.id, true);
+      if (result.status !== 'running') break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(result.status, 'complete');
+    assert.ok(writeOnTokenCalls > 0, 'onToken must be provided during the write phase');
+  } finally { rmSync(directory, { recursive: true, force: true }); }
+});

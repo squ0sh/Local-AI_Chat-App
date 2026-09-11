@@ -603,6 +603,55 @@ async function ollamaContextFor(model) {
   return context;
 }
 
+async function streamOllamaChat({ model, messages, signal, numCtx, temperature = 0.2, tools, onToken, stepTimeout = 300_000 }) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (process.env.OLLAMA_API_KEY) headers.Authorization = 'Bearer ' + process.env.OLLAMA_API_KEY;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), stepTimeout);
+  const abort = () => controller.abort();
+  signal?.addEventListener('abort', abort, { once: true });
+  try {
+    const body = { model, messages, stream: true, temperature, options: { num_ctx: numCtx } };
+    if (tools?.length) body.tools = tools;
+    const response = await fetch(cfg.ollamaUrl + '/api/chat', {
+      method: 'POST', headers, signal: controller.signal, body: JSON.stringify(body),
+    });
+    if (!response.ok || !response.body) {
+      const text = await response.text().catch(() => '');
+      throw new Error(`Local model returned HTTP ${response.status}: ${text.slice(0, 300)}`);
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '', content = '', toolCalls = [], tokenCount = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop();
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        let chunk;
+        try { chunk = JSON.parse(trimmed); } catch { continue; }
+        const delta = chunk.message?.content;
+        if (typeof delta === 'string' && delta) { content += delta; tokenCount += 1; onToken?.(delta); }
+        if (Array.isArray(chunk.message?.tool_calls) && chunk.message.tool_calls.length) toolCalls = chunk.message.tool_calls;
+      }
+    }
+    return { content, toolCalls, tokenCount };
+  } catch (error) {
+    if (signal?.aborted || controller.signal.aborted) {
+      const abortError = new DOMException('Research cancelled', 'AbortError');
+      throw abortError;
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', abort);
+  }
+}
+
 async function ollamaLoadedModels() {
   const result = await ollamaJSON('GET', '/api/ps');
   return Array.isArray(result.models) ? result.models.map(publicLoadedModel).filter((model) => model.name) : [];
@@ -2079,24 +2128,18 @@ async function handle(req, res) {
       // Approval tracking (shared with /api/agent/approve endpoint)
       let approvalIdCounter = 0;
 
-      // LLM call function
-      const llmCall = async (messages, tools) => {
-        const headers = { 'Content-Type': 'application/json' };
-        if (process.env.OLLAMA_API_KEY) headers.Authorization = 'Bearer ' + process.env.OLLAMA_API_KEY;
+      // LLM call function (streams tokens through SSE when connected)
+      const llmCall = async (messages, tools, onToken) => {
         const numCtx = await ollamaContextFor(model);
-        const response = await fetch(cfg.ollamaUrl + '/api/chat', {
-          method: 'POST', headers, signal: controller.signal,
-          body: JSON.stringify({
-            model, messages, stream: false, temperature: 0.3, options: { num_ctx: numCtx },
-            tools: tools.map(t => ({ type: 'function', function: t.function })),
-          }),
+        const streamed = await streamOllamaChat({
+          model, messages, signal: controller.signal, numCtx, temperature: 0.3,
+          tools: tools.map(t => ({ type: 'function', function: t.function })),
+          onToken: onToken ? (delta) => sendSSE({ type: 'token', delta }) : undefined,
         });
-        if (!response.ok) throw new Error(`Model returned HTTP ${response.status}`);
-        const data = await response.json();
-        const message = data.message || {};
         return {
-          content: message.content || '',
-          tool_calls: (message.tool_calls || []).map(tc => {
+          content: streamed.content,
+          tokens: streamed.tokenCount || 0,
+          tool_calls: (streamed.toolCalls || []).map(tc => {
             const raw = tc.function?.arguments;
             let arguments_ = {};
             if (typeof raw === 'string') { try { arguments_ = JSON.parse(raw); } catch {} }
@@ -2737,25 +2780,14 @@ function isCloudProvider() {
   return cfg.aiProvider === 'openai' || cfg.aiProvider === 'anthropic' || cfg.aiProvider === 'gemini';
 }
 
-async function researchModelCompletion({ model, messages, signal }) {
+async function researchModelCompletion({ model, messages, signal, onToken }) {
   if (modelUnloadActive) throw new Error('A model memory operation is running. Try research again in a moment.');
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 300_000);
-  const abort = () => controller.abort();
-  signal?.addEventListener('abort', abort, { once: true });
   const releaseGeneration = beginOllamaGeneration(model);
   if (!releaseGeneration) throw new Error('The local model has reached its concurrent-generation limit. Try research again in a moment.');
   try {
-    const headers = { 'Content-Type': 'application/json' };
-    if (process.env.OLLAMA_API_KEY) headers.Authorization = 'Bearer ' + process.env.OLLAMA_API_KEY;
     const numCtx = await ollamaContextFor(model);
-    const response = await fetch(cfg.ollamaUrl + '/api/chat', {
-      method: 'POST', headers, signal: controller.signal,
-      body: JSON.stringify({ model, messages, stream: false, temperature: 0.2, options: { num_ctx: numCtx } }),
-    });
-    if (!response.ok) throw new Error(`Local model returned HTTP ${response.status}: ${(await response.text()).slice(0, 300)}`);
-    const data = await response.json();
-    const content = data.message?.content;
+    const streamed = await streamOllamaChat({ model, messages, signal, numCtx, temperature: 0.2, onToken });
+    const content = streamed.content;
     if (!content) throw new Error('The local model returned an empty research step');
     return content;
   } catch (error) {
@@ -2763,8 +2795,6 @@ async function researchModelCompletion({ model, messages, signal }) {
     if (error?.name === 'AbortError') throw new Error('The local model took too long during a research step');
     throw error;
   } finally {
-    clearTimeout(timer);
-    signal?.removeEventListener('abort', abort);
     releaseGeneration();
   }
 }
