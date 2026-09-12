@@ -37,6 +37,12 @@ set "LOCAL_AI_OLLAMA_BIN=%OLLAMA_BIN%"
 set "OLLAMA_MODELS=%PORTABLE_DIR%\ollama\models"
 set "OLLAMA_HOST=127.0.0.1:11435"
 set "OLLAMA_NOPRUNE=true"
+rem Machines without the Capsule signing key accept the unsigned manifest that
+rem `npm run integrity` generates. Maintainers with the key keep signed checks.
+if not exist "%USERPROFILE%\.capsule-signing\key.pem" (
+  set "CAPSULE_ALLOW_UNSIGNED=1"
+  echo Capsule integrity: unsigned mode (no signing key). After code changes run: npm run integrity
+)
 set "PATH=%OLLAMA_LIB_DIR%;%PATH%"
 
 set "OLLAMA_URL=http://127.0.0.1:11435"

@@ -31,6 +31,32 @@ individual file larger than 4 GB, which many AI models exceed. A drive mounted
 with `noexec` cannot launch binaries in place; copy the Capsule to a local
 folder in that case.
 
+### Capsule integrity
+
+`capsule-integrity.json` pins every release file with a sha256 hash, signed with
+an ed25519 key. The launcher and the **Portable readiness** panel verify the
+files at startup, so a corrupt, missing, or modified file is caught immediately.
+
+Anyone can work on the Capsule without the release key:
+
+- Change files freely. At the next start the banner tells you which files differ
+  and what to do.
+- Regenerate the manifest after any tracked change:
+
+  ```
+  npm run integrity
+  ```
+
+- On a machine without `~/.capsule-signing/key.pem` the regenerated manifest is
+  unsigned. `start-portable.sh` (and `start-portable.cmd` on Windows) detects
+  the missing key and automatically sets `CAPSULE_ALLOW_UNSIGNED=1`, so the
+  readiness check stays green. The same effect applies when you launch with
+  `node server.mjs` and set the variable yourself.
+
+Release builds are signed with the private key (`~/.capsule-signing/key.pem`,
+never committed). Keep that key on the release machine only; consumers ship and
+verify against the pinned public key `capsule-signing-pub.pem`.
+
 ### Curated local model choices
 
 Open **Model library** in the Capsule sidebar. It shows what is installed,
@@ -87,11 +113,34 @@ Ollama model name or register GGUF files placed in `models/`. All model
 management, including memory controls, remains local-only and is unavailable
 to Remote guests.
 
-Agent Mode starts with plain language: turn on **Use Agent Mode**, choose
-**Start a task**, and describe the result you want. Its setup screen also has
-one-click choices for Research, Skills, and a model-readiness check. The
-**Tools** button beside the message bar opens the optional `/` command menu;
-manual file-path, terminal, and write controls stay collapsed under Advanced.
+Agent Mode starts with plain language. The **Start** screen (open the Start
+button, or `/start`) turns on **Use Agent Mode**, then offers one-click
+starters: **Ask my files** (answers that cite your project), **Write something**,
+**Improve my writing**, **Summarize**, **Translate**, and **Organize my files**
+(sort a folder by year or type — preview the plan, approve, and **Undo** any
+move afterwards). Research, Skills, and a model-readiness check stay one click
+away, and the Deep Research panel remains available through `#agent-start-research`
+and `/research`.
+
+Each chat keeps its own agent memory: the conversation the agent saw is saved,
+and relaunching a task in the same chat continues from where you left off. A new
+chat starts fresh. `/help` and `/forget` clear that memory.
+
+The **Tools** button beside the message bar opens the optional `/` command menu;
+the same commands also run from the Start screen's terminal field, which lives
+under Advanced together with a **Write a file** panel and MCP server
+registration. `/help` lists everything; the most useful ones:
+
+- `/start` — reopen the friendly Start screen.
+- `/grep <pattern>`, `/find *.<ext>` — search file contents or file names.
+- `/git status`, `/git diff` — read-only git, allowlisted, no force pushes.
+- `/test`, `/test <name>` — run the test suite (or just matching tests).
+- `/plan <task>` — draft a plan first, then `/go` to execute it.
+- `/undo` — reverts the agent's last file change (writes and moves).
+- `/forget` — clear this chat's agent memory.
+- `/search <topic>`, `/research <topic>` — web search and cited deep research.
+- `/ask <question>` — a plain chat turn with no tools involved.
+- `/env` — show model, tunnel, and workspace context.
 
 Offline behavior packs live inside Agent Mode. Choose **Choose a skill** or use
 `/skills`; the selected pack updates the current chat's system prompt. Skills

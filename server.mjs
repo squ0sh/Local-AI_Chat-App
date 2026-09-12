@@ -29,7 +29,7 @@ import { RateLimiter, rateLimitResponse } from './lib/rate-limit.mjs';
 import { ChatStore } from './lib/chat-store.mjs';
 import { McpClient } from './lib/mcp-client.mjs';
 import { UserStore } from './lib/user-store.mjs';
-import { runAgentLoop, AGENT_TOOLS, SKILL_PROMPTS, webSearch, webFetchPage } from './lib/agent-loop.mjs';
+import { runAgentLoop, globSearch, agentWriteFile, revertLastAgentWrite, buildOrganizePlan, applyOrganizePlan, webSearch } from './lib/agent-loop.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -62,6 +62,35 @@ const MODEL_VERIFICATIONS_FILE = join(DATA_DIR, 'model-verifications.json');
 const MODEL_IMPORTS_FILE = join(DATA_DIR, 'model-imports.json');
 const RESEARCH_DIR = join(DATA_DIR, 'research');
 const CHATS_DIR = join(DATA_DIR, 'chats');
+const AGENT_THREADS_DIR = join(DATA_DIR, 'agent-threads');
+const AGENT_THREAD_ID_RE = /^[A-Za-z0-9._-]{1,120}$/;
+// Per-chat conversational memory: the agent's message buffer is persisted so
+// follow-up turns and page reloads keep context. Files are written atomically.
+function agentThreadKey(id) {
+  const value = String(id || '');
+  return AGENT_THREAD_ID_RE.test(value) ? value : null;
+}
+function loadAgentThread(chatId) {
+  try {
+    const saved = JSON.parse(readFileSync(join(AGENT_THREADS_DIR, chatId + '.json'), 'utf8'));
+    if (!Array.isArray(saved)) return [];
+    return saved.filter((m) => m && typeof m.content === 'string').slice(-80)
+      .map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content).slice(0, 8000) }));
+  } catch { return []; }
+}
+function saveAgentThread(chatId, thread) {
+  if (!chatId || !Array.isArray(thread)) return;
+  try {
+    mkdirSync(AGENT_THREADS_DIR, { recursive: true });
+    const target = join(AGENT_THREADS_DIR, chatId + '.json');
+    writeFileSync(target + '.tmp', JSON.stringify(thread.slice(-80)), 'utf8');
+    renameSync(target + '.tmp', target);
+  } catch {}
+}
+function clearAgentThread(chatId) {
+  if (!chatId) return false;
+  try { unlinkSync(join(AGENT_THREADS_DIR, chatId + '.json')); return true; } catch { return false; }
+}
 const PORTABLE_ROOT = join(__dirname, '.portable');
 const PORTABLE_MODELS_DIR = join(PORTABLE_ROOT, 'ollama', 'models');
 const OLLAMA_MODELS_DIR = resolve(process.env.OLLAMA_MODELS || join(homedir(), '.ollama', 'models'));
@@ -97,6 +126,8 @@ const activeOllamaGenerations = new Map();
 const MAX_CONCURRENT_GENERATIONS = 4;
 // Agent loop state: active loops for cancellation and pending approvals for gate-based execution
 const activeAgentLoops = new Map();
+// Per-chat thread locks so two /api/agent/loop calls never interleave for one chat.
+const activeAgentThreads = new Set();
 const pendingApprovalsGlobal = new Map();
 // Requests asking for more output than this are clamped, not rejected.
 const MAX_REQUEST_TOKENS = 8192;
@@ -1987,18 +2018,18 @@ async function handle(req, res) {
   if (p.startsWith('/api/agent/')) {
     if (!agentToolsAllowed(req)) return sendJSON(res, 403, { error: 'Agent tools are available only from the local app, never through a tunnel.' });
 
-    if (req.method === 'GET' && p === '/api/agent/tools') {
-      const mcpTools = [];
-      for (const [clientId, client] of mcpClients) {
-        for (const t of client.tools) mcpTools.push({ clientId, server: client.serverInfo?.name || clientId, name: t.name, description: t.description });
-      }
-      const brief = [];
-      brief.push('Available agent tools (each requires explicit human approval in the UI):');
-      brief.push('  /api/agent/files   GET  read a file or list a folder inside the workspace');
-      brief.push('  /api/agent/write   POST write a file inside the workspace (approval: write)');
-      brief.push('  /api/agent/command POST run a shell command (approval: run, 30s cap)');
-      for (const t of mcpTools) brief.push('  MCP ' + t.name + ' via ' + t.server + (t.description ? ' — ' + t.description : ''));
-      return sendJSON(res, 200, { tools: { files: 'read a file or list a folder in the workspace', write: 'write a file in the workspace', command: 'run a shell command' }, mcp: mcpTools, brief: brief.join('\n') });
+    if (req.method === 'GET' && p === '/api/agent/find') {
+      try {
+        const pattern = String(url.searchParams.get('pattern') || '');
+        if (!pattern || pattern.length > 200) return sendJSON(res, 400, { error: 'pattern is required (max 200 chars)' });
+        const relPath = String(url.searchParams.get('path') || '');
+        const target = agentWorkspacePath(relPath);
+        const base = relative(__dirname, target);
+        const files = globSearch(target, pattern)
+          .map((f) => (base ? base.split(sep).join('/') + '/' + f : f))
+          .slice(0, 100);
+        return sendJSON(res, 200, { files, count: files.length });
+      } catch (e) { return sendJSON(res, 400, { error: e.message }); }
     }
 
     if (req.method === 'GET' && p === '/api/agent/files') {
@@ -2022,12 +2053,9 @@ async function handle(req, res) {
       try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
       if (payload.approval !== 'write') return sendJSON(res, 403, { error: 'Explicit write approval is required' });
       if (typeof payload.content !== 'string' || payload.content.length > 1_000_000) return sendJSON(res, 400, { error: 'Content must be text under 1 MB' });
-      try {
-        const target = agentWorkspacePath(payload.path || '');
-        mkdirSync(dirname(target), { recursive: true });
-        writeFileSync(target, payload.content, 'utf8');
-        return sendJSON(res, 200, { ok: true, path: relative(__dirname, target) });
-      } catch (e) { return sendJSON(res, 400, { error: e.message }); }
+      const wrote = agentWriteFile(__dirname, payload.path, payload.content);
+      if (wrote.ok) return sendJSON(res, 200, wrote);
+      return sendJSON(res, 400, { error: wrote.error });
     }
 
     if (req.method === 'POST' && p === '/api/agent/command') {
@@ -2046,6 +2074,36 @@ async function handle(req, res) {
         proc.on('close', (code) => { clearTimeout(timer); resolve({ ok: !timedOut && code === 0, code, timedOut, stdout, stderr }); });
       });
       return sendJSON(res, 200, output);
+    }
+
+    // ── Agent: read-only git (allowlisted subcommands) ──────────────────────
+    if (req.method === 'POST' && p === '/api/agent/git') {
+      let payload;
+      try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      const args = Array.isArray(payload.args) ? payload.args.map(String).slice(0, 8) : [];
+      if (!args.length) return sendJSON(res, 400, { error: 'git subcommand required' });
+      const allowed = ['status', 'diff', 'log', 'show', 'branch', 'ls-files', 'rev-parse', 'remote', 'tag'];
+      if (!allowed.includes(args[0])) return sendJSON(res, 403, { error: 'Not allowed. Read-only subcommands: ' + allowed.join(', ') });
+      if (args.some((a) => a === '--hard' || a === '-f' || a === '--force')) return sendJSON(res, 403, { error: 'Destructive git flags are not allowed' });
+      if (args.join(' ').length > 500) return sendJSON(res, 400, { error: 'Arguments too long (max 500 chars)' });
+      const output = await new Promise((resolve) => {
+        let proc;
+        try { proc = spawn('git', args, { cwd: __dirname, stdio: ['ignore', 'pipe', 'pipe'] }); }
+        catch (e) { resolve({ ok: false, error: e.message, stdout: '', stderr: '' }); return; }
+        let stdout = '', stderr = '', timedOut = false;
+        const timer = setTimeout(() => { timedOut = true; try { proc.kill('SIGTERM'); } catch {} }, 15_000);
+        proc.stdout.on('data', (d) => { if (stdout.length < 60_000) stdout += d; });
+        proc.stderr.on('data', (d) => { if (stderr.length < 60_000) stderr += d; });
+        proc.on('error', (e) => { clearTimeout(timer); resolve({ ok: false, error: e.message, stdout, stderr }); });
+        proc.on('close', (code) => { clearTimeout(timer); resolve({ ok: !timedOut && code === 0, code, timedOut, stdout, stderr }); });
+      });
+      return sendJSON(res, 200, output);
+    }
+
+    // ── Agent: undo the last agent file change ──────────────────────────────
+    if (req.method === 'POST' && p === '/api/agent/undo') {
+      const result = revertLastAgentWrite(__dirname);
+      return sendJSON(res, result.ok ? 200 : 400, result);
     }
 
     // ── MCP: Model Context Protocol servers (stdio) ──────────────────────
@@ -2108,6 +2166,20 @@ async function handle(req, res) {
       if (!model) return sendJSON(res, 400, { error: 'model is required' });
       const autonomy = ['supervised', 'selective', 'auto'].includes(payload.autonomy) ? payload.autonomy : 'selective';
       const skillPrompt = String(payload.skill_prompt || '').trim();
+      const readonly = Boolean(payload.plan);
+
+      // Per-chat conversational memory: continue the saved thread, or seed from
+      // recent chat history when this chat has no saved agent context yet.
+      const chatId = agentThreadKey(payload.chat_id);
+      const history = Array.isArray(payload.history)
+        ? payload.history.filter((m) => m && typeof m.content === 'string').slice(-14)
+            .map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content).slice(0, 8000) }))
+        : [];
+      if (chatId && activeAgentThreads.has(chatId)) return sendJSON(res, 409, { error: 'This conversation is already running an agent task. Wait for it to finish or cancel it first.' });
+      if (chatId) activeAgentThreads.add(chatId);
+      let savedThread = chatId ? loadAgentThread(chatId) : [];
+      if (!savedThread.length) savedThread = history;
+      let loopResult = null;
 
       // Set up SSE response
       res.writeHead(200, {
@@ -2168,9 +2240,11 @@ async function handle(req, res) {
       // Run the loop
       try {
         const result = await runAgentLoop({
-          task, model, workspaceRoot: __dirname, autonomy, skillPrompt,
-          onEvent, llmCall, signal: controller.signal,
+          task, model, workspaceRoot: __dirname, autonomy, skillPrompt, readonly,
+          initialMessages: savedThread, onEvent, llmCall, signal: controller.signal,
         });
+        loopResult = result;
+        if (chatId && Array.isArray(loopResult.thread)) saveAgentThread(chatId, loopResult.thread);
         sendSSE({ type: 'loop_complete', ...result });
       } catch (e) {
         if (e?.name === 'AbortError' || controller.signal.aborted) {
@@ -2180,9 +2254,38 @@ async function handle(req, res) {
         }
       } finally {
         activeAgentLoops.delete(loopId);
+        if (chatId) activeAgentThreads.delete(chatId);
         res.end();
       }
       return;
+    }
+
+    // ── Agent: clear a chat's saved memory ──────────────────────────────────
+    if (req.method === 'DELETE' && p === '/api/agent/thread') {
+      const chatId = agentThreadKey(url.searchParams.get('chat_id'));
+      if (!chatId) return sendJSON(res, 400, { error: 'chat_id is required' });
+      clearAgentThread(chatId);
+      return sendJSON(res, 200, { ok: true });
+    }
+
+    // ── Agent: organize files — preview first, then apply (undoable) ────────
+    if (req.method === 'POST' && p === '/api/agent/organize') {
+      let payload;
+      try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      const plan = buildOrganizePlan(__dirname, payload.path, payload.style);
+      if (plan.ok) return sendJSON(res, 200, plan);
+      return sendJSON(res, 400, { error: plan.error });
+    }
+    if (req.method === 'POST' && p === '/api/agent/organize/apply') {
+      let payload;
+      try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      if (payload.approval !== 'organize') return sendJSON(res, 403, { error: 'Explicit organize approval is required' });
+      const plan = buildOrganizePlan(__dirname, payload.path, payload.style);
+      if (!plan.ok) return sendJSON(res, 400, { error: plan.error });
+      if (!plan.count) return sendJSON(res, 200, { ok: true, applied: 0, message: 'Nothing to organize — files are already sorted.' });
+      const result = applyOrganizePlan(__dirname, plan.plan);
+      if (result.error) return sendJSON(res, 400, { error: result.error });
+      return sendJSON(res, 200, result);
     }
 
     // ── Agent loop approval endpoint ────────────────────────────────────────
@@ -2216,14 +2319,6 @@ async function handle(req, res) {
       try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
       const results = await webSearch(payload.query || '', payload.num_results || 5);
       return sendJSON(res, 200, { results });
-    }
-
-    // ── Agent: web fetch tool ───────────────────────────────────────────────
-    if (req.method === 'POST' && p === '/api/agent/web-fetch') {
-      let payload;
-      try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
-      const result = await webFetchPage(payload.url || '');
-      return sendJSON(res, 200, result);
     }
 
     // ── Agent: grep search tool ─────────────────────────────────────────────
@@ -2265,11 +2360,6 @@ async function handle(req, res) {
         walk(target);
         return sendJSON(res, 200, { results });
       } catch (e) { return sendJSON(res, 400, { error: e.message }); }
-    }
-
-    // ── Agent: skills list ──────────────────────────────────────────────────
-    if (req.method === 'GET' && p === '/api/agent/skills') {
-      return sendJSON(res, 200, { skills: Object.entries(SKILL_PROMPTS).map(([id, prompt]) => ({ id, prompt })) });
     }
 
     return sendJSON(res, 404, { error: 'Unknown agent tool' });
@@ -3569,6 +3659,12 @@ server.listen(cfg.port, cfg.host, async () => {
   console.log('  Backend         : ' + (isCloudProvider() ? openaiBase() : cfg.ollamaUrl));
   console.log('  Mode            : ' + cfg.mode + (cfg.authToken ? '  (auth token enabled)' : ''));
   console.log('  Models folder   : ' + MODELS_DIR);
+  try {
+    const integrity = portableIntegrityReport(__dirname, INTEGRITY_FILE, { allowUnsigned: process.env.CAPSULE_ALLOW_UNSIGNED === '1' });
+    if (integrity.verified) console.log('  Capsule files   : ' + integrity.files.length + ' files verified');
+    else if (integrity.signature) console.log('  Capsule files   : ⚠ files changed since the manifest — run: npm run integrity');
+    else console.log('  Capsule files   : ⚠ unsigned manifest (no signing key) — launch via start-portable.sh or set CAPSULE_ALLOW_UNSIGNED=1');
+  } catch {}
   if (cfg.mode === 'tunnel') await startTunnel();
   // Auto-register any .gguf files dropped into the models folder (local providers).
   if (!isCloudProvider()) {

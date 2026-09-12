@@ -1,22 +1,22 @@
 {
   "schema_version": 1,
   "algorithm": "sha256",
-  "generated_at": "2026-09-11T08:03:05.730Z",
+  "generated_at": "2026-09-12T15:41:43.098Z",
   "files": [
     {
       "path": "server.mjs",
-      "bytes": 172670,
-      "sha256": "954159ceb00a841f128800e48dfcc67f5690574f946f57ba88f64dae98f56f72"
+      "bytes": 190337,
+      "sha256": "4df32d79383119a5ca475252d5354837a042fe18ec3a1d1cc7bdec1480a651af"
     },
     {
       "path": "index.html",
-      "bytes": 48152,
-      "sha256": "3948306fb59613a57701c1b2931ed75ec64600402f92832c7fa9d5475ad3b3d0"
+      "bytes": 53174,
+      "sha256": "c17519a90d2ca92972d1287b7ebf6168e5472841f3a19a56dfc5839cc4a86c87"
     },
     {
       "path": "capsule-ui.js",
-      "bytes": 123025,
-      "sha256": "d54dffa99719c583fd934126e87bd89d8f9e63cdd69fdcebba632e68bd71fdcb"
+      "bytes": 158553,
+      "sha256": "b939a40d8e531e2a78cf3a9a42d9124475b8b791d818228c3f52b41aa57e2b37"
     },
     {
       "path": "capsule.json",
@@ -25,18 +25,18 @@
     },
     {
       "path": "skills.json",
-      "bytes": 1555,
-      "sha256": "8e287ee463e220b8917e7330a5e0dfc093e6cf78372834a382bb69d260a23e99"
+      "bytes": 3895,
+      "sha256": "29d7a5de315c7c2a0290b065b29fff68db312ce666cd4ee8e5167a209cb6e9cb"
     },
     {
       "path": "start-portable.sh",
-      "bytes": 2805,
-      "sha256": "70d2fdf3ea6f2d3e66bc774f7456806d5982126d6a4236b8763bde72560162b1"
+      "bytes": 3154,
+      "sha256": "77705d271ea45b96c51cf343d351eedb303d34cfc8034e4ea1ed6205ae7c44f1"
     },
     {
       "path": "start-portable.cmd",
-      "bytes": 2182,
-      "sha256": "f3ade0084741bc79f87cf0d3bbbbae626f693c86bce7fc90bc244b8e905c56ca"
+      "bytes": 2532,
+      "sha256": "fa600711efdd44eff8a6939264924f70839df442a8d67a4351a9634aba08e83c"
     },
     {
       "path": "package.json",
@@ -70,8 +70,8 @@
     },
     {
       "path": "lib/research-engine.mjs",
-      "bytes": 19977,
-      "sha256": "4962f708dc3d2aa26f32572bb404e0781afb1736b059ee3c0c168f61c7f6ec59"
+      "bytes": 30700,
+      "sha256": "2d89116f640da2f586c54a7c02a18cc3cc1976200e65771ad9c685d33ed623aa"
     },
     {
       "path": "lib/resumable-ollama-pull.mjs",
@@ -90,8 +90,8 @@
     },
     {
       "path": "tools/generate-integrity.mjs",
-      "bytes": 2844,
-      "sha256": "0f1dfa8e38d96b7eef22c6ba25b2d0d0c467d2d5bb651ded8d322e540fd9b509"
+      "bytes": 4071,
+      "sha256": "255e1fc385e2dd9d1cebc1928722ad1dfee659e6fc2b4724772bb17b555d8330"
     },
     {
       "path": "tools/package-runtimes.mjs",
@@ -152,6 +152,6 @@
   "signature": {
     "algorithm": "ed25519",
     "pubkey_sha256": "336c45ddfa36a7c461e9d63c90f0e1a781b2a83f7347dbc03ac9b66a2a9a8591",
-    "value": "C5z+ZcFt53V/iFe2CfB+zph9wEPRx5RQ2Pyjr0x4iMQ3ZVnOGDCIQW5Fdi/bKg+dlobMFDEFsAqfI0SXYFQHAw=="
+    "value": "OmQ0MwwCNkPeV1fHlFc4VXUSm0AdE66taGkIvHSYETQa9uEjFaZQCYnWodA5IJDpGMXfdiZusEbvIsdC79ZYDQ=="
   }
 }

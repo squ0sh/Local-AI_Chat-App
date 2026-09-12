@@ -66,20 +66,47 @@ const manifest = {
   files,
 };
 
-try {
-  const pem = readFileSync(SIGNING_KEY, 'utf8');
-  const key = createPrivateKey({ key: pem, format: 'pem', type: 'pkcs8' });
-  const pub = readFileSync(join(appDir, 'capsule-signing-pub.pem'), 'utf8');
-  manifest.signature = {
-    algorithm: 'ed25519',
-    pubkey_sha256: pubkeyFingerprint(pub),
-    value: sign(null, Buffer.from(canonicalManifest(manifest), 'utf8'), key).toString('base64'),
-  };
-  if (!verifyManifestSignature(manifest, pub).ok) throw new Error('self-check failed');
-  console.log('Signed integrity manifest with ' + SIGNING_KEY);
-} catch (error) {
-  console.warn('⚠ Manifest NOT signed: ' + error.message);
+const manifestPath = join(appDir, 'capsule-integrity.json');
+let current = null;
+try { current = JSON.parse(readFileSync(manifestPath, 'utf8')); } catch {}
+
+// Regeneration is idempotent: when the tracked files are byte-identical to the
+// existing manifest we leave it untouched (including its signature and
+// timestamp), so `npm run ci` does not produce a spurious diff.
+const contentChanged = !current || JSON.stringify(current.files) !== JSON.stringify(manifest.files);
+
+let signed = false;
+let signError = '';
+function signManifest() {
+  try {
+    const pem = readFileSync(SIGNING_KEY, 'utf8');
+    const key = createPrivateKey({ key: pem, format: 'pem', type: 'pkcs8' });
+    const pub = readFileSync(join(appDir, 'capsule-signing-pub.pem'), 'utf8');
+    manifest.signature = {
+      algorithm: 'ed25519',
+      pubkey_sha256: pubkeyFingerprint(pub),
+      value: sign(null, Buffer.from(canonicalManifest(manifest), 'utf8'), key).toString('base64'),
+    };
+    const check = verifyManifestSignature(manifest, pub);
+    if (!check.ok) throw new Error('self-check failed: ' + check.error);
+    signed = true;
+  } catch (error) {
+    signError = error.message;
+  }
 }
 
-writeFileSync(join(appDir, 'capsule-integrity.json'), JSON.stringify(manifest, null, 2) + '\n');
-console.log(`Recorded ${files.length} Capsule files.`);
+if (!contentChanged && current) {
+  console.log('Integrity manifest is current (' + files.length + ' files' + (current.signature ? ', signed' : ', unsigned') + ').');
+} else {
+  manifest.generated_at = new Date().toISOString();
+  signManifest();
+  writeFileSync(manifestPath, JSON.stringify(manifest, null, 2) + '\n');
+  if (signed) {
+    console.log('Signed integrity manifest with ' + SIGNING_KEY);
+  } else {
+    console.log('Wrote unsigned integrity manifest (' + files.length + ' files) — no signing key at ' + SIGNING_KEY + (signError ? ' (' + signError + ')' : '') + '.');
+    console.log('  Launch via start-portable.sh (it auto-sets CAPSULE_ALLOW_UNSIGNED=1 on keyless machines), or');
+    console.log('  set CAPSULE_ALLOW_UNSIGNED=1 manually after npm run integrity.');
+  }
+  console.log(`Recorded ${files.length} Capsule files.`);
+}

@@ -93,6 +93,53 @@ test('signed integrity manifest verifies and fails closed on tamper', () => {
     assert.match(report.signature_error, /invalid/i);
   } finally { rmSync(appDir, { recursive: true, force: true }); }
 });
+
+test('unsigned manifest is accepted only under allowUnsigned', () => {
+  const appDir = mkdtempSync(join(tmpdir(), 'capsule-integrity-unsigned-'));
+  try {
+    const manifest = {
+      schema_version: 1,
+      algorithm: 'sha256',
+      generated_at: new Date().toISOString(),
+      files: [
+        { path: 'demo.txt', bytes: 9, sha256: createHash('sha256').update('demo data').digest('hex') },
+      ],
+    };
+    const manifestFile = join(appDir, 'capsule-integrity.json');
+    writeFileSync(manifestFile, JSON.stringify(manifest));
+    writeFileSync(join(appDir, 'demo.txt'), 'demo data');
+    // No signature field and no allowUnsigned → refused.
+    const strict = portableIntegrityReport(appDir, manifestFile);
+    assert.equal(strict.verified, false);
+    assert.match(strict.signature_error, /unsigned/i);
+    // Same manifest with allowUnsigned (the keyless portable launcher path) → OK.
+    const allowed = portableIntegrityReport(appDir, manifestFile, { allowUnsigned: true });
+    assert.equal(allowed.verified, true);
+    assert.equal(allowed.signed, false);
+    // A changed file still fails even with allowUnsigned.
+    writeFileSync(join(appDir, 'demo.txt'), 'tampered');
+    assert.equal(portableIntegrityReport(appDir, manifestFile, { allowUnsigned: true }).verified, false);
+  } finally { rmSync(appDir, { recursive: true, force: true }); }
+});
+
+test('regenerated manifests are idempotent: a second run does not rewrite', async (t) => {
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const execFileAsync = promisify(execFile);
+  const repoDir = process.cwd();
+  const manifestPath = join(repoDir, 'capsule-integrity.json');
+  const original = readFileSync(manifestPath, 'utf8');
+  t.after(() => { writeFileSync(manifestPath, original); });
+  // First run syncs the manifest to the current tree (signing key or not).
+  await execFileAsync(process.execPath, ['tools/generate-integrity.mjs'], { cwd: repoDir });
+  const before = statSync(manifestPath).mtimeMs;
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  // Second run must report "current" and leave the file byte-identical.
+  const { stdout } = await execFileAsync(process.execPath, ['tools/generate-integrity.mjs'], { cwd: repoDir });
+  assert.match(stdout, /current/i);
+  assert.equal(statSync(manifestPath).mtimeMs, before);
+});
+
 test('chat store seals the workspace on disk and sanitizes input', () => {
   const dir = mkdtempSync(join(tmpdir(), 'capsule-chats-'));
   try {

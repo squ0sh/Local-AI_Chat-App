@@ -46,6 +46,12 @@ export OLLAMA_HOST="127.0.0.1:11435"
 # restarts. Automatic pruning can mistake a recently finalized direct-HF model
 # for an unused cache entry on some Ollama builds.
 export OLLAMA_NOPRUNE="true"
+# Machines without the Capsule signing key accept the unsigned manifest that
+# `npm run integrity` generates. Maintainers with the key keep signed checks.
+if [[ ! -f "$HOME/.capsule-signing/key.pem" ]]; then
+  export CAPSULE_ALLOW_UNSIGNED="1"
+  echo "Capsule integrity: unsigned mode (no signing key). After code changes run: npm run integrity"
+fi
 
 OLLAMA_PID=""
 ollama_ready() {
