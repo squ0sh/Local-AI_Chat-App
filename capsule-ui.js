@@ -82,6 +82,9 @@
     body.agent-terminal-mode .composer-foot{width:min(980px,100%);color:var(--agent-dim);font-family:var(--mono)}
     body.agent-terminal-mode .send{border-radius:6px;background:var(--agent-green);color:#07100a}
     body.agent-terminal-mode .compose-icon{color:var(--agent-dim)}
+    #agent-empty-hint{display:none;justify-content:center;padding:26px 12px 4px;color:var(--agent-dim);font:600 12.5px var(--mono);text-align:center}
+    #agent-empty-hint.show{display:flex}
+    body.agent-terminal-mode .welcome{display:none}
     #agent-simple-guide{width:min(980px,100%);align-items:center;justify-content:space-between;gap:12px;margin:7px auto 0;color:var(--agent-dim);font:11px/1.4 var(--mono)}body.agent-terminal-mode #agent-simple-guide{display:flex}#agent-tools-button{flex:none;border:1px solid var(--agent-line);border-radius:6px;background:#0c1711;color:var(--agent-green);padding:6px 10px;font:11px var(--mono)}#agent-tools-button:hover{border-color:var(--agent-green)}
     #agent-slash-menu{position:absolute;z-index:25;left:-1px;right:-1px;bottom:calc(100% + 8px);max-height:310px;overflow:auto;border:1px solid #315d45;border-radius:8px;background:#09100df5;box-shadow:0 16px 36px #000b;padding:6px}
     body.agent-terminal-mode #agent-slash-menu.open{display:block}
@@ -105,6 +108,7 @@
   const menu=document.createElement('div');menu.id='agent-slash-menu';menu.setAttribute('role','listbox');menu.setAttribute('aria-label','Agent commands');composer.append(menu);
   const guide=document.createElement('div');guide.id='agent-simple-guide';guide.innerHTML='<span>Describe the result you want. Agent will pause before commands or file changes.</span><button type="button" id="agent-tools-button">Tools</button>';foot.after(guide);const toolsButton=guide.querySelector('#agent-tools-button');
   const originalPlaceholder=input.placeholder;
+  const emptyHint=document.createElement('div');emptyHint.id='agent-empty-hint';emptyHint.textContent='Describe what you want Agent to accomplish…';messages.prepend(emptyHint);
   let selected=0,history=[],historyIndex=0,pendingContext='';
   const commands=[
     {name:'/help',description:'Show all Agent commands'},
@@ -382,8 +386,12 @@
     if(name==='/forget'){if(typeof window.clearAgentThread!=='function'){appendEvent('info','nothing to forget');return}let chatId='';try{chatId=(typeof active==='function'&&active())?.id}catch{}if(!chatId){appendEvent('info','nothing to forget');return}if(!confirm('Forget this conversation’s saved agent memory?')){appendEvent('info','forget cancelled');return}try{window.clearAgentThread(chatId)}catch{}appendEvent('success','conversation memory cleared','Start a fresh direction in this chat.');return}
     appendEvent('error','unknown command',`${name}\nType /help to see available commands.`);
   }
+  function syncEmptyHint(){
+    if(!emptyHint.isConnected)messages.prepend(emptyHint);
+    emptyHint.classList.toggle('show',isEnabled()&&Boolean(messages.querySelector('.welcome')));
+  }
   function applyMode(){
-    const active=isEnabled();document.body.classList.toggle('agent-terminal-mode',active);shell.querySelector('.agent-shell-model').textContent=modelLabel();input.placeholder=active?'Describe what you want Agent to accomplish…':originalPlaceholder;if(!active)hideMenu();decorateMessages();
+    const active=isEnabled();document.body.classList.toggle('agent-terminal-mode',active);shell.querySelector('.agent-shell-model').textContent=modelLabel();input.placeholder=active?'Describe what you want Agent to accomplish…':originalPlaceholder;if(!active)hideMenu();decorateMessages();syncEmptyHint();
   }
   function decorateMessages(){
     if(!isEnabled())return;messages.querySelectorAll('.bubble.thinking:not([data-agent-processing])').forEach(bubble=>{bubble.dataset.agentProcessing='true';bubble.textContent='';const row=document.createElement('div'),spinner=document.createElement('span'),copy=document.createElement('span'),title=document.createElement('strong'),detail=document.createElement('small');row.className='agent-processing';spinner.className='agent-spinner';spinner.textContent='◌';title.textContent='analyzing task';detail.textContent='planning the next supervised step with the local model';copy.append(title,detail);row.append(spinner,copy);bubble.append(row)});
@@ -408,7 +416,7 @@
   window.send=function(){if(isEnabled()&&localStorage.getItem('local-ai-cloud-mode')!=='cloud'){const raw=(input.value||'').trim();if(!raw)return;const fromSlash=raw.startsWith('/');input.value='';input.dispatchEvent(new Event('input',{bubbles:true}));hideMenu();if(fromSlash){execute(raw);return}runAgentTask(raw,agentAutonomy());return}return priorSend()};
   document.getElementById('send').onclick=()=>window.send();
   close.addEventListener('click',()=>setTimeout(applyMode,0));window.addEventListener('storage',event=>{if(event.key===key)applyMode()});
-  new MutationObserver(decorateMessages).observe(messages,{childList:true,subtree:true});
+  new MutationObserver(()=>{decorateMessages();syncEmptyHint()}).observe(messages,{childList:true,subtree:true});
   const priorFetch=window.fetch.bind(window);
   window.fetch=(url,init={})=>{
     if(isEnabled()&&localStorage.getItem('local-ai-cloud-mode')!=='cloud'&&String(url).includes('/api/chat')&&init.body){
