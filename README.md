@@ -34,8 +34,25 @@ folder in that case.
 ### Capsule integrity
 
 `capsule-integrity.json` pins every release file with a sha256 hash, signed with
-an ed25519 key. The launcher and the **Portable readiness** panel verify the
+an ed25519 key. Every release file also carries a **compressed canonical copy**
+inside the manifest itself, so the Capsule can repair itself without the
+original file. The launcher and the **Portable readiness** panel verify the
 files at startup, so a corrupt, missing, or modified file is caught immediately.
+
+Self-healing is **safe by default**: a tracked file that is *missing* is restored
+automatically from its embedded copy in the manifest. A file that is *present but
+different* is never clobbered — the readiness panel lists it and offers **Restore
+file** (write the canonical copy back) or **Regenerate manifest** (accept your
+change as the new release state). Use **Restore missing files** in the panel to
+re-attempt an automatic repair at any time.
+
+Bundled runtimes also self-heal. `runtime/downloads.txt` pins the official
+download URL plus archive and binary SHA-256 hashes for Node and Ollama on every
+supported platform. When a bundled binary is missing or below its size floor, the
+launcher asks once (`LOCAL_AI_AUTO_DOWNLOADS=1` skips the prompt), downloads to
+`.portable/cache/`, verifies the archive hash, and extracts it. Pass
+`--verify-runtimes` to the launchers for a full binary hash check against the
+pins (plus a `--version` smoke check) on every start.
 
 Anyone can work on the Capsule without the release key:
 

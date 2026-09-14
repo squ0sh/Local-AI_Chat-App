@@ -1,72 +1,19 @@
-import { createHash, createPrivateKey, sign } from 'crypto';
-import { readFileSync, readdirSync, statSync, writeFileSync } from 'fs';
+import { createPrivateKey, sign } from 'crypto';
+import { readFileSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { canonicalManifest, pubkeyFingerprint, verifyManifestSignature } from '../lib/capsule-integrity.mjs';
+import { buildReleaseManifest, canonicalManifest, pubkeyFingerprint, verifyManifestSignature } from '../lib/capsule-integrity.mjs';
 
 const appDir = join(dirname(fileURLToPath(import.meta.url)), '..');
 const SIGNING_KEY = process.env.CAPSULE_SIGNING_KEY || join(homedir(), '.capsule-signing', 'key.pem');
-const trackedFiles = [
-  'server.mjs',
-  'index.html',
-  'capsule-ui.js',
-  'capsule.json',
-  'skills.json',
-  'start-portable.sh',
-  'start-portable.cmd',
-  'package.json',
-  'capsule-signing-pub.pem',
-  'lib/capsule-integrity.mjs',
-  'lib/capsule-vault.mjs',
-  'lib/chat-store.mjs',
-  'lib/rate-limit.mjs',
-  'lib/research-engine.mjs',
-  'lib/resumable-ollama-pull.mjs',
-  'lib/vendor/qrcode-generator.mjs',
-  'tools/model-cli.mjs',
-  'tools/generate-integrity.mjs',
-  'tools/package-runtimes.mjs',
-  'tools/ollama-health.mjs',
-  'tools/sign-capsule.mjs',
-  'tools/update-cloudflared-manifest.mjs',
-  'cloud/worker.mjs',
-  'cloud/wrangler.toml',
-  'cloud/cloudflared-manifest.json',
-];
-
-function filesUnder(relativeDir) {
-  const found = [];
-  const visit = (dir) => {
-    for (const entry of readdirSync(join(appDir, dir), { withFileTypes: true })) {
-      const path = join(dir, entry.name);
-      if (entry.isDirectory()) {
-        if (path === 'runtime/platforms' || path.startsWith('runtime/.platforms-')) continue;
-        visit(path);
-      } else found.push(path);
-    }
-  };
-  visit(relativeDir);
-  return found.sort();
-}
-
-trackedFiles.push(...filesUnder('runtime'));
-
-const files = trackedFiles.map((path) => {
-  const file = join(appDir, path);
-  const bytes = statSync(file).size;
-  const sha256 = createHash('sha256').update(readFileSync(file)).digest('hex');
-  return { path, bytes, sha256 };
-});
-
-const manifest = {
-  schema_version: 1,
-  algorithm: 'sha256',
-  generated_at: new Date().toISOString(),
-  files,
-};
-
 const manifestPath = join(appDir, 'capsule-integrity.json');
+
+// The manifest embeds gzip'd canonical copies of every tracked file, so a lost
+// or corrupt file can be restored entirely offline (see repairReleaseFiles in
+// lib/capsule-integrity.mjs).
+const manifest = buildReleaseManifest(appDir, { embedContent: true });
+
 let current = null;
 try { current = JSON.parse(readFileSync(manifestPath, 'utf8')); } catch {}
 
@@ -96,7 +43,7 @@ function signManifest() {
 }
 
 if (!contentChanged && current) {
-  console.log('Integrity manifest is current (' + files.length + ' files' + (current.signature ? ', signed' : ', unsigned') + ').');
+  console.log('Integrity manifest is current (' + manifest.files.length + ' files' + (current.signature ? ', signed' : ', unsigned') + ').');
 } else {
   manifest.generated_at = new Date().toISOString();
   signManifest();
@@ -104,9 +51,9 @@ if (!contentChanged && current) {
   if (signed) {
     console.log('Signed integrity manifest with ' + SIGNING_KEY);
   } else {
-    console.log('Wrote unsigned integrity manifest (' + files.length + ' files) — no signing key at ' + SIGNING_KEY + (signError ? ' (' + signError + ')' : '') + '.');
+    console.log('Wrote unsigned integrity manifest (' + manifest.files.length + ' files) — no signing key at ' + SIGNING_KEY + (signError ? ' (' + signError + ')' : '') + '.');
     console.log('  Launch via start-portable.sh (it auto-sets CAPSULE_ALLOW_UNSIGNED=1 on keyless machines), or');
     console.log('  set CAPSULE_ALLOW_UNSIGNED=1 manually after npm run integrity.');
   }
-  console.log(`Recorded ${files.length} Capsule files.`);
+  console.log(`Recorded ${manifest.files.length} Capsule files.`);
 }

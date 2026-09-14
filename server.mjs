@@ -21,7 +21,7 @@ import { Readable, Transform } from 'stream';
 import { totalmem, freemem, cpus, loadavg, homedir } from 'os';
 import { randomBytes, createHash } from 'crypto';
 import qrcode from './lib/vendor/qrcode-generator.mjs';
-import { portableIntegrityReport } from './lib/capsule-integrity.mjs';
+import { portableIntegrityReport, rebuildManifest, repairReleaseFiles } from './lib/capsule-integrity.mjs';
 import { sealVault, openVault } from './lib/capsule-vault.mjs';
 import { ResearchEngine } from './lib/research-engine.mjs';
 import { pullOllamaModel } from './lib/resumable-ollama-pull.mjs';
@@ -35,20 +35,42 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 
 // ------------------------------------------------------------------ static paths
 const HTML_FILE = join(__dirname, 'index.html');
-const INDEX_HTML = existsSync(HTML_FILE) ? readFileSync(HTML_FILE, 'utf8') : null;
+let INDEX_HTML = existsSync(HTML_FILE) ? readFileSync(HTML_FILE, 'utf8') : null;
 const CAPSULE_UI_FILE = join(__dirname, 'capsule-ui.js');
-const CAPSULE_UI = existsSync(CAPSULE_UI_FILE) ? readFileSync(CAPSULE_UI_FILE, 'utf8') : null;
+let CAPSULE_UI = existsSync(CAPSULE_UI_FILE) ? readFileSync(CAPSULE_UI_FILE, 'utf8') : null;
 // CSP needs the single inline <script> block in index.html to be hashed, not
 // allowed with 'unsafe-inline'. The hash is derived from the exact file we
 // serve, so it stays correct as the UI evolves.
-const INLINE_SCRIPT_SHA = (() => {
-  const match = (INDEX_HTML || '').match(/<script>([\s\S]*?)<\/script>/);
+function cspHashFrom(html) {
+  const match = (html || '').match(/<script>([\s\S]*?)<\/script>/);
   return match && match[1] ? 'sha256-' + createHash('sha256').update(match[1]).digest('base64') : '';
-})();
+}
+let INLINE_SCRIPT_SHA = cspHashFrom(INDEX_HTML);
 const CAPSULE_FILE = join(__dirname, 'capsule.json');
 const SKILLS_FILE = join(__dirname, 'skills.json');
 const INTEGRITY_FILE = join(__dirname, 'capsule-integrity.json');
 const RUNTIME_INDEX_FILE = join(__dirname, 'runtime', 'index.json');
+
+// Self-healing: tracked release files that are missing are restored from the
+// canonical copies embedded in the integrity manifest before any static bundle
+// below is cached or served. Present-but-different files are left alone and
+// surfaced in the readiness panel, so an intentional edit is never silently
+// overwritten. User data and models are never touched.
+let lastIntegrityRepair = null;
+try {
+  lastIntegrityRepair = repairReleaseFiles(__dirname, INTEGRITY_FILE, { policy: 'missing', allowUnsigned: process.env.CAPSULE_ALLOW_UNSIGNED === '1' });
+  const repaired = lastIntegrityRepair.restored || [];
+  if (repaired.includes('index.html') && existsSync(HTML_FILE)) {
+    INDEX_HTML = readFileSync(HTML_FILE, 'utf8');
+    INLINE_SCRIPT_SHA = cspHashFrom(INDEX_HTML);
+  }
+  if (repaired.includes('capsule-ui.js') && existsSync(CAPSULE_UI_FILE)) {
+    CAPSULE_UI = readFileSync(CAPSULE_UI_FILE, 'utf8');
+  }
+  if (repaired.length) console.log('  Capsule self-heal: restored ' + repaired.join(', '));
+} catch (error) {
+  console.warn('  Capsule self-heal: ' + error.message);
+}
 
 // Set LOCAL_AI_DATA_DIR to make a fully self-contained portable installation.
 const ROOT_DIR = join(__dirname, '..');
@@ -1859,7 +1881,33 @@ async function handle(req, res) {
     });
   }
   if (req.method === 'GET' && p === '/api/portable/integrity') {
-    return sendJSON(res, 200, portableIntegrityReport(__dirname, INTEGRITY_FILE, { allowUnsigned: process.env.CAPSULE_ALLOW_UNSIGNED === '1' }));
+    const report = portableIntegrityReport(__dirname, INTEGRITY_FILE, { allowUnsigned: process.env.CAPSULE_ALLOW_UNSIGNED === '1' });
+    const failed = (report.files || []).filter((file) => !file.ok);
+    const missing = failed.filter((file) => /no such file|ENOENT|missing/i.test(file.error || '')).map((file) => file.path);
+    const changed = failed.filter((file) => !missing.includes(file.path)).map((file) => file.path);
+    let embedded = new Set();
+    try { embedded = new Set((JSON.parse(readFileSync(INTEGRITY_FILE, 'utf8')).files || []).filter((entry) => entry.content).map((entry) => entry.path)); } catch {}
+    const restorable = missing.filter((path) => embedded.has(path));
+    return sendJSON(res, 200, { ...report, missing, changed, restorable, last_repair: lastIntegrityRepair });
+  }
+  if (req.method === 'POST' && p === '/api/portable/integrity/repair') {
+    let payload;
+    try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const result = repairReleaseFiles(__dirname, INTEGRITY_FILE, {
+      policy: payload.path ? 'all' : (payload.policy === 'all' ? 'all' : 'missing'),
+      path: typeof payload.path === 'string' && payload.path ? payload.path : undefined,
+      allowUnsigned: process.env.CAPSULE_ALLOW_UNSIGNED === '1',
+    });
+    lastIntegrityRepair = result;
+    return sendJSON(res, 200, result);
+  }
+  if (req.method === 'POST' && p === '/api/portable/integrity/regenerate') {
+    try {
+      const result = rebuildManifest(__dirname);
+      return sendJSON(res, 200, { ok: true, files: result.files, signed: result.signed, signature_error: result.signature_error });
+    } catch (error) {
+      return sendJSON(res, 400, { error: error.message });
+    }
   }
   if (req.method === 'GET' && p === '/api/portable/handoff-preview') {
     let manifest = {};
@@ -3664,6 +3712,7 @@ server.listen(cfg.port, cfg.host, async () => {
     if (integrity.verified) console.log('  Capsule files   : ' + integrity.files.length + ' files verified');
     else if (integrity.signature) console.log('  Capsule files   : ⚠ files changed since the manifest — run: npm run integrity');
     else console.log('  Capsule files   : ⚠ unsigned manifest (no signing key) — launch via start-portable.sh or set CAPSULE_ALLOW_UNSIGNED=1');
+    if (lastIntegrityRepair?.restored?.length) console.log('  Self-heal       : restored ' + lastIntegrityRepair.restored.length + ' missing release file(s)');
   } catch {}
   if (cfg.mode === 'tunnel') await startTunnel();
   // Auto-register any .gguf files dropped into the models folder (local providers).

@@ -17,6 +17,34 @@ set "NODE_BIN=%RUNTIME_DIR%\node\node.exe"
 set "OLLAMA_BIN=%RUNTIME_DIR%\ollama\ollama.exe"
 set "OLLAMA_LIB_DIR=%RUNTIME_DIR%\ollama\lib\ollama"
 
+if not exist "%APP_DIR%runtime\downloads.txt" goto :legacy_check
+
+rem Restore missing runtime binaries automatically from the pinned release table.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%APP_DIR%tools\install-portable-runtime.ps1" -AppDir "%APP_DIR%" -Target "%TARGET%" -Kind node
+if errorlevel 1 goto :runtime_failed
+powershell -NoProfile -ExecutionPolicy Bypass -File "%APP_DIR%tools\install-portable-runtime.ps1" -AppDir "%APP_DIR%" -Target "%TARGET%" -Kind ollama
+if errorlevel 1 goto :runtime_failed
+goto :runtime_ok
+
+:legacy_check
+if not exist "%NODE_BIN%" (
+  echo The bundled Node runtime is missing for %TARGET%.
+  pause
+  exit /b 1
+)
+if not exist "%OLLAMA_BIN%" (
+  echo The bundled Ollama runtime is missing for %TARGET%.
+  pause
+  exit /b 1
+)
+goto :runtime_ok
+
+:runtime_failed
+echo Could not restore the bundled runtime for %TARGET%. See README for manual setup.
+pause
+exit /b 1
+
+:runtime_ok
 if not exist "%NODE_BIN%" (
   echo The bundled Node runtime is missing for %TARGET%.
   pause
