@@ -5,7 +5,7 @@ import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { spawn } from 'child_process';
 import { createServer as netCreateServer } from 'net';
-import { globSearch, revertLastAgentWrite, WRITE_HISTORY } from '../lib/agent-loop.mjs';
+import { globSearch, revertLastAgentWrite, WRITE_HISTORY, executeTool } from '../lib/agent-loop.mjs';
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -135,6 +135,61 @@ test('agent tools server: git allowlist, find, and undo endpoints', async () => 
     await new Promise((resolve) => { server.once('exit', resolve); setTimeout(resolve, 3000); });
     rmSync(join(repoRoot, tmpPath), { force: true });
   }
+});
+
+test('executeTool web_search parses results and validates input', async () => {
+  const prevFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    text: async () => '<a class="result__a" href="https://example.com/?uddg=https%3A%2F%2Fexample.com%2Freal">Example Co</a><a class="result__snippet">A useful snippet.</a>',
+  });
+  try {
+    const res = await executeTool('web_search', { query: 'hello world', num_results: 3 }, tmpdir(), { autonomy: 'auto' });
+    assert.ok(Array.isArray(res), 'web_search returns an array of results');
+    assert.equal(res.length, 1);
+    assert.equal(res[0].url, 'https://example.com/real');
+    assert.equal(res[0].title, 'Example Co');
+    assert.equal(res[0].snippet, 'A useful snippet.');
+  } finally {
+    globalThis.fetch = prevFetch;
+  }
+  const missing = await executeTool('web_search', {}, tmpdir(), { autonomy: 'auto' });
+  assert.match(missing.error, /No query/);
+});
+
+test('executeTool web_search retries once after a transient failure', async () => {
+  const prevFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls += 1;
+    if (calls === 1) throw new Error('temporary outage');
+    return { ok: true, text: async () => '<a class="result__a" href="https://x.test/">X</a><a class="result__snippet">s</a>' };
+  };
+  try {
+    const res = await executeTool('web_search', { query: 'retry me', num_results: 2 }, tmpdir(), { autonomy: 'auto' });
+    assert.equal(calls, 2, 'the search is attempted twice');
+    assert.ok(Array.isArray(res) && res.length === 1, 'second attempt returns parsed results');
+    assert.equal(res[0].url, 'https://x.test/');
+  } finally {
+    globalThis.fetch = prevFetch;
+  }
+});
+
+test('executeTool web_fetch extracts readable text and validates url', async () => {
+  const prevFetch = globalThis.fetch;
+  globalThis.fetch = async () => ({
+    ok: true,
+    text: async () => '<html><head><style>body{background:#fff}</style></head><body><script>evil()</script><nav>menu</nav><main><p>Hello&nbsp;World, capsule&nbsp;agent!</p></main></body></html>',
+  });
+  try {
+    const res = await executeTool('web_fetch', { url: 'https://example.com/page' }, tmpdir(), { autonomy: 'auto' });
+    assert.equal(res.url, 'https://example.com/page');
+    assert.ok(/Hello World/.test(res.content), 'page text is extracted and entities decoded');
+  } finally {
+    globalThis.fetch = prevFetch;
+  }
+  const invalid = await executeTool('web_fetch', { url: 'not a url' }, tmpdir(), { autonomy: 'auto' });
+  assert.match(invalid.error, /Invalid url/);
 });
 
 test('agent tools server: organize preview/apply/undo and thread memory endpoints', async () => {

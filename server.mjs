@@ -30,6 +30,7 @@ import { ChatStore } from './lib/chat-store.mjs';
 import { McpClient } from './lib/mcp-client.mjs';
 import { UserStore } from './lib/user-store.mjs';
 import { runAgentLoop, globSearch, agentWriteFile, revertLastAgentWrite, buildOrganizePlan, applyOrganizePlan, webSearch } from './lib/agent-loop.mjs';
+import { shouldFreeMemory, otherModelNames } from './lib/memory.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -638,6 +639,18 @@ async function ollamaTags() {
 }
 
 const ollamaContextCache = new Map();
+let contextCapLogged = false;
+function contextCapForHost() {
+  const override = Number(process.env.CAPSULE_MAX_CONTEXT);
+  if (Number.isFinite(override) && override >= 1024) return override;
+  const totalGB = totalmem() / 2 ** 30;
+  const cap = totalGB <= 8 ? 4096 : totalGB <= 16 ? 8192 : 32768;
+  if (!contextCapLogged) {
+    contextCapLogged = true;
+    try { console.log(`[context] ${totalGB.toFixed(1)} GiB total RAM (${(freemem() / 2 ** 30).toFixed(1)} GiB free) -> num_ctx cap ${cap}${process.env.CAPSULE_MAX_CONTEXT ? ' (env override)' : ''}`); } catch {}
+  }
+  return cap;
+}
 async function ollamaContextFor(model) {
   const name = String(model || '');
   if (!name) return 4096;
@@ -650,7 +663,8 @@ async function ollamaContextFor(model) {
       const key = Object.keys(info.model_info).find((candidate) => /^[a-z0-9_-]+\.context_length$/.test(candidate));
       if (key) detected = info.model_info[key];
     }
-    if (detected) context = Math.max(1024, Math.min(Number(detected) || 4096, 32768));
+    if (detected) context = Math.max(1024, Math.min(Number(detected) || 4096, contextCapForHost()));
+    else context = Math.min(4096, contextCapForHost());
   } catch {}
   ollamaContextCache.set(name, context);
   return context;
@@ -697,7 +711,7 @@ async function streamOllamaChat({ model, messages, signal, numCtx, temperature =
     return { content, toolCalls, tokenCount };
   } catch (error) {
     if (signal?.aborted || controller.signal.aborted) {
-      const abortError = new DOMException('Research cancelled', 'AbortError');
+      const abortError = new DOMException('Request cancelled', 'AbortError');
       throw abortError;
     }
     throw error;
@@ -748,6 +762,15 @@ async function waitForOllamaLoad(modelName, attempts = 20) {
     if (attempt < attempts - 1) await new Promise((resolveDelay) => setTimeout(resolveDelay, 500));
   }
   return null;
+}
+
+async function unloadOllamaModels(modelNames) {
+  const failures = [];
+  for (const model of modelNames || []) {
+    try { await ollamaJSON('POST', '/api/generate', { model, keep_alive: 0 }, 30000); }
+    catch (error) { failures.push({ model, error: error.message }); }
+  }
+  return failures;
 }
 
 function publicModelJob(job) {
@@ -2264,6 +2287,20 @@ async function handle(req, res) {
       activeAgentLoops.set(loopId, controller);
       sendSSE({ type: 'loop_started', loop_id: loopId });
 
+      // Pre-flight: evict other resident models before loading the requested
+      // one when RAM is tight, so a model swap cannot stall generation.
+      try {
+        const loadedModels = await ollamaLoadedModels();
+        if (!activeOllamaGenerations.size && shouldFreeMemory(loadedModels, model, { totalmem: totalmem(), freemem: freemem() })) {
+          const others = otherModelNames(loadedModels, model);
+          if (others.length) {
+            sendSSE({ type: 'memory', message: `Freeing memory: unloading ${others.length} other model${others.length === 1 ? '' : 's'} before loading ${model}.` });
+            const failures = await unloadOllamaModels(others);
+            if (failures.length) sendSSE({ type: 'memory', message: `Memory warning: could not unload ${failures.map((f) => `${f.model}: ${f.error}`).join('; ')}` });
+          }
+        }
+      } catch {}
+
       // Approval tracking (shared with /api/agent/approve endpoint)
       let approvalIdCounter = 0;
 
@@ -2523,11 +2560,7 @@ async function handle(req, res) {
         });
       }
 
-      const failures = [];
-      for (const model of targets) {
-        try { await ollamaJSON('POST', '/api/generate', { model, keep_alive: 0 }, 30000); }
-        catch (error) { failures.push({ model, error: error.message }); }
-      }
+      const failures = await unloadOllamaModels(targets);
 
       let stillRunning;
       try { stillRunning = await waitForOllamaUnload(targets); }

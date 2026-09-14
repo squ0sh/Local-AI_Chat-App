@@ -254,13 +254,26 @@
       }
     }catch{}
     agentLoop.running=true;agentLoop.plan=plan;const finalizer=appendEvent('pending',plan?'plan · starting':'agent · starting',task);
+    const controller=new AbortController();let lastFrame=Date.now(),warned=false,timedOut=false;
+    const watchdog=setInterval(()=>{
+      if(!agentLoop.running){clearInterval(watchdog);return}
+      const idle=Date.now()-lastFrame;
+      if(idle>360000){
+        timedOut=true;clearInterval(watchdog);
+        try{fetch('/api/agent/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).catch(()=>{})}catch{}
+        controller.abort();
+      }else if(idle>120000&&!warned){
+        warned=true;finalizer('pending','still loading the local model…','This machine can take a minute or two to start a model. Waiting for the first response…');
+      }
+    },5000);
     try{
-      const res=await fetch('/api/agent/loop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({task,model:model.value,autonomy,skill_prompt:skillPrompt,plan,chat_id:chatId,history})});
+      const res=await fetch('/api/agent/loop',{method:'POST',headers:{'Content-Type':'application/json'},signal:controller.signal,body:JSON.stringify({task,model:model.value,autonomy,skill_prompt:skillPrompt,plan,chat_id:chatId,history})});
       if(!res.ok){const err=await res.json().catch(()=>({}));throw Error(err.error||`HTTP ${res.status}`)}
       const reader=res.body.getReader(),decoder=new TextDecoder();let buffer='';
       while(true){
         const {done,value}=await reader.read();
         if(done)break;
+        if(value&&value.byteLength)lastFrame=Date.now();
         buffer+=decoder.decode(value,{stream:true});
         const frames=buffer.split('\n\n');buffer=frames.pop();
         for(const frame of frames){
@@ -271,7 +284,13 @@
         }
       }
       if(buffer.trim()){for(const line of buffer.split('\n')){if(line.startsWith('data: ')){try{handleAgentEvent(JSON.parse(line.slice(6)),finalizer)}catch{}}}}
-    }catch(error){finalizer('error','agent failed',error.message);agentLoop.running=false}
+    }catch(error){
+      if(timedOut)finalizer('error','model load timed out',`No first response from ${(model.value||'the local model').split('/').pop()} after 6 minutes (${new Date().toLocaleTimeString()}). It likely failed to start in the available memory — another model may still be resident. Pick the 1.9 GiB Llama-3.2-3B or Qwen3-4B model, then Retry.`);
+      else if(!controller.signal.aborted)finalizer('error','agent failed',error.message);
+      agentLoop.running=false;
+    }finally{
+      clearInterval(watchdog);
+    }
   }
   const agentAutonomy=()=>{try{return JSON.parse(localStorage.getItem('local-ai-agent-autonomy'))||'selective'}catch{return 'selective'}};
   function startTaskFromInput(){const task=(input.value||'').trim();if(!task){const update=appendEvent('error','task required','Describe what you want Agent to accomplish. Example: /go Fix the bug in server.mjs that crashes on empty chat history');update;return}input.value='';input.dispatchEvent(new Event('input',{bubbles:true}));runAgentTask(task,agentAutonomy())}

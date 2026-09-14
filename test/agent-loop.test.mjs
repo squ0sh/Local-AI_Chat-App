@@ -49,3 +49,51 @@ test('agent loop invokes llmCall with onToken as the third argument', async () =
   assert.ok(Array.isArray(tools), 'tools should be an array');
   assert.equal(passedToken, onToken, 'third argument must be the onToken callback');
 });
+
+test('agent loop blocks an exact repeated tool call and lets the run complete', async () => {
+  const events = [];
+  let step = 0;
+  const llmCall = async () => {
+    step += 1;
+    if (step === 1) return { content: '', tool_calls: [{ name: 'list_dir', arguments: { path: '.' } }], tokens: 1 };
+    if (step === 2) return { content: '', tool_calls: [{ name: 'list_dir', arguments: { path: '.' } }], tokens: 1 };
+    return { content: 'Done.', tool_calls: [], tokens: 1 };
+  };
+  const result = await runAgentLoop({
+    task: 'list the root',
+    model: 'test-model',
+    workspaceRoot: '/tmp',
+    autonomy: 'auto',
+    llmCall,
+    signal: new AbortController().signal,
+    onEvent: (e) => events.push(e),
+  });
+  assert.equal(result.status, 'complete');
+  const results = events.filter((e) => e.type === 'tool_result');
+  assert.equal(results.length, 2, 'first call executed, repeat was blocked');
+  assert.equal(results.filter((t) => t.result?.repeated).length, 1, 'one call flagged as repeated');
+  assert.equal(results.filter((t) => !t.result?.repeated).length, 1, 'one call actually executed');
+});
+
+test('agent loop does not block different tool calls', async () => {
+  const events = [];
+  let step = 0;
+  const llmCall = async () => {
+    step += 1;
+    if (step === 1) return { content: '', tool_calls: [{ name: 'list_dir', arguments: { path: '.' } }], tokens: 1 };
+    if (step === 2) return { content: '', tool_calls: [{ name: 'list_dir', arguments: { path: 'lib' } }], tokens: 1 };
+    return { content: 'Done.', tool_calls: [], tokens: 1 };
+  };
+  const result = await runAgentLoop({
+    task: 'list a couple of dirs',
+    model: 'test-model',
+    workspaceRoot: '/tmp',
+    autonomy: 'auto',
+    llmCall,
+    signal: new AbortController().signal,
+    onEvent: (e) => events.push(e),
+  });
+  assert.equal(result.status, 'complete');
+  const results = events.filter((e) => e.type === 'tool_result');
+  assert.equal(results.filter((t) => t.result?.repeated).length, 0, 'different calls are never treated as repeats');
+});
