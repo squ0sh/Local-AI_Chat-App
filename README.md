@@ -74,6 +74,20 @@ Release builds are signed with the private key (`~/.capsule-signing/key.pem`,
 never committed). Keep that key on the release machine only; consumers ship and
 verify against the pinned public key `capsule-signing-pub.pem`.
 
+A versioned pre-commit hook refills the manifest automatically, so a normal
+"edit, commit, push" workflow never leaves the release files and their
+fingerprints out of sync. Enable it once per clone:
+
+```
+npm run hooks:install
+```
+
+On every commit that touches a guarded file the hook runs `npm run integrity`
+and stages the refreshed manifest; it refuses a commit where a guarded file has
+both staged and unstaged edits, so a refresh never pins half-applied work.
+`npm run integrity:check` compares the pinned files against the manifest without
+writing anything and is part of `npm run ci` for a readable check.
+
 ### Curated local model choices
 
 Open **Model library** in the Capsule sidebar. It shows what is installed,

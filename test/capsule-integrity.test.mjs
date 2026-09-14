@@ -5,7 +5,7 @@ import { tmpdir } from 'os';
 import { dirname, join } from 'path';
 import { gzipSync, gunzipSync } from 'zlib';
 import { createHash } from 'crypto';
-import { buildReleaseManifest, repairReleaseFiles, rebuildManifest, releaseTrackedPaths } from '../lib/capsule-integrity.mjs';
+import { buildReleaseManifest, integrityCheck, repairReleaseFiles, rebuildManifest, releaseTrackedPaths } from '../lib/capsule-integrity.mjs';
 
 function sha(buf) {
   return createHash('sha256').update(buf).digest('hex');
@@ -115,6 +115,47 @@ test('repairReleaseFiles refuses hostile manifest entries and unknown paths', ()
 
     const unknown = repairReleaseFiles(root, manifestFile, { allowUnsigned: true, path: 'does-not-exist.mjs' });
     assert.ok(unknown.failed.some((f) => f.path === 'does-not-exist.mjs'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('integrityCheck reports drift read-only and never modifies files', () => {
+  const root = mkdtempSync(join(tmpdir(), 'capsule-check-'));
+  try {
+    stageTree(root);
+    rebuildManifest(root);
+    const manifestFile = join(root, 'capsule-integrity.json');
+    const before = readFileSync(manifestFile);
+
+    const clean = integrityCheck(root, manifestFile);
+    assert.equal(clean.ok, true);
+    assert.deepEqual(clean.drifted, []);
+    assert.equal(clean.files, JSON.parse(readFileSync(manifestFile, 'utf8')).files.length);
+    assert.equal(clean.signed, false);
+
+    writeFileSync(join(root, 'skills.json'), 'tampered');
+    const drift = integrityCheck(root, manifestFile);
+    assert.equal(drift.ok, false);
+    assert.deepEqual(drift.drifted, ['skills.json']);
+    assert.equal(readFileSync(manifestFile).toString(), before.toString());
+
+    rmSync(join(root, 'capsule.json'));
+    const gone = integrityCheck(root, manifestFile);
+    assert.equal(gone.ok, false);
+    assert.ok(gone.drifted.includes('capsule.json'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('integrityCheck flags an unreadable manifest without throwing', () => {
+  const root = mkdtempSync(join(tmpdir(), 'capsule-check-missing-'));
+  try {
+    stageTree(root);
+    const check = integrityCheck(root, join(root, 'capsule-integrity.json'));
+    assert.equal(check.ok, false);
+    assert.ok(check.error.includes('Cannot read'));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

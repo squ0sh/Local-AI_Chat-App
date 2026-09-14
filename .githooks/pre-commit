@@ -1,0 +1,35 @@
+#!/bin/sh
+# Auto-refresh capsule-integrity.json before committing changes to guarded
+# release files, so the fingerprint file never drifts from the code. Enable
+# once per clone with `npm run hooks:install` (sets core.hooksPath).
+set -eu
+
+ROOT="$(git rev-parse --show-toplevel)"
+MANIFEST="capsule-integrity.json"
+
+guarded() {
+  git diff --cached --name-only --diff-filter=ACMR | grep -v "^$MANIFEST$" || true
+}
+
+ambiguous() {
+  for f in $(guarded); do
+    if git diff --name-only -- "$f" | grep -qx "$f"; then
+      echo "pre-commit: '$f' has staged AND unstaged changes; commit or stash the unstaged part first so the manifest refresh is unambiguous." >&2
+      return 0
+    fi
+  done
+  return 1
+}
+
+if [ -z "$(guarded)" ]; then
+  exit 0
+fi
+
+if ambiguous; then
+  exit 1
+fi
+
+echo "pre-commit: refreshing capsule-integrity.json…"
+( cd "$ROOT" && node tools/generate-integrity.mjs )
+git add "$MANIFEST"
+echo "pre-commit: fingerprint file updated and staged."

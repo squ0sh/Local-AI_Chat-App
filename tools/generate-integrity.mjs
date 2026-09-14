@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync } from 'fs';
 import { homedir } from 'os';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
-import { buildReleaseManifest, canonicalManifest, pubkeyFingerprint, verifyManifestSignature } from '../lib/capsule-integrity.mjs';
+import { buildReleaseManifest, canonicalManifest, integrityCheck, pubkeyFingerprint, verifyManifestSignature } from '../lib/capsule-integrity.mjs';
 
 const appDir = join(dirname(fileURLToPath(import.meta.url)), '..');
 const SIGNING_KEY = process.env.CAPSULE_SIGNING_KEY || join(homedir(), '.capsule-signing', 'key.pem');
@@ -13,6 +13,17 @@ const manifestPath = join(appDir, 'capsule-integrity.json');
 // or corrupt file can be restored entirely offline (see repairReleaseFiles in
 // lib/capsule-integrity.mjs).
 const manifest = buildReleaseManifest(appDir, { embedContent: true });
+
+if (process.argv.includes('--check')) {
+  const check = integrityCheck(appDir, manifestPath);
+  if (check.ok) {
+    console.log('Capsule files match the integrity manifest (' + (check.files) + ' files' + (check.signed ? ', signed' : ', unsigned') + ').');
+    process.exit(0);
+  }
+  console.error('Capsule integrity check FAILED: ' + (check.error || '') + (check.drifted.length ? '\n  drifted: ' + check.drifted.join(', ') : ''));
+  console.error('Run `npm run integrity` after intentional changes, or restore the drifted files (Portable readiness panel -> Restore).');
+  process.exit(1);
+}
 
 let current = null;
 try { current = JSON.parse(readFileSync(manifestPath, 'utf8')); } catch {}
