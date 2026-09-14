@@ -62,7 +62,7 @@
     body.agent-terminal-mode #agent-shell-status{display:flex}
     #agent-shell-status .agent-live-dot{width:7px;height:7px;border-radius:50%;background:var(--agent-green);box-shadow:0 0 9px #70e1a588}
     #agent-shell-status .agent-shell-model{max-width:145px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--agent-dim)}
-    body.agent-terminal-mode .messages{width:min(980px,100%);padding-top:24px}
+    body.agent-terminal-mode .messages{width:min(980px,100%);padding-top:24px;display:flex;flex-direction:column;justify-content:flex-end;min-height:100%}
     body.agent-terminal-mode .message{grid-template-columns:18px minmax(0,1fr);gap:9px;margin-bottom:18px}
     body.agent-terminal-mode .message .avatar{width:18px;height:22px;border:0;border-radius:0;background:transparent;color:var(--agent-green);font-size:0}
     body.agent-terminal-mode .message.user .avatar::after{content:'›';font:700 17px var(--mono)}
@@ -82,7 +82,7 @@
     body.agent-terminal-mode .composer-foot{width:min(980px,100%);color:var(--agent-dim);font-family:var(--mono)}
     body.agent-terminal-mode .send{border-radius:6px;background:var(--agent-green);color:#07100a}
     body.agent-terminal-mode .compose-icon{color:var(--agent-dim)}
-    #agent-empty-hint{display:none;justify-content:center;padding:26px 12px 4px;color:var(--agent-dim);font:600 12.5px var(--mono);text-align:center}
+    #agent-empty-hint{display:none;justify-content:center;padding:20px 12px 10px;color:var(--agent-dim);font:600 12.5px var(--mono);text-align:center}
     #agent-empty-hint.show{display:flex}
     body.agent-terminal-mode .welcome{display:none}
     #agent-simple-guide{width:min(980px,100%);align-items:center;justify-content:space-between;gap:12px;margin:7px auto 0;color:var(--agent-dim);font:11px/1.4 var(--mono)}body.agent-terminal-mode #agent-simple-guide{display:flex}#agent-tools-button{flex:none;border:1px solid var(--agent-line);border-radius:6px;background:#0c1711;color:var(--agent-green);padding:6px 10px;font:11px var(--mono)}#agent-tools-button:hover{border-color:var(--agent-green)}
@@ -388,7 +388,7 @@
   }
   function syncEmptyHint(){
     if(!emptyHint.isConnected)messages.prepend(emptyHint);
-    emptyHint.classList.toggle('show',isEnabled()&&Boolean(messages.querySelector('.welcome')));
+    emptyHint.classList.toggle('show',isEnabled()&&!messages.querySelector('.agent-terminal-event,.message'));
   }
   function applyMode(){
     const active=isEnabled();document.body.classList.toggle('agent-terminal-mode',active);shell.querySelector('.agent-shell-model').textContent=modelLabel();input.placeholder=active?'Describe what you want Agent to accomplish…':originalPlaceholder;if(!active)hideMenu();decorateMessages();syncEmptyHint();
