@@ -656,7 +656,7 @@ async function ollamaContextFor(model) {
   return context;
 }
 
-async function streamOllamaChat({ model, messages, signal, numCtx, temperature = 0.2, tools, onToken, stepTimeout = 300_000 }) {
+async function streamOllamaChat({ model, messages, signal, numCtx, temperature = 0.2, tools, onToken, onReasoning, stepTimeout = 300_000 }) {
   const headers = { 'Content-Type': 'application/json' };
   if (process.env.OLLAMA_API_KEY) headers.Authorization = 'Bearer ' + process.env.OLLAMA_API_KEY;
   const controller = new AbortController();
@@ -689,6 +689,8 @@ async function streamOllamaChat({ model, messages, signal, numCtx, temperature =
         try { chunk = JSON.parse(trimmed); } catch { continue; }
         const delta = chunk.message?.content;
         if (typeof delta === 'string' && delta) { content += delta; tokenCount += 1; onToken?.(delta); }
+        const reasoningDelta = chunk.message?.reasoning_content;
+        if (typeof reasoningDelta === 'string' && reasoningDelta) onReasoning?.(reasoningDelta);
         if (Array.isArray(chunk.message?.tool_calls) && chunk.message.tool_calls.length) toolCalls = chunk.message.tool_calls;
       }
     }
@@ -702,6 +704,22 @@ async function streamOllamaChat({ model, messages, signal, numCtx, temperature =
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener('abort', abort);
+  }
+}
+
+async function modelSupportsTools(model) {
+  try {
+    const tags = await ollamaTags();
+    const tag = tags.find((t) => modelNamesMatch(t.name || t.model, model));
+    if (tag && Array.isArray(tag.capabilities)) return tag.capabilities.includes('tools');
+    if (!tag) return false;
+  } catch {}
+  try {
+    const show = await ollamaJSON('POST', '/api/show', { model }, 12000);
+    const caps = show?.capabilities || show?.model?.capabilities || [];
+    return Array.isArray(caps) && caps.includes('tools');
+  } catch {
+    return false;
   }
 }
 
@@ -2215,6 +2233,7 @@ async function handle(req, res) {
       const autonomy = ['supervised', 'selective', 'auto'].includes(payload.autonomy) ? payload.autonomy : 'selective';
       const skillPrompt = String(payload.skill_prompt || '').trim();
       const readonly = Boolean(payload.plan);
+      const supportsTools = await modelSupportsTools(model);
 
       // Per-chat conversational memory: continue the saved thread, or seed from
       // recent chat history when this chat has no saved agent context yet.
@@ -2250,11 +2269,13 @@ async function handle(req, res) {
 
       // LLM call function (streams tokens through SSE when connected)
       const llmCall = async (messages, tools, onToken) => {
+        const usableTools = supportsTools ? tools : [];
         const numCtx = await ollamaContextFor(model);
         const streamed = await streamOllamaChat({
           model, messages, signal: controller.signal, numCtx, temperature: 0.3,
-          tools: tools.map(t => ({ type: 'function', function: t.function })),
+          tools: usableTools.map(t => ({ type: 'function', function: t.function })),
           onToken: onToken ? (delta) => sendSSE({ type: 'token', delta }) : undefined,
+          onReasoning: (delta) => sendSSE({ type: 'reasoning', delta }),
         });
         return {
           content: streamed.content,
@@ -2290,6 +2311,7 @@ async function handle(req, res) {
         const result = await runAgentLoop({
           task, model, workspaceRoot: __dirname, autonomy, skillPrompt, readonly,
           initialMessages: savedThread, onEvent, llmCall, signal: controller.signal,
+          supportsTools,
         });
         loopResult = result;
         if (chatId && Array.isArray(loopResult.thread)) saveAgentThread(chatId, loopResult.thread);

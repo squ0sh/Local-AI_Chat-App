@@ -190,6 +190,20 @@
     if(final)final.textContent=`agent response · streaming… (${agentStream.count} chunks)`;
     if(scroll)scroll.scrollTop=scroll.scrollHeight;
   }
+  let agentReasoning={update:null,count:0};
+  function streamAgentReasoning(delta){
+    if(!delta)return;
+    if(!agentReasoning.update){
+      agentReasoning.update=appendEvent('info','reasoning · thinking…');
+      agentReasoning.count=0;
+    }
+    agentReasoning.update.detail.textContent+=delta;
+    agentReasoning.update.detail.hidden=false;
+    agentReasoning.count+=1;
+    const heading=agentReasoning.update.elements?.heading;
+    if(heading)heading.textContent=`reasoning · thinking… (${agentReasoning.count} chunks)`;
+    if(scroll)scroll.scrollTop=scroll.scrollHeight;
+  }
   function approveDialog(id,name,args){return new Promise(resolve=>{
     const item=document.createElement('article'),mark=document.createElement('div'),content=document.createElement('div'),heading=document.createElement('div'),detail=document.createElement('pre'),row=document.createElement('div');
     item.className='agent-terminal-event pending agent-approval';mark.className='agent-event-mark';content.className='agent-event-content';heading.className='agent-event-title';detail.className='agent-event-body';mark.textContent='?';heading.textContent=`approve ${toolLabel[name]||name}`;detail.textContent=JSON.stringify(args,null,2);
@@ -200,11 +214,15 @@
   })}
   function handleAgentEvent(data,finalizer){
     if(data.type==='token'){return streamAgentTokens(data.delta)}
+    if(data.type==='reasoning'){return streamAgentReasoning(data.delta)}
     if(data.type==='stream_end'||data.type==='streaming'){return}
-    if(data.type==='completed'){if(agentStream.update){agentStream.update('success','agent response · complete','');agentStream.update=null}if(agentLoop.plan){finalizer('success','plan ready — review it, then /go to execute',data.content||'')}else{finalizer('success','agent complete',data.content||'');if(typeof window.appendAgentResponse==='function'){try{window.appendAgentResponse(data.content||'',data.toolTrail||[])}catch{}}}agentLoop.running=false;agentLoop.plan=false;return}
-    agentStream.update=null;
+    if(data.type==='completed'){
+      if(agentStream.update){const streamed=agentStream.update.detail?.textContent||'';agentStream.update('success','agent response · complete',streamed);agentStream.update=null}
+      if(agentReasoning.update){const thought=agentReasoning.update.detail?.textContent||'';agentReasoning.update('info','reasoning · complete',thought);agentReasoning.update=null}
+      if(agentLoop.plan){finalizer('success','plan ready — review it, then /go to execute',data.content||'')}else{finalizer('success','agent complete',data.content||'');if(typeof window.appendAgentResponse==='function'){try{window.appendAgentResponse(data.content||'',data.toolTrail||[])}catch{}}}agentLoop.running=false;agentLoop.plan=false;return}
+    agentStream.update=null;agentReasoning.update=null;
     if(data.type==='started'){finalizer('pending','agent started','');return}
-    if(data.type==='thinking'){finalizer('pending',data.message||`step ${data.iteration}`);return}
+    if(data.type==='thinking'){appendEvent('pending',data.message||`step ${data.iteration} · thinking`);return}
     if(data.type==='tool_call'){const t=appendEvent('pending',`proposing ${toolLabel[data.name]||data.name}`,JSON.stringify(data.arguments));return}
     if(data.type==='executing'){appendEvent('pending',data.message||`running ${toolLabel[data.name]||data.name}`);return}
     if(data.type==='tool_result'){const ok=data.result&&!data.result.error&&!data.result.blocked;appendEvent(ok?'success':'error',`${toolLabel[data.name]||data.name} ${ok?'complete':'returned an issue'}`,JSON.stringify(data.result,null,2).slice(0,4000));return}
