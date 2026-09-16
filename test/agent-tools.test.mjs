@@ -273,3 +273,60 @@ test('agent tools server: organize preview/apply/undo and thread memory endpoint
     rmSync(dataDir, { recursive: true, force: true });
   }
 });
+test('agent mode: plan blocks manual write/command/mcp call, build restores', async () => {
+  const repoRoot = dirname(new URL('../server.mjs', import.meta.url).pathname);
+  const port = await freePort();
+  const dataDir = mkdtempSync(join(tmpdir(), 'agent-mode-data-'));
+  const server = spawn(process.execPath, ['server.mjs', '--mode', 'local', '--host', '127.0.0.1', '--port', String(port)], {
+    cwd: repoRoot,
+    env: { ...process.env, OLLAMA_URL: 'http://127.0.0.1:1', LOCAL_AI_DATA_DIR: dataDir },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let logs = '';
+  server.stdout.on('data', (d) => { logs += d; });
+  server.stderr.on('data', (d) => { logs += d; });
+
+  const base = `http://127.0.0.1:${port}`;
+  const call = async (path, init = {}) => {
+    const r = await fetch(base + path, init);
+    let body = null;
+    try { body = await r.json(); } catch {}
+    return { status: r.status, body };
+  };
+  const waitReady = async () => {
+    for (let i = 0; i < 100; i += 1) {
+      try { const r = await fetch(base + '/health'); if (r.status < 500) return; } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error('server did not become ready\n' + logs);
+  };
+
+  try {
+    await waitReady();
+    const jsonInit = (body) => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+
+    assert.equal((await call('/api/agent/mode')).body.mode, 'build', 'mode defaults to build');
+
+    const toPlan = await call('/api/agent/mode', jsonInit({ mode: 'plan' }));
+    assert.equal(toPlan.status, 200);
+    assert.equal(toPlan.body.mode, 'plan');
+
+    for (const path of ['/api/agent/command', '/api/agent/write', '/api/agent/organize/apply', '/api/agent/mcp/call']) {
+      const r = await call(path, jsonInit({}));
+      assert.equal(r.status, 409, `${path} blocked in plan mode`);
+      assert.equal(r.body.requiresBuild, true, `${path} advertises requiresBuild`);
+    }
+
+    await call('/api/agent/mode', jsonInit({ mode: 'build' }));
+    const writeAfter = await call('/api/agent/write', jsonInit({ path: 'x', content: 'y' }));
+    assert.equal(writeAfter.status, 403, 'build mode lifts the plan gate back to normal approval checks');
+    assert.match(writeAfter.body.error, /approval/i);
+
+    const mcpAfter = await call('/api/agent/mcp/call', jsonInit({ clientId: 'nope', tool: 'echo', arguments: {} }));
+    assert.equal(mcpAfter.status, 404, 'mcp gate lifted in build mode (fails on missing client, not 409)');
+  } finally {
+    server.kill('SIGTERM');
+    await new Promise((resolve) => { server.once('exit', resolve); setTimeout(resolve, 3000); });
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});

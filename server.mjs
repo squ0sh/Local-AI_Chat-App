@@ -152,6 +152,18 @@ const activeAgentLoops = new Map();
 // Per-chat thread locks so two /api/agent/loop calls never interleave for one chat.
 const activeAgentThreads = new Set();
 const pendingApprovalsGlobal = new Map();
+// Active agent mode: 'plan' (read-only) or 'build' (full access). Set by the
+// agent loop and via POST /api/agent/mode; manual write/command endpoints gate
+// on it so plan mode holds regardless of which command or tool is invoked.
+let currentAgentMode = 'build';
+const PLAN_MODE_BLOCK = 'Plan mode is active — switch to Build mode to run commands or change files.';
+function planModeBlocks(res) {
+  if (currentAgentMode === 'plan') {
+    sendJSON(res, 409, { error: PLAN_MODE_BLOCK, requiresBuild: true, mode: 'plan' });
+    return true;
+  }
+  return false;
+}
 // Requests asking for more output than this are clamped, not rejected.
 const MAX_REQUEST_TOKENS = 8192;
 let remoteTunnel = { child: null, url: '', token: '', expiresAt: 0, timer: null };
@@ -2140,6 +2152,7 @@ async function handle(req, res) {
     if (req.method === 'POST' && p === '/api/agent/write') {
       let payload;
       try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      if (planModeBlocks(res)) return;
       if (payload.approval !== 'write') return sendJSON(res, 403, { error: 'Explicit write approval is required' });
       if (typeof payload.content !== 'string' || payload.content.length > 1_000_000) return sendJSON(res, 400, { error: 'Content must be text under 1 MB' });
       const wrote = agentWriteFile(__dirname, payload.path, payload.content);
@@ -2150,6 +2163,7 @@ async function handle(req, res) {
     if (req.method === 'POST' && p === '/api/agent/command') {
       let payload;
       try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      if (planModeBlocks(res)) return;
       const command = typeof payload.command === 'string' ? payload.command.trim() : '';
       if (payload.approval !== 'run') return sendJSON(res, 403, { error: 'Explicit command approval is required' });
       if (!command || command.length > 500) return sendJSON(res, 400, { error: 'Command must be between 1 and 500 characters' });
@@ -2223,6 +2237,7 @@ async function handle(req, res) {
     if (p === '/api/agent/mcp/call') {
       let payload;
       try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      if (planModeBlocks(res)) return;
       const { clientId, tool, arguments: args = {} } = payload;
       if (!clientId || !tool) return sendJSON(res, 400, { error: 'clientId and tool are required' });
       const client = mcpClients.get(clientId);
@@ -2244,6 +2259,19 @@ async function handle(req, res) {
       return sendJSON(res, 200, { ok: true });
     }
 
+    // ── Agent mode: Plan (read-only) / Build ────────────────────────────────
+    if (req.method === 'GET' && p === '/api/agent/mode') {
+      return sendJSON(res, 200, { mode: currentAgentMode });
+    }
+    if (req.method === 'POST' && p === '/api/agent/mode') {
+      let payload;
+      try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      const nextMode = payload.mode === 'plan' || payload.mode === 'build' ? payload.mode : null;
+      if (!nextMode) return sendJSON(res, 400, { error: 'mode must be "plan" or "build"' });
+      currentAgentMode = nextMode;
+      return sendJSON(res, 200, { mode: currentAgentMode });
+    }
+
     // ── Agent loop: autonomous observe→think→act cycle ────────────────────
     if (req.method === 'POST' && p === '/api/agent/loop') {
       let payload;
@@ -2255,7 +2283,9 @@ async function handle(req, res) {
       if (!model) return sendJSON(res, 400, { error: 'model is required' });
       const autonomy = ['supervised', 'selective', 'auto'].includes(payload.autonomy) ? payload.autonomy : 'selective';
       const skillPrompt = String(payload.skill_prompt || '').trim();
-      const readonly = Boolean(payload.plan);
+      const mode = payload.mode === 'plan' || payload.mode === 'build' ? payload.mode : (payload.plan ? 'plan' : 'build');
+      const readonly = mode === 'plan';
+      if (mode === 'plan') currentAgentMode = 'plan';
       const supportsTools = await modelSupportsTools(model);
 
       // Per-chat conversational memory: continue the saved thread, or seed from
@@ -2386,6 +2416,7 @@ async function handle(req, res) {
     if (req.method === 'POST' && p === '/api/agent/organize/apply') {
       let payload;
       try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      if (planModeBlocks(res)) return;
       if (payload.approval !== 'organize') return sendJSON(res, 403, { error: 'Explicit organize approval is required' });
       const plan = buildOrganizePlan(__dirname, payload.path, payload.style);
       if (!plan.ok) return sendJSON(res, 400, { error: plan.error });

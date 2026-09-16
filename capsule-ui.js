@@ -62,6 +62,8 @@
     body.agent-terminal-mode #agent-shell-status{display:flex}
     #agent-shell-status .agent-live-dot{width:7px;height:7px;border-radius:50%;background:var(--agent-green);box-shadow:0 0 9px #70e1a588}
     #agent-shell-status .agent-shell-model{max-width:145px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--agent-dim)}
+    #agent-shell-status .agent-shell-mode{margin-left:auto;flex:none;padding:1px 7px;border-radius:5px;border:1px solid var(--agent-line);background:#0c1711;color:var(--agent-green);font-size:10px;font-weight:800;text-transform:uppercase;letter-spacing:.05em}.agent-shell-mode.plan{color:#ffd27d;border-color:#6b5b2e;background:#1b160c}
+    #agent-simple-guide .agent-mode-chip{display:flex;gap:2px;padding:2px;border:1px solid var(--agent-line);border-radius:6px;background:#0c1711}.agent-mode-chip button{border:0;border-radius:4px;background:transparent;color:var(--agent-dim);padding:4px 9px;font:600 11px var(--mono);cursor:pointer}.agent-mode-chip button:hover{color:#d9e7de}.agent-mode-chip button.active{background:var(--agent-green);color:#07100a}.agent-mode-chip button.active[data-mode="plan"]{background:#5b4a1f;color:#ffe2a6}
     body.agent-terminal-mode .messages{width:min(980px,100%);padding-top:24px;display:flex;flex-direction:column;justify-content:flex-end;min-height:100%}
     body.agent-terminal-mode .message{grid-template-columns:18px minmax(0,1fr);gap:9px;margin-bottom:18px}
     body.agent-terminal-mode .message .avatar{width:18px;height:22px;border:0;border-radius:0;background:transparent;color:var(--agent-green);font-size:0}
@@ -94,6 +96,7 @@
     .agent-terminal-event{display:none}
     body.agent-terminal-mode .agent-terminal-event{display:grid;grid-template-columns:18px minmax(0,1fr);gap:9px;margin:0 0 16px;color:#d8e5dc;font:12px/1.55 var(--mono)}
     .agent-terminal-event .agent-event-mark{color:var(--agent-green);font-weight:800}.agent-terminal-event.error .agent-event-mark{color:#ff8d98}.agent-terminal-event.pending .agent-event-mark{animation:agentPulse .9s infinite alternate}
+    .agent-mode-row{display:flex;gap:6px;margin:4px 0}.agent-mode-row .agent-mode-seg{flex:1;border-color:var(--agent-line);color:var(--agent-dim);font-weight:700}.agent-mode-row .agent-mode-seg.active{border-color:var(--agent-green);color:var(--agent-green);background:#0c1711}.agent-mode-row .agent-mode-seg.active[data-mode="plan"]{border-color:#ffd27d;color:#ffd27d}
     .agent-terminal-event .agent-event-title{color:#dcece2;font-weight:700}.agent-terminal-event .agent-event-body{margin-top:4px;color:#9fb0a6;white-space:pre-wrap;overflow-wrap:anywhere;max-height:290px;overflow:auto}
     .agent-processing{display:flex;align-items:center;gap:8px;color:var(--agent-dim)}.agent-processing .agent-spinner{color:var(--agent-green);animation:agentSpin .85s steps(8) infinite}.agent-processing small{display:block;margin-top:2px;color:#708078}
     #agent-research-dialog .settings{width:min(820px,calc(100vw - 24px))}.research-mode-row{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:10px 0}.research-mode{display:flex!important;align-items:flex-start;gap:8px;border:1px solid var(--line);border-radius:8px;padding:9px;background:var(--panel2)}.research-mode input{width:auto!important;margin-top:2px}.research-mode span{display:block;color:var(--muted);font-size:11px;margin-top:2px}.research-status{max-height:110px;overflow:auto;white-space:pre-wrap}.research-report{max-height:42vh;overflow:auto;border:1px solid var(--line);border-radius:8px;background:var(--panel2);padding:13px;white-space:pre-wrap;font:12px/1.6 var(--mono);color:var(--text)}.research-sources{display:grid;gap:5px;margin-top:10px}.research-sources a{color:var(--blue2);font-size:12px;overflow-wrap:anywhere}.research-recent{display:grid;gap:5px;max-height:135px;overflow:auto}.research-recent button{width:100%;text-align:left}.research-offline-note{color:var(--muted);font-size:11px}
@@ -103,18 +106,17 @@
   `;
   document.head.append(style);
 
-  const shell=document.createElement('div');shell.id='agent-shell-status';shell.innerHTML='<span class="agent-live-dot"></span><strong>agent</strong><span class="agent-shell-model"></span>';topbar.insertBefore(shell,model);
+  const shell=document.createElement('div');shell.id='agent-shell-status';shell.innerHTML='<span class="agent-live-dot"></span><strong>agent</strong><span class="agent-shell-mode"></span><span class="agent-shell-model"></span>';topbar.insertBefore(shell,model);
   const prefix=document.createElement('span');prefix.id='agent-prompt-prefix';prefix.textContent='›';composer.insertBefore(prefix,input);
   const menu=document.createElement('div');menu.id='agent-slash-menu';menu.setAttribute('role','listbox');menu.setAttribute('aria-label','Agent commands');composer.append(menu);
-  const guide=document.createElement('div');guide.id='agent-simple-guide';guide.innerHTML='<span>Describe the result you want. Agent will pause before commands or file changes.</span><button type="button" id="agent-tools-button">Tools</button>';foot.after(guide);const toolsButton=guide.querySelector('#agent-tools-button');
+  const guide=document.createElement('div');guide.id='agent-simple-guide';guide.innerHTML='<span>Describe the result you want. Agent will pause before commands or file changes.</span><span class="agent-mode-chip" id="agent-mode-chip"><button type="button" data-mode="plan" title="Plan mode: read, search, and plan — no changes">⚑ Plan</button><button type="button" data-mode="build" title="Build mode: plan, edit, and run commands">⚒ Build</button></span><button type="button" id="agent-tools-button">Tools</button>';foot.after(guide);const toolsButton=guide.querySelector('#agent-tools-button');
+  guide.querySelectorAll('#agent-mode-chip button[data-mode]').forEach(btn=>{btn.onclick=()=>{if(!agentLoop||agentLoop.running){return}setAgentMode(btn.dataset.mode)}});
   const originalPlaceholder=input.placeholder;
   const emptyHint=document.createElement('div');emptyHint.id='agent-empty-hint';emptyHint.textContent='Describe what you want Agent to accomplish…';messages.prepend(emptyHint);
   let selected=0,history=[],historyIndex=0,pendingContext='';
   const commands=[
     {name:'/help',description:'Show all Agent commands'},
-    {name:'/status',description:'Check the local model and memory'},
-    {name:'/go',usage:' <task>',description:'Run Agent autonomously (plan, read, write, run commands)'},
-    {name:'/plan',usage:' <task>',description:'Read and search, then produce a plan — changes nothing'},
+    {name:'/status',description:'Check the local model, memory, and agent mode'},
     {name:'/git',usage:' [sub]',description:'Read-only git status / diff / log'},
     {name:'/test',usage:' [name]',description:'Run the project test suite (asks first)'},
     {name:'/find',usage:' <name>',description:'Find files by name or glob pattern'},
@@ -173,8 +175,26 @@
   async function cancelResearch(){if(!research.id)return false;stopResearchPoll();try{await json('/api/research/'+encodeURIComponent(research.id),{method:'DELETE'});researchStatus.textContent='Stopping after the current local-model or web request…';research.timer=setTimeout(pollResearch,300);return true}catch(error){researchStatus.textContent='Could not cancel research: '+error.message;return false}}
   async function openResearch(question=''){if(question)researchQuestion.value=question;researchDialog.showModal();await loadSavedResearch();researchQuestion.focus()}
 
-  // ── Autonomous agent loop (/go) ─────────────────────────────────────────
-  let agentLoop={loopId:'',running:false,plan:false};
+  // ── Autonomous agent loop (mode toggle drives every run) ───────────────
+  let agentLoop={loopId:'',running:false,plan:false,task:'',autonomy:'selective'};
+  let pendingPlan=null;
+  const modeKey='local-ai-agent-mode';
+  const agentMode=()=>{try{return localStorage.getItem(modeKey)==='plan'?'plan':'build'}catch{return 'build'}};
+  function paintMode(){
+    const mode=agentMode();
+    const chip=document.getElementById('agent-mode-chip');
+    if(chip&&!agentLoop.running)chip.querySelectorAll('button[data-mode]').forEach(btn=>btn.classList.toggle('active',btn.dataset.mode===mode));
+    const badge=document.querySelector('#agent-shell-status .agent-shell-mode');
+    if(badge){badge.textContent=(agentLoop.running&&agentLoop.plan)?'plan':mode;badge.classList.toggle('plan',mode==='plan'||agentLoop.plan)}
+    const dialogPlan=document.getElementById('dialog-mode-plan'),dialogBuild=document.getElementById('dialog-mode-build');
+    if(dialogPlan&&dialogBuild){dialogPlan.classList.toggle('active',mode==='plan');dialogBuild.classList.toggle('active',mode==='build')}
+  }
+  function setAgentMode(mode){
+    const next=mode==='plan'?'plan':'build';
+    try{localStorage.setItem(modeKey,next)}catch{}
+    paintMode();
+    try{fetch('/api/agent/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:next})}).catch(()=>{})}catch{}
+  }
   const toolLabel={read_file:'read file',write_file:'write file',list_dir:'list directory',run_command:'run command',run_tests:'run tests',search_files:'search files',grep_search:'grep search',git:'git',web_search:'web search',web_fetch:'fetch page'};
   let agentStream={update:null,count:0};
   function streamAgentTokens(delta){
@@ -219,7 +239,11 @@
     if(data.type==='completed'){
       if(agentStream.update){const streamed=agentStream.update.detail?.textContent||'';agentStream.update('success','agent response · complete',streamed);agentStream.update=null}
       if(agentReasoning.update){const thought=agentReasoning.update.detail?.textContent||'';agentReasoning.update('info','reasoning · complete',thought);agentReasoning.update=null}
-      if(agentLoop.plan){finalizer('success','plan ready — review it, then /go to execute',data.content||'')}else{finalizer('success','agent complete',data.content||'');if(typeof window.appendAgentResponse==='function'){try{window.appendAgentResponse(data.content||'',data.toolTrail||[])}catch{}}}agentLoop.running=false;agentLoop.plan=false;return}
+      if(agentLoop.plan){
+        finalizer('success','plan ready','Review the plan, then Approve & implement it — or toggle Plan/Build in the status bar.');
+        pendingPlan={task:agentLoop.task,autonomy:agentLoop.autonomy,content:data.content||''};
+        renderPlanHandoff(pendingPlan);
+      }else{finalizer('success','agent complete',data.content||'');if(typeof window.appendAgentResponse==='function'){try{window.appendAgentResponse(data.content||'',data.toolTrail||[])}catch{}}}agentLoop.running=false;agentLoop.plan=false;paintMode();return}
     agentStream.update=null;agentReasoning.update=null;
     if(data.type==='started'){finalizer('pending','agent started','');return}
     if(data.type==='thinking'){appendEvent('pending',data.message||`step ${data.iteration} · thinking`);return}
@@ -228,14 +252,15 @@
     if(data.type==='tool_result'){const ok=data.result&&!data.result.error&&!data.result.blocked;appendEvent(ok?'success':'error',`${toolLabel[data.name]||data.name} ${ok?'complete':'returned an issue'}`,JSON.stringify(data.result,null,2).slice(0,4000));return}
     if(data.type==='approval_needed'){approveDialog(data.approval_id,data.name,data.arguments);return}
     if(data.type==='completed'){finalizer('success','agent complete',data.content||'');agentLoop.running=false;return}
-    if(data.type==='cancelled'){finalizer('info','agent cancelled');agentLoop.running=false;return}
-    if(data.type==='error'){finalizer('error','agent error',data.message||data.error||'');agentLoop.running=false;return}
+    if(data.type==='cancelled'){finalizer('info','agent cancelled');agentLoop.running=false;agentLoop.plan=false;paintMode();return}
+    if(data.type==='error'){finalizer('error','agent error',data.message||data.error||'');agentLoop.running=false;agentLoop.plan=false;paintMode();return}
     if(data.type==='loop_started'){agentLoop.loopId=data.loop_id;return}
-    if(data.type==='loop_complete'){agentLoop.running=false;if(data.status==='cancelled')finalizer('info','agent cancelled');else if(data.status==='error')finalizer('error','agent error',data.error);return}
+    if(data.type==='loop_complete'){agentLoop.running=false;agentLoop.plan=false;paintMode();if(data.status==='cancelled')finalizer('info','agent cancelled');else if(data.status==='error')finalizer('error','agent error',data.error);return}
   }
-  async function runAgentTask(task,autonomy='selective',skillPrompt='',plan=false){
-    if(agentLoop.running){appendEvent('error','agent already running','Stop or finish the current /go task first.');return}
+  async function runAgentTask(task,autonomy='selective',skillPrompt='',plan=null){
+    if(agentLoop.running){appendEvent('error','agent already running','Stop or finish the current task first.');return}
     if(!model.value){appendEvent('error','no model selected','Choose or install a model first.');return}
+    const isPlan=plan===null?agentMode()==='plan':plan===true;
     let chatId='',history=[];
     try{
       const c=typeof active==='function'?active():null;
@@ -253,7 +278,7 @@
         history=c.messages.slice(-14).map(m=>({role:m.role==='assistant'?'assistant':'user',content:String(m.content||'').slice(0,8000)}));
       }
     }catch{}
-    agentLoop.running=true;agentLoop.plan=plan;const finalizer=appendEvent('pending',plan?'plan · starting':'agent · starting',task);
+    agentLoop.running=true;agentLoop.plan=isPlan;agentLoop.task=task;agentLoop.autonomy=autonomy;paintMode();const finalizer=appendEvent('pending',isPlan?'plan · starting':'agent · starting',task);
     const controller=new AbortController();let lastFrame=Date.now(),warned=false,timedOut=false;
     const watchdog=setInterval(()=>{
       if(!agentLoop.running){clearInterval(watchdog);return}
@@ -267,7 +292,7 @@
       }
     },5000);
     try{
-      const res=await fetch('/api/agent/loop',{method:'POST',headers:{'Content-Type':'application/json'},signal:controller.signal,body:JSON.stringify({task,model:model.value,autonomy,skill_prompt:skillPrompt,plan,chat_id:chatId,history})});
+      const res=await fetch('/api/agent/loop',{method:'POST',headers:{'Content-Type':'application/json'},signal:controller.signal,body:JSON.stringify({task,model:model.value,autonomy,skill_prompt:skillPrompt,mode:isPlan?'plan':'build',chat_id:chatId,history})});
       if(!res.ok){const err=await res.json().catch(()=>({}));throw Error(err.error||`HTTP ${res.status}`)}
       const reader=res.body.getReader(),decoder=new TextDecoder();let buffer='';
       while(true){
@@ -292,26 +317,44 @@
       clearInterval(watchdog);
     }
   }
+  function renderPlanHandoff(plan){
+    const item=document.createElement('article');
+    item.className='agent-terminal-event pending agent-approval agent-plan-handoff';
+    const mark=document.createElement('div');mark.className='agent-event-mark';mark.textContent='✓';
+    const content=document.createElement('div');content.className='agent-event-content';
+    const heading=document.createElement('div');heading.className='agent-event-title';heading.textContent='Plan ready — approve to implement';
+    const row=document.createElement('div');row.style.cssText='display:flex;gap:8px;margin-top:8px';
+    const approve=document.createElement('button'),later=document.createElement('button');
+    approve.className='plain-btn';approve.textContent='✓ Approve & implement';approve.style.borderColor='var(--agent-green)';approve.style.color='var(--agent-green)';
+    later.className='plain-btn';later.textContent='Later (stay in Plan)';
+    approve.onclick=()=>{item.remove();setAgentMode('build');runAgentTask(plan.task,plan.autonomy,'APPROVED PLAN:\n\n'+(plan.content||''))};
+    later.onclick=()=>item.remove();
+    row.append(approve,later);content.append(heading,row);item.append(mark,content);
+    messages.append(item);if(scroll)scroll.scrollTop=scroll.scrollHeight;
+  }
   const agentAutonomy=()=>{try{return JSON.parse(localStorage.getItem('local-ai-agent-autonomy'))||'selective'}catch{return 'selective'}};
-  function startTaskFromInput(){const task=(input.value||'').trim();if(!task){const update=appendEvent('error','task required','Describe what you want Agent to accomplish. Example: /go Fix the bug in server.mjs that crashes on empty chat history');update;return}input.value='';input.dispatchEvent(new Event('input',{bubbles:true}));runAgentTask(task,agentAutonomy())}
+  function startTaskFromInput(){const task=(input.value||'').trim();if(!task){const update=appendEvent('error','task required','Describe what you want Agent to accomplish. Example: Fix the bug in server.mjs that crashes on empty chat history');update;return}input.value='';input.dispatchEvent(new Event('input',{bubbles:true}));runAgentTask(task,agentAutonomy())}
 
   const enableAgent=next=>{enabledInput.checked=true;close.click();setTimeout(next,60)};
   dialog.querySelector('#agent-start-task').onclick=()=>enableAgent(()=>{if(!input.value.trim())input.placeholder='Example: Review this project and tell me what to improve';input.focus()});
   dialog.querySelector('#agent-start-research').onclick=()=>enableAgent(()=>openResearch());
   dialog.querySelector('#agent-choose-skill').onclick=()=>enableAgent(()=>{if(typeof window.openCapsuleSkills==='function')window.openCapsuleSkills();else setTimeout(()=>window.openCapsuleSkills?.(),100)});
   dialog.querySelector('#agent-check-status').onclick=()=>enableAgent(()=>execute('/status'));
+  const dialogPlanBtn=dialog.querySelector('#dialog-mode-plan'),dialogBuildBtn=dialog.querySelector('#dialog-mode-build');
+  if(dialogPlanBtn)dialogPlanBtn.onclick=()=>setAgentMode('plan');
+  if(dialogBuildBtn)dialogBuildBtn.onclick=()=>setAgentMode('build');
   researchStart.onclick=startResearch;researchCancel.onclick=cancelResearch;researchDialog.querySelector('#research-close').onclick=()=>researchDialog.close();researchExport.onclick=()=>{if(!research.result)return;const blob=new Blob([research.result.report||''],{type:'text/markdown;charset=utf-8'}),link=document.createElement('a');link.href=URL.createObjectURL(blob);link.download=`research-${String(research.result.query||'report').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,55)||'report'}.md`;link.click();setTimeout(()=>URL.revokeObjectURL(link.href),1000)};researchContinue.onclick=()=>{if(!research.result)return;pendingContext=`LOCAL RESEARCH REPORT (${research.result.mode}, ${research.result.sources_count} sources)\nQuestion: ${research.result.query}\n\n${trimContext(research.result.report)}`;researchDialog.close();input.value='Using the completed research, ';input.dispatchEvent(new Event('input',{bubbles:true}));input.focus()};
   async function execute(raw){
     const space=raw.indexOf(' '),name=(space<0?raw:raw.slice(0,space)).toLowerCase(),arg=space<0?'':raw.slice(space+1).trim();
     if(name==='/help'){
-      const groups=[['TASKS',['/go','/plan','/test']],['SEARCH & CODE',['/grep','/find','/git','/read','/files']],['FILES',['/run','/write','/undo']],['WEB & RESEARCH',['/search','/research']],['CHAT',['/ask','/new','/model','/agent','/env','/status']],['CONTROL',['/mcp','/skills','/stop','/clear']]];
+      const groups=[['RUN',['/test']],['SEARCH & CODE',['/grep','/find','/git','/read','/files']],['FILES',['/run','/write','/undo']],['WEB & RESEARCH',['/search','/research']],['CHAT',['/ask','/new','/model','/agent','/env','/status']],['CONTROL',['/mcp','/skills','/stop','/clear','/forget']]];
       const lines=['You usually don’t need these — just describe what you want and Agent will handle it. /start opens the friendly Start screen.',''];
       for(const [title,names] of groups){lines.push(title);for(const name of names){const command=commands.find(c=>c.name===name);if(command)lines.push((command.name+(command.usage||'')).padEnd(21)+command.description)}lines.push('')}
       appendEvent('info','Agent commands',lines.join('\n'));return;
     }
     if(name==='/status'){
       const update=appendEvent('pending','checking local runtime…');
-      try{const [health,cockpit]=await Promise.all([json('/health'),json('/api/cockpit')]),loaded=(cockpit.running||[]).map(item=>item.name).join(', ')||'none',free=cockpit.system?.memory_free?`${(cockpit.system.memory_free/1073741824).toFixed(1)} GB free`:'memory unavailable';update('success','local runtime ready',`provider  ${health.provider||'ollama'}\nmodel     ${modelLabel()}\nloaded    ${loaded}\nmemory    ${free}`)}catch(error){update('error','status check failed',error.message)}return;
+      try{const [health,cockpit]=await Promise.all([json('/health'),json('/api/cockpit')]),loaded=(cockpit.running||[]).map(item=>item.name).join(', ')||'none',free=cockpit.system?.memory_free?`${(cockpit.system.memory_free/1073741824).toFixed(1)} GB free`:'memory unavailable';update('success','local runtime ready',`provider  ${health.provider||'ollama'}\nmodel     ${modelLabel()}\nloaded    ${loaded}\nmemory    ${free}\nmode      ${agentMode()} (toggle in the status bar)`)}catch(error){update('error','status check failed',error.message)}return;
     }
     if(name==='/mcp'){
       if(!arg){const update=appendEvent('pending','listing MCP tools…');try{const result=await json('/api/agent/mcp/list');update('success','registered MCP servers',result.clients?.length?result.clients.map(client=>`${client.id} · ${client.serverInfo?.name||'unknown'}${(client.tools||[]).map(tool=>`\n  ${tool.name} — ${tool.description||''}`).join('')}`).join('\n\n')||'(none connected)':'(none connected). Connect one via the MCP panel.');}catch(error){update('error','MCP list failed',error.message)}return}
@@ -385,10 +428,6 @@
         update('success',`search · ${query}`,lines);
       }catch(error){update('error','search failed',error.message)}return;
     }
-    if(name==='/plan'){
-      if(!arg){appendEvent('error','task required','Describe what to plan. Example: /plan add an /env command');return}
-      runAgentTask(arg,agentAutonomy(),'',true);return;
-    }
     if(name==='/ask'){
       const message=(arg||'').trim();
       if(!message){appendEvent('error','message required','Example: /ask summarize the workspace layout');return}
@@ -410,7 +449,6 @@
       }catch(error){update('error','undo failed',error.message)}return;
     }
     if(name==='/research'){openResearch(arg);return}
-    if(name==='/go'){if(!arg){appendEvent('error','task required','Describe what you want Agent to accomplish.\nExample: /go Find and fix the bug that makes the server crash on empty chat history');return}runAgentTask(arg,agentAutonomy());return}
     if(name==='/skills'){
       if(typeof window.openCapsuleSkills!=='function'){appendEvent('error','skills unavailable','The offline skill library could not be opened.');return}window.openCapsuleSkills();return;
     }
@@ -428,7 +466,7 @@
     emptyHint.classList.toggle('show',isEnabled()&&!messages.querySelector('.agent-terminal-event,.message'));
   }
   function applyMode(){
-    const active=isEnabled();document.body.classList.toggle('agent-terminal-mode',active);shell.querySelector('.agent-shell-model').textContent=modelLabel();input.placeholder=active?'Describe what you want Agent to accomplish…':originalPlaceholder;if(!active)hideMenu();decorateMessages();syncEmptyHint();
+    const active=isEnabled();document.body.classList.toggle('agent-terminal-mode',active);shell.querySelector('.agent-shell-model').textContent=modelLabel();input.placeholder=active?'Describe what you want Agent to accomplish…':originalPlaceholder;if(!active)hideMenu();decorateMessages();syncEmptyHint();paintMode();
   }
   function decorateMessages(){
     if(!isEnabled())return;messages.querySelectorAll('.bubble.thinking:not([data-agent-processing])').forEach(bubble=>{bubble.dataset.agentProcessing='true';bubble.textContent='';const row=document.createElement('div'),spinner=document.createElement('span'),copy=document.createElement('span'),title=document.createElement('strong'),detail=document.createElement('small');row.className='agent-processing';spinner.className='agent-spinner';spinner.textContent='◌';title.textContent='analyzing task';detail.textContent='planning the next supervised step with the local model';copy.append(title,detail);row.append(spinner,copy);bubble.append(row)});
