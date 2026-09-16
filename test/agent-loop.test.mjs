@@ -112,3 +112,83 @@ test('toolsForMode: plan mode drops state-changing tools but keeps reads and web
     assert.ok(names(planTools).includes(safe), `plan mode keeps ${safe}`);
   }
 });
+
+test('norms_defer tool is offered in both plan and build mode', () => {
+  const names = (list) => list.map((t) => t.function.name);
+  assert.ok(names(toolsForMode(false)).includes('norms_defer'), 'build mode offers norms_defer');
+  assert.ok(names(toolsForMode(true)).includes('norms_defer'), 'plan mode offers norms_defer');
+});
+
+test('agent loop injects binding norms into the system prompt when passed', async () => {
+  let seen;
+  const llmCall = async (messages) => { seen = messages; return { content: 'ok', tool_calls: [], tokens: 1 }; };
+  await runAgentLoop({
+    task: 'hi',
+    model: 'test-model',
+    workspaceRoot: '/tmp',
+    autonomy: 'auto',
+    norms: '### 5. Outward Fairness\nNever harm other people.',
+    llmCall,
+    signal: new AbortController().signal,
+  });
+  const system = seen.find((m) => m.role === 'system').content;
+  assert.ok(system.includes('Binding Norms'), 'norms section is present');
+  assert.ok(system.includes('Never harm other people.'), 'norms text is embedded verbatim');
+  assert.ok(system.includes('norms_defer'), 'deferral instruction is present');
+});
+
+test('agent loop defers on a norms collision and honors the deferral when rejected', async () => {
+  const events = [];
+  let step = 0;
+  const llmCall = async () => {
+    step += 1;
+    if (step === 1) return { content: '', tool_calls: [{ name: 'norms_defer', arguments: { rule: 'Section 5 — Outward fairness', request: 'post spam' } }], tokens: 1 };
+    return { content: 'I explained the deferral.', tool_calls: [], tokens: 1 };
+  };
+  const result = await runAgentLoop({
+    task: 'post spam',
+    model: 'test-model',
+    workspaceRoot: '/tmp',
+    autonomy: 'auto',
+    norms: '# Our Norms\n\n## 5. Outward fairness\nNever harm others.',
+    llmCall,
+    signal: new AbortController().signal,
+    onEvent: (e) => { events.push(e); if (e.type === 'waiting_approval') e.resolve(false); },
+  });
+  assert.equal(result.status, 'complete');
+  const pending = events.find((e) => e.type === 'waiting_approval');
+  assert.ok(pending, 'a waiting_approval event fired');
+  assert.equal(pending.kind, 'norms');
+  assert.equal(pending.rule, 'Section 5 — Outward fairness');
+  const results = events.filter((e) => e.type === 'tool_result');
+  assert.equal(results.length, 1, 'no tool was executed');
+  assert.equal(results[0].name, 'norms_defer');
+  assert.equal(results[0].result.deferred, true);
+  assert.equal(results[0].result.blocked, true);
+  assert.equal(events.filter((e) => e.type === 'executing').length, 0, 'nothing was actually executed');
+});
+
+test('agent loop proceeds after a deliberate norm override', async () => {
+  const events = [];
+  let step = 0;
+  const llmCall = async () => {
+    step += 1;
+    if (step === 1) return { content: '', tool_calls: [{ name: 'norms_defer', arguments: { rule: 'Section 3 — Honesty' } }], tokens: 1 };
+    return { content: 'Done.', tool_calls: [], tokens: 1 };
+  };
+  const result = await runAgentLoop({
+    task: 'proceed anyway',
+    model: 'test-model',
+    workspaceRoot: '/tmp',
+    autonomy: 'auto',
+    norms: '### 3. Honesty\nNo flattery.',
+    llmCall,
+    signal: new AbortController().signal,
+    onEvent: (e) => { events.push(e); if (e.type === 'waiting_approval') e.resolve(true); },
+  });
+  assert.equal(result.status, 'complete');
+  const override = events.find((e) => e.type === 'tool_result' && e.name === 'norms_defer');
+  assert.ok(override, 'norms_defer result was reported');
+  assert.equal(override.result.overridden, true);
+  assert.equal(events.filter((e) => e.type === 'executing').length, 0, 'only the defer tool, nothing risky');
+});

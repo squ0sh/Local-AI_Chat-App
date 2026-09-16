@@ -117,6 +117,7 @@
   const commands=[
     {name:'/help',description:'Show all Agent commands'},
     {name:'/status',description:'Check the local model, memory, and agent mode'},
+    {name:'/norms',description:'View or edit your standing agreement with Agent (Our Norms)'},
     {name:'/git',usage:' [sub]',description:'Read-only git status / diff / log'},
     {name:'/test',usage:' [name]',description:'Run the project test suite (asks first)'},
     {name:'/find',usage:' <name>',description:'Find files by name or glob pattern'},
@@ -224,11 +225,17 @@
     if(heading)heading.textContent=`reasoning · thinking… (${agentReasoning.count} chunks)`;
     if(scroll)scroll.scrollTop=scroll.scrollHeight;
   }
-  function approveDialog(id,name,args){return new Promise(resolve=>{
+  function approveDialog(id,name,args,kind='tool',rule=''){return new Promise(resolve=>{
     const item=document.createElement('article'),mark=document.createElement('div'),content=document.createElement('div'),heading=document.createElement('div'),detail=document.createElement('pre'),row=document.createElement('div');
-    item.className='agent-terminal-event pending agent-approval';mark.className='agent-event-mark';content.className='agent-event-content';heading.className='agent-event-title';detail.className='agent-event-body';mark.textContent='?';heading.textContent=`approve ${toolLabel[name]||name}`;detail.textContent=JSON.stringify(args,null,2);
-    const approve=document.createElement('button'),reject=document.createElement('button');approve.className='plain-btn';approve.textContent='Approve';approve.style.borderColor='var(--agent-green)';approve.style.color='var(--agent-green)';reject.className='plain-btn danger';reject.textContent='Reject';row.style.cssText='display:flex;gap:8px;margin-top:8px';row.append(approve,reject);
-    approve.onclick=async()=>{try{await json('/api/agent/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({approval_id:id,approved:true})});item.className='agent-terminal-event pending';mark.textContent='✓';heading.textContent=`running ${toolLabel[name]||name}…`;detail.textContent='';resolve(true)}catch(e){resolve(false)}};
+    const isNorms=kind==='norms';item.className='agent-terminal-event pending agent-approval';mark.className='agent-event-mark';content.className='agent-event-content';heading.className='agent-event-title';detail.className='agent-event-body';
+    mark.textContent='?';
+    if(isNorms){heading.textContent=`defer — ${rule||name}`;detail.textContent=`This request may collide with a binding norm. Override to proceed deliberately, or honor the deferral. An override is recorded in norms.log.\n\nRequest: ${typeof args==='object'&&args?args.request||JSON.stringify(args,null,2):args}`}
+    else{heading.textContent=`approve ${toolLabel[name]||name}`;detail.textContent=JSON.stringify(args,null,2)}
+    const approve=document.createElement('button'),reject=document.createElement('button');approve.className='plain-btn';reject.className='plain-btn danger';row.style.cssText='display:flex;gap:8px;margin-top:8px';
+    if(isNorms){approve.textContent='✓ Override · proceed';approve.style.borderColor='var(--agent-green)';approve.style.color='var(--agent-green)';reject.textContent='Honor defer (do not act)'}
+    else{approve.textContent='Approve';approve.style.borderColor='var(--agent-green)';approve.style.color='var(--agent-green)';reject.textContent='Reject'}
+    row.append(approve,reject);
+    approve.onclick=async()=>{try{await json('/api/agent/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({approval_id:id,approved:true})});item.className='agent-terminal-event pending';mark.textContent='✓';if(isNorms){heading.textContent='overrode defer · recorded';detail.textContent='Proceeding as requested. Override logged to norms.log.';row.remove()}else{heading.textContent=`running ${toolLabel[name]||name}…`;detail.textContent=''}resolve(true)}catch{resolve(false)}};
     reject.onclick=async()=>{try{await json('/api/agent/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({approval_id:id,approved:false})});item.remove();resolve(false)}catch{resolve(false)}};
     content.append(heading,detail,row);item.append(mark,content);messages.append(item);scroll.scrollTop=scroll.scrollHeight;
   })}
@@ -250,7 +257,7 @@
     if(data.type==='tool_call'){const t=appendEvent('pending',`proposing ${toolLabel[data.name]||data.name}`,JSON.stringify(data.arguments));return}
     if(data.type==='executing'){appendEvent('pending',data.message||`running ${toolLabel[data.name]||data.name}`);return}
     if(data.type==='tool_result'){const ok=data.result&&!data.result.error&&!data.result.blocked;appendEvent(ok?'success':'error',`${toolLabel[data.name]||data.name} ${ok?'complete':'returned an issue'}`,JSON.stringify(data.result,null,2).slice(0,4000));return}
-    if(data.type==='approval_needed'){approveDialog(data.approval_id,data.name,data.arguments);return}
+    if(data.type==='approval_needed'){approveDialog(data.approval_id,data.name,data.arguments,data.kind,data.rule);return}
     if(data.type==='completed'){finalizer('success','agent complete',data.content||'');agentLoop.running=false;return}
     if(data.type==='cancelled'){finalizer('info','agent cancelled');agentLoop.running=false;agentLoop.plan=false;paintMode();return}
     if(data.type==='error'){finalizer('error','agent error',data.message||data.error||'');agentLoop.running=false;agentLoop.plan=false;paintMode();return}
@@ -347,14 +354,18 @@
   async function execute(raw){
     const space=raw.indexOf(' '),name=(space<0?raw:raw.slice(0,space)).toLowerCase(),arg=space<0?'':raw.slice(space+1).trim();
     if(name==='/help'){
-      const groups=[['RUN',['/test']],['SEARCH & CODE',['/grep','/find','/git','/read','/files']],['FILES',['/run','/write','/undo']],['WEB & RESEARCH',['/search','/research']],['CHAT',['/ask','/new','/model','/agent','/env','/status']],['CONTROL',['/mcp','/skills','/stop','/clear','/forget']]];
+      const groups=[['RUN',['/test']],['SEARCH & CODE',['/grep','/find','/git','/read','/files']],['FILES',['/run','/write','/undo']],['WEB & RESEARCH',['/search','/research']],['CHAT',['/ask','/new','/model','/agent','/env','/status','/norms']],['CONTROL',['/mcp','/skills','/stop','/clear','/forget']]];
       const lines=['You usually don’t need these — just describe what you want and Agent will handle it. /start opens the friendly Start screen.',''];
       for(const [title,names] of groups){lines.push(title);for(const name of names){const command=commands.find(c=>c.name===name);if(command)lines.push((command.name+(command.usage||'')).padEnd(21)+command.description)}lines.push('')}
       appendEvent('info','Agent commands',lines.join('\n'));return;
     }
     if(name==='/status'){
       const update=appendEvent('pending','checking local runtime…');
-      try{const [health,cockpit]=await Promise.all([json('/health'),json('/api/cockpit')]),loaded=(cockpit.running||[]).map(item=>item.name).join(', ')||'none',free=cockpit.system?.memory_free?`${(cockpit.system.memory_free/1073741824).toFixed(1)} GB free`:'memory unavailable';update('success','local runtime ready',`provider  ${health.provider||'ollama'}\nmodel     ${modelLabel()}\nloaded    ${loaded}\nmemory    ${free}\nmode      ${agentMode()} (toggle in the status bar)`)}catch(error){update('error','status check failed',error.message)}return;
+      try{const [health,cockpit,norms]=await Promise.all([json('/health'),json('/api/cockpit'),json('/api/agent/norms')]),loaded=(cockpit.running||[]).map(item=>item.name).join(', ')||'none',free=cockpit.system?.memory_free?`${(cockpit.system.memory_free/1073741824).toFixed(1)} GB free`:'memory unavailable';update('success','local runtime ready',`provider  ${health.provider||'ollama'}\nmodel     ${modelLabel()}\nloaded    ${loaded}\nmemory    ${free}\nnorms     ${norms.exists?`✓ loaded (${norms.content.split(/\s+/).length} words)`:'none'}\nmode      ${agentMode()} (toggle in the status bar)`)}catch(error){update('error','status check failed',error.message)}return;
+    }
+    if(name==='/norms'){
+      loadNorms();normsDialog.showModal();
+      return;
     }
     if(name==='/mcp'){
       if(!arg){const update=appendEvent('pending','listing MCP tools…');try{const result=await json('/api/agent/mcp/list');update('success','registered MCP servers',result.clients?.length?result.clients.map(client=>`${client.id} · ${client.serverInfo?.name||'unknown'}${(client.tools||[]).map(tool=>`\n  ${tool.name} — ${tool.description||''}`).join('')}`).join('\n\n')||'(none connected)':'(none connected). Connect one via the MCP panel.');}catch(error){update('error','MCP list failed',error.message)}return}
@@ -501,6 +512,35 @@
   };
   window.runAgentTask=runAgentTask;window.agentExecute=execute;window.agentEnable=()=>{if(!isEnabled())localStorage.setItem(key,JSON.stringify({enabled:true,code:Boolean(readConfig().code)}));applyMode()};window.appendAgentToolOutput=(title,body)=>{appendEvent('success',title,String(body??''))};
   applyMode();
+
+  // ── Our Norms: the two-sided standing agreement between human and agent ──
+  const normsDialog=document.createElement('dialog');
+  normsDialog.innerHTML='<div class="settings"><h2>Our Norms</h2><p>A two-sided standing agreement between you and your agent. Written seat-neutral, and it extends to people outside this conversation. The agent re-reads the file every run — edits apply without a restart.</p><div id="norms-status" class="notice" hidden></div><label style="display:block">The norms</label><textarea id="norms-editor" rows="18"></textarea><label class="agent-option" style="margin-top:8px"><input id="norms-adopt" type="checkbox"><span><b>I adopt these norms as binding</b><span>Required on the first save.</span></span></label><div class="dialog-actions"><button class="plain-btn" id="norms-save">Save</button><button class="plain-btn" id="norms-close">Done</button></div></div>';
+  document.body.append(normsDialog);
+  const normsEditor=normsDialog.querySelector('#norms-editor'),normsAdopt=normsDialog.querySelector('#norms-adopt'),normsStatus=normsDialog.querySelector('#norms-status');
+  normsEditor.style.cssText='width:100%;font-family:monospace;font-size:13px;line-height:1.45;padding:8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);resize:vertical';
+  async function loadNorms(){
+    normsStatus.hidden=true;
+    try{
+      const result=await json('/api/agent/norms');
+      const exists=!!result.exists;
+      normsEditor.value=exists?result.content:(result.default||'');
+      normsAdopt.checked=exists;normsAdopt.disabled=exists;
+      if(!exists)normsStatus.textContent='No norms yet — a draft is pre-filled below. Review it and save to adopt it as binding.';
+      else normsStatus.textContent='Loaded from norms.md in the data directory.';
+      normsStatus.hidden=false;
+    }catch(e){normsStatus.hidden=false;normsStatus.textContent='Could not load norms: '+e.message}
+  }
+  const normsButton=document.getElementById('agent-norms-button');
+  if(normsButton)normsButton.onclick=()=>{loadNorms();normsDialog.showModal()};
+  normsDialog.querySelector('#norms-close').onclick=()=>normsDialog.close();
+  normsDialog.querySelector('#norms-save').onclick=async()=>{
+    const content=normsEditor.value.trim();
+    if(!content){normsStatus.hidden=false;normsStatus.textContent='Norms cannot be empty.';return}
+    if(!normsAdopt.checked){normsStatus.hidden=false;normsStatus.textContent='You must check "I adopt these norms as binding" to save.';return}
+    normsStatus.hidden=false;normsStatus.textContent='Saving…';
+    try{const r=await json('/api/agent/norms',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content,adopt:true})});normsStatus.textContent='Saved. The agent will follow this on its next run.';normsAdopt.checked=true;normsAdopt.disabled=true}catch(e){normsStatus.textContent='Save failed: '+e.message}
+  };
 
   // ── Deep research in the open chat terminal ────────────────────────────
   // These overrides replace the earlier declarations above: research progress

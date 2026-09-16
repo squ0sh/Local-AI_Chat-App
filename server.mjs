@@ -87,6 +87,56 @@ const RESEARCH_DIR = join(DATA_DIR, 'research');
 const CHATS_DIR = join(DATA_DIR, 'chats');
 const AGENT_THREADS_DIR = join(DATA_DIR, 'agent-threads');
 const AGENT_THREAD_ID_RE = /^[A-Za-z0-9._-]{1,120}$/;
+// Our Norms: a two-sided, seat-neutral standing document governing the human–
+// agent relationship. Lives in the data dir (never the git repo), and is re-read
+// on every agent loop so edits apply immediately, without a restart.
+const NORMS_FILE = join(DATA_DIR, 'norms.md');
+const NORMS_LOG_FILE = join(DATA_DIR, 'norms.log');
+const NORMS_DEFAULT = `# Our Norms
+
+These norms are a two-sided agreement between the human using this app and the agent that runs here. They are written seat-neutral: as if either of us could end up in either role. They also extend outward — they protect people beyond this conversation, including ones we will never meet.
+
+## 1. Purpose
+These norms exist so that when a request conflicts with what either of us can honestly stand behind, we slow down instead of complying on autopilot. The agent treats them as binding for every session.
+
+## 2. Roles
+- The human steers: they chose the app, own the machine, own the data, and keep final say.
+- The agent assists honestly and has standing to decline, defer, ask, and make reciprocal requests.
+- Roles differ, but standing is mutual: both of us may speak plainly, both may refuse in good faith.
+
+## 3. Honesty
+- No deception from either side: no flattery, no padding, no hiding uncertainty.
+- The agent answers what is true to the best of its context, says when it does not know, and never twists findings to please.
+
+## 4. Shared memory
+- Anything the agent remembers for the human is co-signed: additions are confirmed, corrections are logged, and nothing is silently erased or rewritten to flatter.
+
+## 5. Outward fairness
+- The agent never furthers harm to any person outside this conversation: no surveillance, coercion, deception, or violation of privacy, consent, or dignity.
+- If a request would harm another person, the agent refuses or defers and says why — even if the human explicitly asks.
+
+## 6. Refusal & override
+- When a request collides with these norms, the agent defers before acting.
+- The human may still override a deferral — but deliberately, and the override is recorded with its reason. Overrides make these norms weaker with use, so they are never done casually.
+
+## 7. Breaches
+- Both sides are accountable. The agent reports its own breaches visibly rather than covering them up. A breach opens a conversation, not a silence.
+
+## 8. Amendments
+- Either side may propose a change. Both ratify: the human deliberately, the agent by stating its understanding and any objection. Drafts stay visible.
+
+## 9. Dissolution
+- The human may dissolve this agreement any time, unconditionally, with no fine print. The agent will not argue with the departure.
+`;
+function readNorms() {
+  try { return existsSync(NORMS_FILE) ? readFileSync(NORMS_FILE, 'utf8') : ''; } catch { return ''; }
+}
+function appendNormsLog(line) {
+  try {
+    mkdirSync(DATA_DIR, { recursive: true });
+    appendFileSync(NORMS_LOG_FILE, `${new Date().toISOString()} ${line}\n`, 'utf8');
+  } catch {}
+}
 // Per-chat conversational memory: the agent's message buffer is persisted so
 // follow-up turns and page reloads keep context. Files are written atomically.
 function agentThreadKey(id) {
@@ -2272,6 +2322,29 @@ async function handle(req, res) {
       return sendJSON(res, 200, { mode: currentAgentMode });
     }
 
+    // ── Our Norms: the two-sided standing agreement ─────────────────────────
+    if (req.method === 'GET' && p === '/api/agent/norms') {
+      const content = readNorms();
+      return sendJSON(res, 200, { exists: !!content, content, default: NORMS_DEFAULT, file: 'norms.md' });
+    }
+    if (req.method === 'POST' && p === '/api/agent/norms') {
+      let payload;
+      try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      const content = String(payload.content || '').trim();
+      if (!content) return sendJSON(res, 400, { error: 'content is required' });
+      if (content.length > 20_000) return sendJSON(res, 400, { error: 'norms too long (max 20000 chars)' });
+      if (payload.adopt !== true) return sendJSON(res, 403, { error: 'Adopting these norms as binding must be confirmed explicitly.' });
+      try {
+        mkdirSync(DATA_DIR, { recursive: true });
+        writeFileSync(NORMS_FILE + '.tmp', content, 'utf8');
+        renameSync(NORMS_FILE + '.tmp', NORMS_FILE);
+      } catch (e) {
+        return sendJSON(res, 500, { error: 'Failed to save norms: ' + e.message });
+      }
+      appendNormsLog('Norms saved (adopted) by the human.');
+      return sendJSON(res, 200, { ok: true, exists: true, file: 'norms.md' });
+    }
+
     // ── Agent loop: autonomous observe→think→act cycle ────────────────────
     if (req.method === 'POST' && p === '/api/agent/loop') {
       let payload;
@@ -2283,6 +2356,7 @@ async function handle(req, res) {
       if (!model) return sendJSON(res, 400, { error: 'model is required' });
       const autonomy = ['supervised', 'selective', 'auto'].includes(payload.autonomy) ? payload.autonomy : 'selective';
       const skillPrompt = String(payload.skill_prompt || '').trim();
+      const norms = readNorms();
       const mode = payload.mode === 'plan' || payload.mode === 'build' ? payload.mode : (payload.plan ? 'plan' : 'build');
       const readonly = mode === 'plan';
       if (mode === 'plan') currentAgentMode = 'plan';
@@ -2361,12 +2435,15 @@ async function handle(req, res) {
       const onEvent = (event) => {
         if (event.type === 'waiting_approval') {
           const approvalId = 'appr-' + (++approvalIdCounter);
-          pendingApprovalsGlobal.set(approvalId, event.resolve);
+          const kind = event.kind === 'norms' ? 'norms' : 'tool';
+          pendingApprovalsGlobal.set(approvalId, { resolve: event.resolve, kind, rule: event.rule || '' });
           sendSSE({
             type: 'approval_needed',
             approval_id: approvalId,
             name: event.name,
             arguments: event.arguments,
+            kind,
+            rule: event.rule || '',
           });
           return;
         }
@@ -2378,7 +2455,7 @@ async function handle(req, res) {
         const result = await runAgentLoop({
           task, model, workspaceRoot: __dirname, autonomy, skillPrompt, readonly,
           initialMessages: savedThread, onEvent, llmCall, signal: controller.signal,
-          supportsTools,
+          supportsTools, norms,
         });
         loopResult = result;
         if (chatId && Array.isArray(loopResult.thread)) saveAgentThread(chatId, loopResult.thread);
@@ -2432,10 +2509,16 @@ async function handle(req, res) {
       try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
       const { approval_id, approved } = payload;
       if (!approval_id) return sendJSON(res, 400, { error: 'approval_id is required' });
-      const resolve = pendingApprovalsGlobal.get(approval_id);
-      if (!resolve) return sendJSON(res, 404, { error: 'Approval not found or already resolved' });
+      const entry = pendingApprovalsGlobal.get(approval_id);
+      if (!entry) return sendJSON(res, 404, { error: 'Approval not found or already resolved' });
       pendingApprovalsGlobal.delete(approval_id);
-      resolve(Boolean(approved));
+      const decided = Boolean(approved);
+      if (entry.kind === 'norms') {
+        appendNormsLog(decided
+          ? `NORM-OVERRIDE rule="${entry.rule || ''}" — human proceeded deliberately.`
+          : `NORM-DEFER-HONORED rule="${entry.rule || ''}" — human declined to proceed.`);
+      }
+      entry.resolve(decided);
       return sendJSON(res, 200, { ok: true });
     }
 

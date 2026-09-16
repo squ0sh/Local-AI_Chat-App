@@ -330,3 +330,68 @@ test('agent mode: plan blocks manual write/command/mcp call, build restores', as
     rmSync(dataDir, { recursive: true, force: true });
   }
 });
+
+test('agent server norms: explicit adoption is required, and the file lands in the data dir', async () => {
+  const repoRoot = dirname(new URL('../server.mjs', import.meta.url).pathname);
+  const port = await freePort();
+  const dataDir = mkdtempSync(join(tmpdir(), 'agent-norms-data-'));
+  const server = spawn(process.execPath, ['server.mjs', '--mode', 'local', '--host', '127.0.0.1', '--port', String(port)], {
+    cwd: repoRoot,
+    env: { ...process.env, OLLAMA_URL: 'http://127.0.0.1:1', LOCAL_AI_DATA_DIR: dataDir },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let logs = '';
+  server.stdout.on('data', (d) => { logs += d; });
+  server.stderr.on('data', (d) => { logs += d; });
+
+  const base = `http://127.0.0.1:${port}`;
+  const call = async (path, init = {}) => {
+    const r = await fetch(base + path, init);
+    let body = null;
+    try { body = await r.json(); } catch {}
+    return { status: r.status, body };
+  };
+  const waitReady = async () => {
+    for (let i = 0; i < 100; i += 1) {
+      try { const r = await fetch(base + '/health'); if (r.status < 500) return; } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error('server did not become ready\n' + logs);
+  };
+
+  try {
+    await waitReady();
+    const jsonInit = (body) => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+
+    const initial = await call('/api/agent/norms');
+    assert.equal(initial.status, 200);
+    assert.equal(initial.body.exists, false);
+    assert.ok((initial.body.default || '').includes('# Our Norms'), 'a default draft is pre-filled');
+    assert.equal(existsSync(join(dataDir, 'norms.md')), false, 'reading does not create the file');
+
+    const noAdopt = await call('/api/agent/norms', jsonInit({ content: '# X', adopt: false }));
+    assert.equal(noAdopt.status, 403, 'saving without explicit adoption is refused');
+    const noContent = await call('/api/agent/norms', jsonInit({ adopt: true }));
+    assert.equal(noContent.status, 400, 'empty norms are refused');
+
+    const saved = await call('/api/agent/norms', jsonInit({ content: '# My Norms\n\n## 5. Outward fairness\nNever spy on people.', adopt: true }));
+    assert.equal(saved.status, 200);
+    assert.equal(saved.body.ok, true);
+    assert.equal(saved.body.exists, true);
+    assert.equal(existsSync(join(dataDir, 'norms.md')), true, 'norms.md lands in the data dir');
+    assert.equal(existsSync(join(dataDir, 'norms.log')), true, 'the adoption is logged');
+
+    const after = await call('/api/agent/norms');
+    assert.equal(after.status, 200);
+    assert.equal(after.body.exists, true);
+    assert.match(after.body.content, /Never spy on people\./);
+
+    const updated = await call('/api/agent/norms', jsonInit({ content: '# My Norms\n\nSecond version.', adopt: true }));
+    assert.equal(updated.status, 200);
+    assert.match((await call('/api/agent/norms')).body.content, /Second version\./);
+  } finally {
+    server.kill('SIGTERM');
+    await new Promise((resolve) => { server.once('exit', resolve); setTimeout(resolve, 3000); });
+    rmSync(dataDir, { recursive: true, force: true });
+  }
+});
