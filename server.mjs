@@ -12,6 +12,7 @@
  */
 
 import { createServer } from 'http';
+import * as https from 'https';
 import { readFileSync, existsSync, mkdirSync, createReadStream, createWriteStream, copyFileSync, chmodSync, readdirSync, rmdirSync, statSync, statfsSync, writeFileSync, renameSync, unlinkSync, accessSync, constants as fsConstants, appendFileSync } from 'fs';
 import { join, dirname, resolve, relative, sep, basename } from 'path';
 import { fileURLToPath } from 'url';
@@ -84,6 +85,7 @@ const CLOUD_VAULT_FILE = join(DATA_DIR, 'capsule-cloud-vault.json');
 const MODEL_VERIFICATIONS_FILE = join(DATA_DIR, 'model-verifications.json');
 const MODEL_IMPORTS_FILE = join(DATA_DIR, 'model-imports.json');
 const RESEARCH_DIR = join(DATA_DIR, 'research');
+const SPEECH_DIR = join(DATA_DIR, 'speech');
 const CHATS_DIR = join(DATA_DIR, 'chats');
 const AGENT_THREADS_DIR = join(DATA_DIR, 'agent-threads');
 const AGENT_THREAD_ID_RE = /^[A-Za-z0-9._-]{1,120}$/;
@@ -1468,10 +1470,13 @@ function runChild(cmd, args, { input } = {}) {
 let speechInfo = null;
 function speechSupport() {
   if (speechInfo) return speechInfo;
+  const speechDir = join(SPEECH_DIR, 'piper');
   const whisper = process.env.WHISPER_CLI || findOnPath('whisper-cli') || findOnPath('whisper-cpp') || findOnPath('whisper');
-  const piper = process.env.PIPER_CLI || findOnPath('piper');
+  const piper = process.env.PIPER_CLI || findOnPath('piper') || (existsSync(join(speechDir, 'piper')) ? join(speechDir, 'piper') : '');
   const whisperModel = process.env.WHISPER_MODEL || join(__dirname, 'models', 'whisper', 'ggml-base.bin');
-  const piperVoice = process.env.PIPER_VOICE || join(__dirname, 'models', 'piper', 'voice.onnx');
+  const piperVoice = process.env.PIPER_VOICE
+    || (existsSync(join(SPEECH_DIR, 'piper-voices', 'en_US-lessac-medium.onnx')) ? join(SPEECH_DIR, 'piper-voices', 'en_US-lessac-medium.onnx') : '')
+    || join(__dirname, 'models', 'piper', 'voice.onnx');
   speechInfo = {
     whisper: Boolean(whisper && existsSync(whisperModel)),
     whisper_cli: whisper ? whisper : '',
@@ -1479,8 +1484,91 @@ function speechSupport() {
     piper: Boolean(piper && existsSync(piperVoice)),
     piper_cli: piper ? piper : '',
     piper_voice: existsSync(piperVoice) ? piperVoice : '',
+    installing: speechInstall != null && speechInstall.status !== 'ready' && speechInstall.status !== 'error',
   };
   return speechInfo;
+}
+
+// One-click offline voice install: pins piper + a voice by SHA-256, and guides
+// the whisper.cpp install (no official prebuilt binaries → shows a how-to).
+const PIPER_RELEASE = '2023.11.14-2';
+const PIPER_ASSETS = {
+  'linux-x64':   { url: `https://github.com/rhasspy/piper/releases/download/${PIPER_RELEASE}/piper_linux_x86_64.tar.gz`,   sha256: 'a50cb45f355b7af1f6d758c1b360717877ba0a398cc8cbe6d2a7a3a26e225992' },
+  'linux-arm64': { url: `https://github.com/rhasspy/piper/releases/download/${PIPER_RELEASE}/piper_linux_aarch64.tar.gz`, sha256: 'fea0fd2d87c54dbc7078d0f878289f404bd4d6eea6e7444a77835d1537ab88eb' },
+};
+const PIPER_VOICE_ASSETS = [
+  { name: 'en_US-lessac-medium.onnx',        url: 'https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx',        sha256: '5efe09e69902187827af646e1a6e9d269dee769f9877d17b16b1b46eeaaf019f' },
+  { name: 'en_US-lessac-medium.onnx.json',   url: 'https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json',   sha256: 'efe19c417bed055f2d69908248c6ba650fa135bc868b0e6abb3da181dab690a0' },
+];
+const WHISPER_SETUP_HINT = 'whisper.cpp has no official Linux/macOS binaries. Set WHISPER_CLI and WHISPER_MODEL in ' + ENV_FILE + ', or use the browser mic for now.';
+let speechInstall = null;
+
+function streamDownload(url, destPath, onProgress) {
+  return new Promise((resolve, reject) => {
+    const out = createWriteStream(destPath);
+    let downloaded = 0, total = 0;
+    https.get(url, { headers: { 'User-Agent': 'LocalAI-Chat-App' } }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return https.get(res.headers.location, { headers: { 'User-Agent': 'LocalAI-Chat-App' } }, (res2) => { pipe(res2); }).on('error', reject);
+      }
+      pipe(res);
+      function pipe(res2) {
+        if (res2.statusCode !== 200) { reject(new Error('HTTP ' + res2.statusCode + ' for ' + url)); res2.resume(); return; }
+        total = Number(res2.headers['content-length'] || 0);
+        res2.on('data', (c) => { downloaded += c.length; onProgress && onProgress(downloaded, total); });
+        res2.pipe(out);
+        out.on('finish', () => { onProgress && onProgress(downloaded, total); resolve(downloaded); });
+        res2.on('error', reject);
+      }
+    }).on('error', reject);
+  });
+}
+
+async function installSpeechEngines() {
+  const platformKey = process.platform === 'linux'
+    ? (process.arch === 'x64' ? 'linux-x64' : process.arch === 'arm64' ? 'linux-arm64' : '')
+    : '';
+  if (!platformKey) throw new Error('One-click speech install supports Linux x64/arm64. On other platforms set PIPER_CLI and PIPER_VOICE; ' + WHISPER_SETUP_HINT);
+  const dest = join(SPEECH_DIR, 'piper', 'piper');
+  if (existsSync(dest) && existsSync(join(SPEECH_DIR, 'piper-voices', PIPER_VOICE_ASSETS[0].name))) return 'already installed';
+  mkdirSync(SPEECH_DIR, { recursive: true });
+  const tmpRoot = join(SPEECH_DIR, '.tmp'); mkdirSync(tmpRoot, { recursive: true });
+  const tall = PIPER_ASSETS[platformKey];
+  const tarPath = join(tmpRoot, 'piper.tar.gz');
+  try {
+    speechInstall.status = 'downloading';
+    await streamDownload(tall.url, tarPath, (d, t) => { speechInstall.downloaded = d; speechInstall.total = t; });
+    const actual = createHash('sha256').update(readFileSync(tarPath)).digest('hex');
+    if (actual !== tall.sha256) throw new Error('piper checksum mismatch: ' + actual.slice(0, 12) + '…');
+    speechInstall.status = 'extracting';
+    execFileSync('tar', ['-xzf', tarPath, '-C', SPEECH_DIR]);
+    chmodSync(dest, 0o755);
+    execFileSync(dest, ['--version'], { stdio: 'ignore' });
+    mkdirSync(join(SPEECH_DIR, 'piper-voices'), { recursive: true });
+    let done = 0;
+    for (const a of PIPER_VOICE_ASSETS) {
+      speechInstall.status = 'downloading';
+      speechInstall.downloaded = 0; speechInstall.total = 0; speechInstall.current = 'piper-voices/' + a.name;
+      const vPath = join(tmpRoot, a.name);
+      await streamDownload(a.url, vPath, (d, t) => { speechInstall.downloaded = d; speechInstall.total = t; });
+      const vHash = createHash('sha256').update(readFileSync(vPath)).digest('hex');
+      if (vHash !== a.sha256) throw new Error(a.name + ' checksum mismatch: ' + vHash.slice(0, 12) + '…');
+      renameSync(vPath, join(SPEECH_DIR, 'piper-voices', a.name));
+      done++;
+    }
+    speechInstall.status = 'ready';
+    speechInstall.downloaded = speechInstall.total = 0;
+    speechInstall.current = '';
+    speechInfo = null;
+    log('Installed offline speech engines (piper ' + platformKey + ' + ' + PIPER_VOICE_ASSETS[0].name + ').');
+  } catch (e) {
+    speechInstall.status = 'error';
+    speechInstall.error = e.message;
+    log('Speech install failed:', e.message);
+    throw e;
+  } finally {
+    try { rmdirSync(tmpRoot, { recursive: true }); } catch {}
+  }
 }
 
 function sendJSON(res, code, obj) {
@@ -1815,6 +1903,26 @@ async function handle(req, res) {
   }
   if (req.method === 'GET' && p === '/api/speech/status') {
     return sendJSON(res, 200, speechSupport());
+  }
+  if (req.method === 'GET' && p === '/api/speech/install') {
+    const s = speechSupport();
+    return sendJSON(res, 200, {
+      installing: s.installing,
+      supported: ['linux-x64', 'linux-arm64'].includes(process.platform === 'linux' ? (process.arch === 'x64' ? 'linux-x64' : 'linux-arm64') : ''),
+      whisper_setup_hint: process.platform === 'linux' ? WHISPER_SETUP_HINT : 'Offline whisper.cpp has no official Linux/macOS binaries; set WHISPER_CLI and WHISPER_MODEL to enable. Browser mic works meanwhile.',
+      status: speechInstall ? speechInstall.status : 'idle',
+      downloaded: speechInstall ? speechInstall.downloaded : 0,
+      total: speechInstall ? speechInstall.total : 0,
+      current: speechInstall ? (speechInstall.current || '') : '',
+      error: speechInstall ? (speechInstall.error || '') : '',
+    });
+  }
+  if (req.method === 'POST' && p === '/api/speech/install') {
+    if (speechSupport().installing) return sendJSON(res, 409, { error: 'Speech engines are already being installed' });
+    speechInstall = { status: 'starting', downloaded: 0, total: 0, current: 'piper', error: '', controller: null };
+    speechInfo = null;
+    installSpeechEngines().catch(() => {});
+    return sendJSON(res, 202, { ok: true, message: 'Installing offline speech engines in the background' });
   }
   if (req.method === 'POST' && p === '/api/speech/transcribe') {
     const s = speechSupport();

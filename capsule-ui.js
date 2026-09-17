@@ -235,11 +235,13 @@
     if(isNorms){approve.textContent='✓ Override · proceed';approve.style.borderColor='var(--agent-green)';approve.style.color='var(--agent-green)';reject.textContent='Honor defer (do not act)'}
     else{approve.textContent='Approve';approve.style.borderColor='var(--agent-green)';approve.style.color='var(--agent-green)';reject.textContent='Reject'}
     row.append(approve,reject);
+    window.__voiceLastApproval={id,approve,reject};
     approve.onclick=async()=>{try{await json('/api/agent/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({approval_id:id,approved:true})});item.className='agent-terminal-event pending';mark.textContent='✓';if(isNorms){heading.textContent='overrode defer · recorded';detail.textContent='Proceeding as requested. Override logged to norms.log.';row.remove()}else{heading.textContent=`running ${toolLabel[name]||name}…`;detail.textContent=''}resolve(true)}catch{resolve(false)}};
     reject.onclick=async()=>{try{await json('/api/agent/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({approval_id:id,approved:false})});item.remove();resolve(false)}catch{resolve(false)}};
     content.append(heading,detail,row);item.append(mark,content);messages.append(item);scroll.scrollTop=scroll.scrollHeight;
   })}
   function handleAgentEvent(data,finalizer){
+    try{window.__voiceAgentFeed?.(data)}catch{}
     if(data.type==='token'){return streamAgentTokens(data.delta)}
     if(data.type==='reasoning'){return streamAgentReasoning(data.delta)}
     if(data.type==='stream_end'||data.type==='streaming'){return}
@@ -336,6 +338,8 @@
     later.className='plain-btn';later.textContent='Later (stay in Plan)';
     approve.onclick=()=>{item.remove();setAgentMode('build');runAgentTask(plan.task,plan.autonomy,'APPROVED PLAN:\n\n'+(plan.content||''))};
     later.onclick=()=>item.remove();
+    window.__voicePlanHandoff={approve,later};
+    window.__voicePlanData={task:plan.task,content:plan.content||''};
     row.append(approve,later);content.append(heading,row);item.append(mark,content);
     messages.append(item);if(scroll)scroll.scrollTop=scroll.scrollHeight;
   }
@@ -510,7 +514,7 @@
     }
     return priorFetch(url,init);
   };
-  window.runAgentTask=runAgentTask;window.agentExecute=execute;window.agentEnable=()=>{if(!isEnabled())localStorage.setItem(key,JSON.stringify({enabled:true,code:Boolean(readConfig().code)}));applyMode()};window.appendAgentToolOutput=(title,body)=>{appendEvent('success',title,String(body??''))};
+  window.runAgentTask=runAgentTask;window.agentExecute=execute;window.agentEnable=()=>{if(!isEnabled())localStorage.setItem(key,JSON.stringify({enabled:true,code:Boolean(readConfig().code)}));applyMode()};window.agentSetEnabled=enable=>{if(Boolean(isEnabled())===Boolean(enable))return;localStorage.setItem(key,JSON.stringify({enabled:Boolean(enable),code:Boolean(readConfig().code)}));applyMode()};window.appendAgentToolOutput=(title,body)=>{appendEvent('success',title,String(body??''))};
   applyMode();
 
   // ── Our Norms: the two-sided standing agreement between human and agent ──
@@ -661,61 +665,253 @@
 
 
 
-// A visible voice-call mode. Speech capture/output use the best engine the
-// current browser/OS exposes; the selected local model remains the response
-// engine. Short recognition sessions are restarted deliberately for iOS Safari.
+// A visible voice-call mode: spoken chat or spoken agent work (a small brain
+// pill picks which: agent · build / agent · plan / chat). The human's speech
+// uses the browser's recognition, or whisper.cpp when a local one is set up.
+// Output streams sentence-by-sentence, via piper when installed (offline) or
+// the browser synthesis. Approvals, norm deferrals, and plan handoffs are read
+// aloud and answered with a spoken yes/no. Speech helpers mirror lib/voice.mjs.
 (()=>{
   const mic=document.getElementById('mic-button'),input=document.getElementById('input'),send=document.getElementById('send'),composer=document.querySelector('.composer'),foot=document.querySelector('.composer-foot');
   if(!mic||!input||!send||!composer||!foot)return;
+  window.__capsuleVoice=true;
   const Recognition=window.SpeechRecognition||window.webkitSpeechRecognition;
   const style=document.createElement('style');style.textContent=`
     .voice-live-pill{display:none;align-items:center;gap:6px;color:var(--muted);font:11px var(--mono)}.voice-live-pill.on{display:flex}.voice-live-pill::before{content:"";width:7px;height:7px;border-radius:50%;background:#ff6e7f;box-shadow:0 0 8px #ff6e7f99}.voice-live-pill.thinking::before{background:var(--blue2);box-shadow:0 0 8px #87a5ff99}.voice-live-pill.speaking::before{background:var(--green);box-shadow:0 0 8px #73d9a899}.compose-icon.voice-live{color:#ff8290!important;background:#3a1720!important}.compose-icon.voice-live svg{filter:drop-shadow(0 0 4px #ff718588)}
-    .voice-mode{position:fixed;inset:0;z-index:10000;display:flex;align-items:center;justify-content:center;padding:24px;background:radial-gradient(circle at 50% 35%,rgba(80,105,205,.24),transparent 42%),rgba(7,9,16,.96);color:var(--text);backdrop-filter:blur(18px)}.voice-mode[hidden]{display:none}.voice-mode-card{width:min(560px,100%);min-height:min(700px,calc(100dvh - 48px));display:flex;flex-direction:column;align-items:center;padding:28px 24px;border:1px solid rgba(150,165,220,.2);border-radius:28px;background:linear-gradient(160deg,rgba(25,29,47,.94),rgba(12,14,24,.96));box-shadow:0 28px 90px #0009}.voice-mode-head{width:100%;display:flex;align-items:center;justify-content:space-between;gap:16px}.voice-mode-title{font-size:15px;font-weight:700}.voice-mode-model{max-width:65%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font:11px var(--mono)}.voice-mode-stage{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;width:100%;gap:25px}.voice-orb{position:relative;width:180px;height:180px;border:0;border-radius:50%;background:radial-gradient(circle at 38% 30%,#a7baff,#526ed8 38%,#20284e 72%);box-shadow:0 0 0 18px #7890ee10,0 0 70px #7189e866;transition:.35s transform,.35s box-shadow;cursor:pointer}.voice-orb::before,.voice-orb::after{content:"";position:absolute;inset:-14px;border:1px solid #9bb0ff55;border-radius:50%;animation:voice-pulse 2s ease-out infinite}.voice-orb::after{inset:-30px;animation-delay:.55s}.voice-mode[data-state="thinking"] .voice-orb{transform:scale(.86);filter:saturate(.7);animation:voice-think 1.2s ease-in-out infinite}.voice-mode[data-state="speaking"] .voice-orb{box-shadow:0 0 0 22px #6ee1ac12,0 0 90px #67dca677;background:radial-gradient(circle at 38% 30%,#c0ffe0,#45c78b 40%,#183c33 75%);animation:voice-speak .7s ease-in-out infinite alternate}.voice-mode[data-muted="true"] .voice-orb{filter:grayscale(.85);opacity:.7}.voice-state{font-size:25px;font-weight:700}.voice-hint{margin-top:-15px;color:var(--muted);font-size:13px;text-align:center}.voice-transcript{width:100%;min-height:86px;max-height:170px;overflow:auto;padding:15px 17px;border:1px solid rgba(145,160,210,.13);border-radius:15px;background:#07091166;color:#dfe5ff;line-height:1.5;text-align:center}.voice-transcript:empty::before{content:"Start speaking when the orb says Listening";color:var(--muted)}.voice-mode-actions{display:flex;gap:18px;align-items:center;justify-content:center}.voice-call-button{width:58px;height:58px;border-radius:50%;border:1px solid var(--line);background:var(--panel2);color:var(--text);font-size:20px}.voice-call-button.end{width:auto;height:58px;border:0;border-radius:29px;padding:0 25px;background:#d53f52;color:white;font-size:14px;font-weight:700}.voice-call-label{display:block;font-size:10px;margin-top:4px;color:var(--muted)}
+    .voice-mode{position:fixed;inset:0;z-index:10000;display:flex;align-items:center;justify-content:center;padding:24px;background:radial-gradient(circle at 50% 35%,rgba(80,105,205,.24),transparent 42%),rgba(7,9,16,.96);color:var(--text);backdrop-filter:blur(18px)}.voice-mode[hidden]{display:none}.voice-mode-card{width:min(560px,100%);min-height:min(700px,calc(100dvh - 48px));display:flex;flex-direction:column;align-items:center;padding:28px 24px;border:1px solid rgba(150,165,220,.2);border-radius:28px;background:linear-gradient(160deg,rgba(25,29,47,.94),rgba(12,14,24,.96));box-shadow:0 28px 90px #0009}.voice-mode-head{width:100%;display:flex;align-items:center;justify-content:space-between;gap:16px}.voice-mode-title{font-size:15px;font-weight:700}.voice-mode-model{max-width:65%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted);font:11px var(--mono)}.voice-mode-stage{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;width:100%;gap:25px}.voice-orb{position:relative;width:180px;height:180px;border:0;border-radius:50%;background:radial-gradient(circle at 38% 30%,#a7baff,#526ed8 38%,#20284e 72%);box-shadow:0 0 0 18px #7890ee10,0 0 70px #7189e866;transition:.35s transform,.35s box-shadow;cursor:pointer}.voice-orb::before,.voice-orb::after{content:"";position:absolute;inset:-14px;border:1px solid #9bb0ff55;border-radius:50%;animation:voice-pulse 2s ease-out infinite}.voice-orb::after{inset:-30px;animation-delay:.55s}.voice-mode[data-state="thinking"] .voice-orb{transform:scale(.86);filter:saturate(.7);animation:voice-think 1.2s ease-in-out infinite}.voice-mode[data-state="speaking"] .voice-orb{box-shadow:0 0 0 22px #6ee1ac12,0 0 90px #67dca677;background:radial-gradient(circle at 38% 30%,#c0ffe0,#45c78b 40%,#183c33 75%);animation:voice-speak .7s ease-in-out infinite alternate}.voice-mode[data-muted="true"] .voice-orb{filter:grayscale(.85);opacity:.7}.voice-state{font-size:25px;font-weight:700}.voice-hint{margin:2px 0 0;color:var(--muted);text-align:center}.voice-transcript{min-height:44px;max-height:180px;overflow:auto;text-align:center;color:var(--text);font:13px/1.5 var(--mono);white-space:pre-wrap}.voice-mode-actions{display:flex;align-items:center;justify-content:center;gap:15px;margin-top:18px}.voice-mode-actions div{display:flex;flex-direction:column;align-items:center;gap:5px}.voice-call-button{width:46px;height:46px;border:1px solid var(--line);border-radius:50%;background:var(--panel2);color:var(--text);font-size:17px;cursor:pointer}.voice-call-button:hover{border-color:var(--blue)}.voice-call-button.end{color:#fff;background:#a12b38;border-color:#a12b38}.voice-call-button.end:hover{border-color:#e25866}.voice-call-label{font-size:10px;color:var(--muted)}
+    .voice-mode-footer{width:100%;display:flex;flex-direction:column;align-items:center;gap:9px;margin-top:8px}
+    .voice-engine-pill{color:var(--muted);font:10px var(--mono);text-align:center}
+    .voice-brain-pill{display:inline-flex;align-items:center;gap:8px;padding:7px 14px;border:1px solid var(--line);border-radius:999px;background:var(--panel2);color:var(--text);font:12px var(--mono);cursor:pointer}.voice-brain-pill:hover{border-color:var(--blue)}.voice-brain-pill i{width:8px;height:8px;border-radius:50%;background:var(--blue2);display:inline-block}.voice-brain-pill.agent i{background:var(--agent-green)}.voice-brain-pill.plan i{background:#ffd27d}
+    .voice-call-button.voice-install{width:auto;border-radius:999px;padding:0 13px;border-color:var(--blue);color:var(--blue2);font-size:11px}
     @keyframes voice-pulse{0%{transform:scale(.86);opacity:.65}100%{transform:scale(1.18);opacity:0}}@keyframes voice-think{50%{transform:scale(.92)}}@keyframes voice-speak{to{transform:scale(1.06)}}@media(max-width:600px){.voice-mode{padding:0}.voice-mode-card{min-height:100dvh;border:0;border-radius:0;padding:22px 18px}.voice-orb{width:150px;height:150px}}@media(prefers-reduced-motion:reduce){.voice-orb,.voice-orb::before,.voice-orb::after{animation:none!important}}
   `;document.head.append(style);
   const pill=document.createElement('span');pill.className='voice-live-pill';pill.setAttribute('role','status');pill.setAttribute('aria-live','polite');foot.prepend(pill);
-  const overlay=document.createElement('section');overlay.className='voice-mode';overlay.hidden=true;overlay.dataset.state='idle';overlay.dataset.muted='false';overlay.setAttribute('role','dialog');overlay.setAttribute('aria-modal','true');overlay.setAttribute('aria-label','Voice Mode');overlay.innerHTML='<div class="voice-mode-card"><div class="voice-mode-head"><span class="voice-mode-title">Voice Mode</span><span class="voice-mode-model"></span></div><div class="voice-mode-stage"><button class="voice-orb" type="button" aria-label="Pause or resume listening"></button><div class="voice-state" role="status" aria-live="polite">Ready</div><div class="voice-hint">A spoken conversation with your selected local model</div><div class="voice-transcript" aria-live="polite"></div></div><div class="voice-mode-actions"><div><button class="voice-call-button voice-mute" type="button" aria-label="Mute microphone">🎙</button><span class="voice-call-label">Mute</span></div><button class="voice-call-button end" type="button">End voice</button></div></div>';document.body.append(overlay);
-  const orb=overlay.querySelector('.voice-orb'),stateText=overlay.querySelector('.voice-state'),hint=overlay.querySelector('.voice-hint'),transcript=overlay.querySelector('.voice-transcript'),modelText=overlay.querySelector('.voice-mode-model'),mute=overlay.querySelector('.voice-mute'),end=overlay.querySelector('.end');
+  const overlay=document.createElement('section');overlay.className='voice-mode';overlay.hidden=true;overlay.dataset.state='idle';overlay.dataset.muted='false';overlay.setAttribute('role','dialog');overlay.setAttribute('aria-modal','true');overlay.setAttribute('aria-label','Voice Mode');overlay.innerHTML='<div class="voice-mode-card"><div class="voice-mode-head"><span class="voice-mode-title">Voice Mode</span><span class="voice-mode-model"></span></div><div class="voice-mode-stage"><button class="voice-orb" type="button" aria-label="Pause or resume listening"></button><div class="voice-state" role="status" aria-live="polite">Ready</div><div class="voice-hint">A spoken conversation with your selected local model</div><div class="voice-transcript" aria-live="polite"></div></div><div class="voice-mode-actions"><div><button class="voice-call-button voice-mute" type="button" aria-label="Mute microphone">🎙</button><span class="voice-call-label">Mute</span></div><button class="voice-call-button end" type="button">End voice</button></div><div class="voice-mode-footer"><div class="voice-engine-pill">checking voice engines…</div><button class="voice-call-button voice-install" type="button" hidden>⬇ Install offline voice</button><button class="voice-brain-pill" type="button"><i></i><span>chat</span></button></div></div>';document.body.append(overlay);
+  const orb=overlay.querySelector('.voice-orb'),stateText=overlay.querySelector('.voice-state'),hint=overlay.querySelector('.voice-hint'),transcript=overlay.querySelector('.voice-transcript'),modelText=overlay.querySelector('.voice-mode-model'),mute=overlay.querySelector('.voice-mute'),end=overlay.querySelector('.end'),engineLine=overlay.querySelector('.voice-engine-pill'),installBtn=overlay.querySelector('.voice-install'),brainPill=overlay.querySelector('.voice-brain-pill');
   let active=false,muted=false,recognition=null,waiting=false,speaking=false,restartTimer=0,wakeLock=null,session=0,previousOverflow='';
+  let brain='chat',engines={whisper:false,piper:false,installing:false},enginesFetched=false;
+  let expectingDecision=null,pendingApproval=null,pendingHandoff=null,speakQueue=[],speakingChunk=false,streamBuf='',leadSpoken=false,streamedThisRun=false,chatAgentDisabled=false;
+  let installTimer=0,currentAudio=null,recorder={stream:null,rec:null,ctx:null,buffers:[],levelTimer:0};
+  const agentEnabled=()=>{try{return !!(JSON.parse(localStorage.getItem('local-ai-agent-preview'))||{}).enabled&&localStorage.getItem('local-ai-cloud-mode')!=='cloud'}catch{return false}};
+  const agentModeValue=()=>{try{return localStorage.getItem('local-ai-agent-mode')==='plan'?'plan':'build'}catch{return 'build'}};
+  const agentAutonomy=()=>{try{return JSON.parse(localStorage.getItem('local-ai-agent-autonomy'))||'selective'}catch{return 'selective'}};
+  const toolLabel={read_file:'read file',write_file:'write file',list_dir:'list directory',run_command:'run command',run_tests:'run tests',search_files:'search files',grep_search:'grep search',git:'git',web_search:'web search',web_fetch:'fetch page'};
   const cleanSpeech=text=>String(text||'').replace(/```[\s\S]*?```/g,' code omitted ').replace(/`([^`]+)`/g,'$1').replace(/!\[[^\]]*\]\([^)]*\)/g,'').replace(/\[([^\]]+)\]\([^)]*\)/g,'$1').replace(/^#{1,6}\s+/gm,'').replace(/[*_~>|]/g,' ').replace(/\s+/g,' ').trim();
-  function setState(state,copy,detail=''){overlay.dataset.state=state;stateText.textContent=copy;hint.textContent=detail||({listening:'Speak naturally — I will send after a short pause',thinking:'Your local model is preparing a response',speaking:'Tap the orb to interrupt',muted:'Microphone paused'}[state]||'Voice conversation');pill.className='voice-live-pill on '+state;pill.textContent='voice mode · '+copy.toLowerCase();mic.classList.add('voice-live');mic.setAttribute('aria-pressed','true');mic.title='Return to Voice Mode';mic.setAttribute('aria-label','Return to Voice Mode')}
+  const trimFiller=text=>{const t=String(text||'').replace(/^(?:hey|okay|ok|so|um|uh|hmm|alright|right|yeah|no problem)\b[,\s]+/i,'');return t.replace(/\s+/g,' ').trim()};
+  function sentenceChunks(text,max=260){const clean=cleanSpeech(trimFiller(text));if(!clean)return[];if(clean.length<=max)return[clean];const out=[],parts=clean.split(/(?<=[.!?;:])\s+/);let buf='';for(const part of parts){if(part.length>max){if(buf)out.push(buf);buf='';for(let i=0;i<part.length;i+=max)out.push(part.slice(i,i+max))}else if(buf&&buf.length+1+part.length>max){out.push(buf);buf=part}else{buf=buf?buf+' '+part:part}}if(buf)out.push(buf);return out}
+  function liveChunks(text,max=300){const clean=cleanSpeech(trimFiller(text));if(!clean)return[];if(clean.length<=max)return[clean];const parts=clean.split(/(?<=[.!?;:])\s+/),out=[];let buf='';for(const part of parts){if(part.length>max){if(buf)out.push(buf);buf='';for(let i=0;i<part.length;i+=max)out.push(part.slice(i,i+max))}else{buf=buf?buf+' '+part:part}}if(buf)out.push(buf);return out}
+  const isYes=w=>/^(yes|yeah|yep|y|ok|okay|sure|fine|go ahead|go|please|do it|approve|sounds good|that'?s great|confirm|continue)$/i.test(String(w||'').trim());
+  const isNo=w=>/^(no|nope|n|nah|cancel|skip|stop|not now|later|don'?t|never|decline|ignore|not yet|hold off|no thanks)$/i.test(String(w||'').trim());
+  function speechDecision(text){const t=trimFiller(text);if(!t)return null;if(isYes(t))return'yes';if(isNo(t))return'no';if(/^(please (?:do it|go ahead|proceed)|i (?:approve|agree|accept|say yes)|yes please|sounds good|that'?s (?:fine|good|right|ok(?:ay)?))$/i.test(t))return'yes';if(/^(i (?:decline|refuse|say no)|no (?:thank you|thanks)|not (?:now|yet)|honor(?: the)? defer(?:ral)?|hold off|cancel (?:it|that)|stop(?: for now)?|don'?t (?:do it|proceed|bother)|skip it|later)$/i.test(t))return'no';return null}
+  function setState(state,copy,detail=''){overlay.dataset.state=state;stateText.textContent=copy;hint.textContent=detail||({listening:'Speak naturally — I will send after a short pause',thinking:'Working on your request',speaking:'Tap the orb to interrupt',muted:'Microphone paused'}[state]||'Voice conversation');pill.className='voice-live-pill on '+state;pill.textContent='voice mode · '+copy.toLowerCase();mic.classList.add('voice-live');mic.setAttribute('aria-pressed','true');mic.title='Return to Voice Mode';mic.setAttribute('aria-label','Return to Voice Mode')}
   function clearRestart(){if(restartTimer)clearTimeout(restartTimer);restartTimer=0}
-  async function releaseWake(){try{await wakeLock?.release()}catch{}wakeLock=null}
-  function stopVoice(message='Voice stopped'){
-    active=false;muted=false;session+=1;clearRestart();waiting=false;speaking=false;try{recognition?.abort()}catch{}recognition=null;window.speechSynthesis?.cancel();releaseWake();overlay.hidden=true;overlay.dataset.muted='false';document.body.style.overflow=previousOverflow;mic.classList.remove('voice-live','recording');mic.setAttribute('aria-pressed','false');mic.title='Start Voice Mode';mic.setAttribute('aria-label','Start Voice Mode');pill.textContent=message;setTimeout(()=>{if(!active)pill.className='voice-live-pill'},1300);
-  }
+  function releaseWake(){return (async()=>{try{await wakeLock?.release()}catch{}wakeLock=null})()}
   async function holdWake(){try{if(navigator.wakeLock&&!wakeLock)wakeLock=await navigator.wakeLock.request('screen')}catch{}}
+  function bestVoice(){const language=(navigator.language||'en-US').toLowerCase(),base=language.split('-')[0];return(window.speechSynthesis.getVoices()||[]).map(voice=>{const lang=String(voice.lang||'').toLowerCase(),name=String(voice.name||'');let score=lang===language?8:lang.startsWith(base)?5:0;if(voice.localService)score+=4;if(voice.default)score+=2;if(/natural|enhanced|premium|neural|samantha|ava/i.test(name))score+=3;return{voice,score}}).sort((a,b)=>b.score-a.score)[0]?.voice}
+  function renderVoiceFooter(){
+    const label=brain==='chat'?'chat':(brain==='plan'?'agent · plan':'agent · build');
+    brainPill.querySelector('span').textContent=label;
+    brainPill.classList.toggle('agent',brain!=='chat');brainPill.classList.toggle('plan',brain==='plan');
+    engineLine.textContent=enginesFetched
+      ?(engines.piper?`offline voice · piper ready${engines.whisper?' · whisper-cli ready':''}`:(engines.whisper?'offline STT · whisper-cli (browser voice for now)':'browser voice · install offline engines below'))
+      :'checking voice engines…';
+    installBtn.hidden=Boolean(engines.piper)||Boolean(engines.installing);
+  }
+  function refreshEngines(){return fetch('/api/speech/status').then(r=>r.json()).then(j=>{engines={whisper:!!j.whisper,piper:!!j.piper,installing:!!j.installing};enginesFetched=true;renderVoiceFooter()}).catch(()=>{renderVoiceFooter()})}
+  function audioForText(text){if(engines.piper)return fetch('/api/speech/tts',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})}).then(r=>{if(!r.ok)throw Error('piper '+r.status);return r.blob()});return Promise.resolve(text)}
+  function speakChunk(chunk,done){
+    if(muted){done();return}
+    setState('speaking','Speaking');transcript.textContent='Assistant: '+chunk;
+    if(engines.piper){
+      audioForText(chunk).then(blob=>{
+        if(!active)return done();
+        const url=URL.createObjectURL(blob);const a=new Audio();currentAudio=a;a.src=url;
+        a.onended=()=>{URL.revokeObjectURL(url);if(currentAudio===a)currentAudio=null;done()};
+        a.onerror=()=>{URL.revokeObjectURL(url);if(currentAudio===a)currentAudio=null;done()};
+        a.play().catch(()=>{if(currentAudio===a)currentAudio=null;done()});
+      }).catch(()=>done());
+      return;
+    }
+    try{const u=new SpeechSynthesisUtterance(chunk),voice=bestVoice();u.lang=navigator.language||'en-US';if(voice)u.voice=voice;u.rate=1;u.onend=()=>done();u.onerror=()=>done();window.speechSynthesis.speak(u)}catch{done()}
+  }
+  function dequeueSpeech(){
+    if(speakingChunk)return;
+    const next=speakQueue.shift();if(!next){speaking=false;if(active&&expectingDecision!=null){setState('listening','Listening','Say yes or no');scheduleListen(250);return}if(active&&!waiting){setState('listening','Listening');scheduleListen(350);return}return}
+    speakingChunk=true;leadSpoken=true;speakChunk(next,()=>{speakingChunk=false;dequeueSpeech()});
+  }
+  function queueSpeech(text,{cut=false}={}){
+    if(cut){speakQueue=[];try{window.speechSynthesis?.cancel()}catch{}try{currentAudio?.pause()}catch{}currentAudio=null}
+    for(const p of sentenceChunks(text)){speakQueue.push(p);if(speakQueue.length>12)speakQueue.shift()}
+    if(!active)return;speaking=true;dequeueSpeech();
+  }
+  function feedSpeechStream(delta){if(!active||!delta)return;streamBuf+=delta;const max=280;while(streamBuf.length){let cut=-1;for(const ch of '.!?…'){const i=streamBuf.indexOf(ch);if(i>=0&&i<=32)cut=Math.max(cut,i+1)}if(cut<0){if(streamBuf.length>=max){queueSpeech(streamBuf);streamedThisRun=true;streamBuf=''}break}const sent=streamBuf.slice(0,cut).trim();streamBuf=streamBuf.slice(cut).replace(/^\s+/,'');if(sent){queueSpeech(sent);streamedThisRun=true}}}
+  function flushStream(){if(streamBuf.trim()){queueSpeech(streamBuf);streamedThisRun=true;streamBuf=''}}
+  function resetLead(){streamBuf='';leadSpoken=false;streamedThisRun=false;speakQueue.splice(0);speakingChunk=false}
   function scheduleListen(delay=350){clearRestart();if(!active||muted||waiting||speaking)return;restartTimer=setTimeout(startListening,delay)}
+  function handleDecision(final){const d=speechDecision(final);if(d==='yes'){if(pendingApproval){const p=pendingApproval;pendingApproval=null;expectingDecision=null;p.approve();}else if(pendingHandoff){const h=pendingHandoff;pendingHandoff=null;expectingDecision=null;window.__voicePlanHandoff=null;resetLead();h.approve();}else expectingDecision=null} else if(d==='no'){if(pendingApproval){const p=pendingApproval;pendingApproval=null;expectingDecision=null;p.reject();}else if(pendingHandoff){const h=pendingHandoff;pendingHandoff=null;expectingDecision=null;window.__voicePlanHandoff=null;h.later();}else expectingDecision=null} else{waiting=false;queueSpeech('Say yes or no.',{cut:true});return} waiting=false;scheduleListen(300)}
   function startListening(){
-    clearRestart();if(!active||muted||waiting||speaking)return;if(!Recognition){stopVoice('Speech input unavailable');alert('Voice Mode speech input is not available in this browser. You can still type and use Read aloud.');return}
+    clearRestart();if(!active||muted||waiting||speaking)return;
+    if(engines.whisper&&navigator.mediaDevices?.getUserMedia&&window.MediaRecorder){startRecorderListen();return}
+    if(!Recognition){if(engines.whisper){startRecorderListen();return}stopVoice('Speech input unavailable');alert('Voice Mode speech input is not available in this browser. You can still type and use Read aloud.');return}
     try{
       recognition=new Recognition();recognition.lang=navigator.language||'en-US';recognition.interimResults=true;recognition.continuous=false;recognition.maxAlternatives=1;
-      recognition.onstart=()=>{if(active&&!muted){mic.classList.add('recording');setState('listening','Listening')}};
-      recognition.onresult=event=>{let final='',interim='';for(let i=event.resultIndex;i<event.results.length;i++){const text=event.results[i][0]?.transcript||'';if(event.results[i].isFinal)final+=text;else interim+=text}if(interim&&!waiting){transcript.textContent=interim;input.value=interim;input.dispatchEvent(new Event('input',{bubbles:true}))}if(final.trim()&&!waiting){waiting=true;transcript.textContent='You: '+final.trim();input.value=final.trim();input.dispatchEvent(new Event('input',{bubbles:true}));setState('thinking','Thinking');try{recognition.stop()}catch{}setTimeout(()=>send.click(),0)}};
+      recognition.onstart=()=>{if(active&&!muted){mic.classList.add('recording');setState('listening','Listening',expectingDecision!=null?'Say yes or no':'')}};
+      recognition.onresult=event=>{let final='',interim='';for(let i=event.resultIndex;i<event.results.length;i++){const text=event.results[i][0]?.transcript||'';if(event.results[i].isFinal)final+=text;else interim+=text}if(interim&&!waiting&&expectingDecision==null){transcript.textContent=interim;input.value=interim;input.dispatchEvent(new Event('input',{bubbles:true}))}if(final.trim()&&!waiting){waiting=true;transcript.textContent='You: '+final.trim();if(expectingDecision){handleDecision(final.trim());return}setState('thinking','Thinking');try{recognition.stop()}catch{}setTimeout(()=>submitVoiceText(final.trim()),0)}};
       recognition.onerror=event=>{mic.classList.remove('recording');if(!active)return;if(event.error==='not-allowed'||event.error==='service-not-allowed'){stopVoice('Microphone permission denied');return}if(event.error==='network'){stopVoice('Browser speech service unavailable');return}if(!waiting)scheduleListen(550)};
       recognition.onend=()=>{mic.classList.remove('recording');recognition=null;if(active&&!muted&&!waiting&&!speaking)scheduleListen()};
       recognition.start();
     }catch{scheduleListen(650)}
   }
-  function chunks(text){
-    const clean=cleanSpeech(text);if(!clean)return[];const pieces=clean.match(/[^.!?]+[.!?]+|[^.!?]+$/g)||[clean],out=[];for(const piece of pieces){const part=piece.trim();if(!part)continue;if(part.length<=240){out.push(part);continue}for(let i=0;i<part.length;i+=220)out.push(part.slice(i,i+220))}return out;
+  function submitVoiceText(final){if(brain==='chat')sendChat(final);else launchAgent(final)}
+  function sendChat(final){
+    resetLead();
+    if(agentEnabled()&&window.agentSetEnabled){window.agentSetEnabled(false);chatAgentDisabled=true}
+    window.agentExecute?.(('/ask '+final));
   }
-  function bestVoice(){const language=(navigator.language||'en-US').toLowerCase(),base=language.split('-')[0];return(window.speechSynthesis.getVoices()||[]).map(voice=>{const lang=String(voice.lang||'').toLowerCase(),name=String(voice.name||'');let score=lang===language?8:lang.startsWith(base)?5:0;if(voice.localService)score+=4;if(voice.default)score+=2;if(/natural|enhanced|premium|neural|samantha|ava/i.test(name))score+=3;return{voice,score}}).sort((a,b)=>b.score-a.score)[0]?.voice}
-  function speakAnswer(text,voiceSession){
-    if(!active||voiceSession!==session)return;const spoken=cleanSpeech(text),parts=chunks(spoken);waiting=false;if(!parts.length){scheduleListen();return}speaking=true;transcript.textContent='Assistant: '+spoken;try{recognition?.abort()}catch{}window.speechSynthesis.cancel();setState('speaking','Speaking');let index=0;
-    const next=()=>{if(!active||voiceSession!==session)return;const part=parts[index++];if(!part){speaking=false;scheduleListen(300);return}const utterance=new SpeechSynthesisUtterance(part),voice=bestVoice();utterance.lang=navigator.language||'en-US';if(voice)utterance.voice=voice;utterance.rate=1;utterance.onend=next;utterance.onerror=()=>{if(index<parts.length)next();else{speaking=false;scheduleListen(400)}};window.speechSynthesis.speak(utterance)};next();
+  function launchAgent(final){
+    waiting=true;setState('thinking','Thinking'+(brain==='plan'?' · plan mode':''));resetLead();
+    if(!agentEnabled()&&window.agentEnable)window.agentEnable();
+    const autonomy=agentAutonomy(),planOverride=brain==='plan';
+    window.runAgentTask?.(final,autonomy,'',planOverride);
   }
-  function watchResponse(response,voiceSession){
-    response.text().then(text=>{if(!active||voiceSession!==session)return;let full='',done=false;for(const line of text.split('\n')){if(!line.startsWith('data:'))continue;const raw=line.slice(5).trim();if(!raw||raw==='[DONE]')continue;try{const event=JSON.parse(raw);if(event.type==='done'){full=event.fullText||full;done=true}else if(event.type==='delta')full+=event.content||'';else full+=event.choices?.[0]?.delta?.content||''}catch{}}if(done&&full)speakAnswer(full,voiceSession);else{waiting=false;scheduleListen()}}).catch(()=>{if(active&&voiceSession===session){waiting=false;scheduleListen()}});
+  function clearRecorderListen(){
+    if(recorder.levelTimer){clearInterval(recorder.levelTimer);recorder.levelTimer=0}
+    try{recorder.rec?.stop()}catch{}
+    try{recorder.stream?.getTracks().forEach(t=>t.stop())}catch{}
+    try{recorder.ctx?.close()}catch{}
+    recorder.rec=null;recorder.stream=null;recorder.ctx=null;recorder.buffers=[];
   }
-  const priorFetch=window.fetch.bind(window);window.fetch=async(url,init={})=>{const response=await priorFetch(url,init);if(active&&waiting&&String(url).includes('/api/chat')){const voiceSession=session;if(response.ok)watchResponse(response.clone(),voiceSession);else{waiting=false;setState('listening','Response failed','Try speaking again');scheduleListen(700)}}return response};
+  function startRecorderListen(){
+    if(recorder.rec)return;
+    navigator.mediaDevices.getUserMedia({audio:true}).then(stream=>{
+      if(!active){stream.getTracks().forEach(t=>t.stop());return}
+      recorder.stream=stream;recorder.buffers=[];
+      const rec=new MediaRecorder(stream);recorder.rec=rec;
+      rec.ondataavailable=e=>{if(e.data&&e.data.size)recorder.buffers.push(e.data)};
+      rec.onstop=()=>transcribeRecorder();
+      rec.start(250);
+      const ctx=new (window.AudioContext||window.webkitAudioContext)();recorder.ctx=ctx;
+      const src=ctx.createMediaStreamSource(stream),analyser=ctx.createAnalyser();analyser.fftSize=1024;src.connect(analyser);
+      setTimeout(()=>{if(active)setState('listening','Listening · whisper')},120);
+      const buf=new Uint8Array(analyser.fftSize);let silent=0;
+      recorder.levelTimer=setInterval(()=>{
+        if(!active||!recorder.rec)return;
+        analyser.getByteTimeDomainData(buf);let sum=0;for(let i=0;i<buf.length;i++){const v=(buf[i]-128)/128;sum+=v*v}
+        const rms=Math.sqrt(sum/buf.length);
+        if(rms<0.006)silent+=0.25;else silent=0;
+        if(silent>1.2){try{rec.stop()}catch{}}
+      },250);
+    }).catch(()=>{
+      if(!Recognition)stopVoice('Speech input unavailable');
+      else if(active&&!muted&&!waiting)startListening();
+    });
+  }
+  async function transcribeRecorder(){
+    const {rec,ctx,buffers}=recorder;
+    clearRecorderListen();
+    if(!active||waiting||!buffers.length){stateText.textContent='Listening';scheduleListen(400);return}
+    waiting=true;setState('thinking','Transcribing…');try{
+      const blob=new Blob(buffers,{type:(rec&&rec.mimeType)||'audio/webm'});
+      const audioBuf=await ctx.decodeAudioData(await blob.arrayBuffer());
+      const wav=encodeWav(audioBuf,16000),b64=bytesToBase64(wav);
+      const r=await fetch('/api/speech/transcribe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({audioBase64:b64,lang:'en'})}),j=await r.json();
+      if(!r.ok)throw Error(j.error||'whisper failed');
+      const text=trimFiller(j.text||'');
+      if(text){transcript.textContent='You: '+text;submitVoiceText(text)}
+      else{waiting=false;scheduleListen()}
+    }catch(e){waiting=false;setState('listening','Whisper error',e.message);scheduleListen(700)}
+  }
+  function encodeWav(audioBuffer,sampleRate){
+    const inRate=audioBuffer.sampleRate,ch=audioBuffer.numberOfChannels,scale=inRate/sampleRate,total=Math.max(1,Math.ceil(audioBuffer.duration*sampleRate)),tmp=new Float32Array(audioBuffer.length),sum=new Float32Array(total);
+    for(let c=0;c<ch;c++){const src=audioBuffer.getChannelData(c);for(let i=0;i<src.length;i++)tmp[i]+=src[i]}
+    const out=new ArrayBuffer(44+total*2),dv=new DataView(out);
+    const str=(o,s)=>{for(let i=0;i<s.length;i++)dv.setUint8(o+i,s.charCodeAt(i))};
+    str(0,'RIFF');dv.setUint32(4,36+total*2,true);str(8,'WAVE');str(12,'fmt ');dv.setUint32(16,16,true);dv.setUint16(20,1,true);dv.setUint16(22,1,true);dv.setUint32(24,sampleRate,true);dv.setUint32(28,sampleRate*2,true);dv.setUint16(32,2,true);dv.setUint16(34,16,true);str(36,'data');dv.setUint32(40,total*2,true);
+    let o=44;for(let i=0;i<total;i++,o+=2){const s=Math.max(-1,Math.min(1,tmp[Math.floor(i*scale)]/ch));dv.setInt16(o,s<0?s*0x8000:s*0x7FFF,true)}
+    return out;
+  }
+  function bytesToBase64(buf){const b=new Uint8Array(buf);let s='';for(let i=0;i<b.length;i+=0x8000)s+=String.fromCharCode(...b.subarray(i,i+0x8000));return btoa(s)}
+  function pollInstall(){
+    clearInterval(installTimer);
+    installTimer=setInterval(()=>{
+      fetch('/api/speech/install').then(r=>r.json()).then(s=>{
+        const pct=s.total?Math.round(s.downloaded/s.total*100):-1;
+        engineLine.textContent=`voice · ${s.status||'installing'}${s.current?` · ${s.current}`:''}${pct>=0?` · ${pct}%`:''}`;
+        if(s.status==='ready'){clearInterval(installTimer);installTimer=0;refreshEngines();queueSpeech('Offline voice engines are installed.',{cut:true});return}
+        if(s.status==='error'){clearInterval(installTimer);installTimer=0;refreshEngines();engineLine.textContent='voice install failed.';}
+      }).catch(()=>{});
+    },600);
+  }
+  function installVoices(){
+    if(engines.installing)return;
+    engineLine.textContent='voice · starting install…';
+    fetch('/api/speech/install',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}).then(r=>r.json()).then(j=>{
+      if(!j.ok){engineLine.textContent='voice · install could not start'+(j.error?' · '+j.error:'');refreshEngines();return}
+      pollInstall();
+    }).catch(()=>{engineLine.textContent='voice · install unavailable';refreshEngines()});
+  }
+  window.__voiceAgentFeed=data=>{
+    if(!active)return;
+    if(data.type==='reasoning'||data.type==='stream_end')return;
+    switch(data.type){
+      case 'token':waiting=true;feedSpeechStream(data.delta);return;
+      case 'thinking':waiting=true;queueSpeech(cleanSpeech(String(data.message||'')));return;
+      case 'tool_call':return;
+      case 'executing':waiting=true;queueSpeech(cleanSpeech(String(data.message||'')));return;
+      case 'tool_result':return;
+      case 'approval_needed':{
+        waiting=false;expectingDecision='approval';
+        const rule=data.kind==='norms'?cleanSpeech(data.rule||data.name||'this request'):(toolLabel[data.name]||data.name||'this step');
+        queueSpeech(data.kind==='norms'
+          ?`Norm check: ${rule}. Say over-ride to proceed, or honor to decline.`
+          :`Approve ${rule}? Say yes or no.`,{cut:true});
+        setTimeout(()=>{pendingApproval=window.__voiceLastApproval||null},40);
+        return;
+      }
+      case 'completed':{
+        flushStream();
+        setTimeout(()=>{
+          if(window.__voicePlanHandoff){
+            pendingHandoff=window.__voicePlanHandoff;
+            const pd=window.__voicePlanData||{};
+            const head=(liveChunks(pd.content||'')||[])[0]||pd.task||'Plan ready';
+            queueSpeech(`Plan ready. ${head} Say yes to approve and implement, or say later.`,{cut:true});
+            expectingDecision='plan';waiting=false;
+          }else{
+            if(!streamedThisRun&&data.content)queueSpeech(cleanSpeech(data.content));
+            waiting=false;
+          }
+        },50);
+        return;
+      }
+      case 'cancelled':waiting=false;queueSpeech('Cancelled.',{cut:true});return;
+      case 'error':waiting=false;queueSpeech(cleanSpeech('There was an error: '+(data.message||data.error||'unknown')),{cut:true});return;
+      case 'loop_started':case 'started':waiting=true;resetLead();return;
+      default:return;
+    }
+  };
+  function stopVoice(message='Voice stopped'){
+    active=false;muted=false;session+=1;waiting=false;speaking=false;expectingDecision=null;pendingApproval=null;pendingHandoff=null;clearRestart();clearRecorderListen();if(installTimer){clearInterval(installTimer);installTimer=0}speakQueue=[];streamBuf='';try{window.speechSynthesis?.cancel()}catch{}try{currentAudio?.pause()}catch{}currentAudio=null;
+    if(chatAgentDisabled){try{window.agentSetEnabled?.(true)}catch{}chatAgentDisabled=false}
+    try{recognition?.abort()}catch{}recognition=null;releaseWake();overlay.hidden=true;overlay.dataset.muted='false';document.body.style.overflow=previousOverflow;mic.classList.remove('voice-live','recording');mic.setAttribute('aria-pressed','false');mic.title='Start Voice Mode';mic.setAttribute('aria-label','Start Voice Mode');pill.textContent=message;setTimeout(()=>{if(!active)pill.className='voice-live-pill'},1300);
+  }
+  function toggleMute(){if(!active)return;muted=!muted;overlay.dataset.muted=String(muted);mute.textContent=muted?'🔇':'🎙';mute.setAttribute('aria-label',muted?'Unmute microphone':'Mute microphone');mute.nextElementSibling.textContent=muted?'Unmute':'Mute';if(muted){clearRestart();try{recognition?.abort()}catch{}recognition=null;clearRecorderListen();setState('muted','Muted')}else{setState('listening','Listening');scheduleListen(100)}}
   async function startVoice(){
-    if(!Recognition){alert('Voice Mode speech input is not available in this browser. You can still type and use Read aloud.');return}if(!window.speechSynthesis||!window.SpeechSynthesisUtterance){alert('Spoken output is not available in this browser.');return}
     const selected=document.getElementById('model-select')?.value;if(!selected){alert('Choose or install a model before starting Voice Mode.');return}if(send.disabled){alert('Wait for the current response to finish, then start Voice Mode.');return}
-    active=true;muted=false;session+=1;waiting=false;speaking=false;transcript.textContent='';modelText.textContent=selected;modelText.title=selected;overlay.hidden=false;overlay.dataset.muted='false';previousOverflow=document.body.style.overflow;document.body.style.overflow='hidden';setState('listening','Requesting microphone…');await holdWake();window.speechSynthesis.cancel();const warmup=new SpeechSynthesisUtterance('');warmup.volume=0;window.speechSynthesis.speak(warmup);startListening();end.focus();
+    await refreshEngines();
+    if(!Recognition&&!engines.whisper){alert('Voice Mode speech input is not available in this browser. Install whisper.cpp (set WHISPER_CLI and WHISPER_MODEL) or use a Chromium-based browser that supports speech input.');return}if(!window.speechSynthesis&&!engines.piper){alert('Spoken output is not available in this browser.');return}
+    brain=agentEnabled()?(agentModeValue()==='plan'?'plan':'build'):'chat';renderVoiceFooter();
+    active=true;muted=false;session+=1;waiting=false;speaking=false;expectingDecision=null;pendingApproval=null;pendingHandoff=null;transcript.textContent='';resetLead();modelText.textContent=selected;modelText.title=selected;overlay.hidden=false;overlay.dataset.muted='false';previousOverflow=document.body.style.overflow;document.body.style.overflow='hidden';setState('listening','Requesting microphone…');await holdWake();try{window.speechSynthesis.cancel()}catch{}const warmup=new SpeechSynthesisUtterance('');warmup.volume=0;window.speechSynthesis.speak(warmup);startListening();end.focus();
   }
-  function toggleMute(){if(!active)return;muted=!muted;overlay.dataset.muted=String(muted);mute.textContent=muted?'🔇':'🎙';mute.setAttribute('aria-label',muted?'Unmute microphone':'Mute microphone');mute.nextElementSibling.textContent=muted?'Unmute':'Mute';if(muted){clearRestart();try{recognition?.abort()}catch{}recognition=null;setState('muted','Muted')}else{setState('listening','Listening');scheduleListen(100)}}
-  mic.onclick=()=>{if(active){overlay.hidden=false;document.body.style.overflow='hidden';end.focus()}else startVoice()};mute.onclick=toggleMute;end.onclick=()=>stopVoice();orb.onclick=()=>{if(speaking){session+=1;window.speechSynthesis.cancel();speaking=false;waiting=false;setState('listening','Listening');scheduleListen(100)}else toggleMute()};mic.setAttribute('aria-pressed','false');mic.title='Start Voice Mode';mic.setAttribute('aria-label','Start Voice Mode');
+  mic.addEventListener('click',ev=>{ev.preventDefault();ev.stopImmediatePropagation();ev.stopPropagation();if(active){overlay.hidden=false;document.body.style.overflow='hidden';end.focus()}else startVoice()},true);mute.onclick=toggleMute;end.onclick=()=>stopVoice();orb.onclick=()=>{if(speaking){session+=1;try{window.speechSynthesis.cancel()}catch{}try{currentAudio?.pause()}catch{}currentAudio=null;speakQueue=[];speaking=false;speakingChunk=false;waiting=false;expectingDecision=null;setState('listening','Listening');scheduleListen(100)}else toggleMute()};installBtn.onclick=installVoices;brainPill.onclick=()=>{brain=brain==='chat'?'build':brain==='build'?'plan':'chat';renderVoiceFooter()};mic.setAttribute('aria-pressed','false');mic.title='Start Voice Mode';mic.setAttribute('aria-label','Start Voice Mode');
+  const priorFetch=window.fetch.bind(window);window.fetch=async(url,init={})=>{const response=await priorFetch(url,init);if(active&&waiting&&String(url).includes('/api/chat')){const voiceSession=session;if(response.ok)watchResponse(response.clone(),voiceSession);else{waiting=false;setState('listening','Response failed','Try speaking again');scheduleListen(700)}}return response};
+  function watchResponse(response,voiceSession){
+    response.text().then(text=>{
+      if(!active||voiceSession!==session)return;let full='',done=false;
+      for(const line of text.split('\n')){if(!line.startsWith('data:'))continue;const raw=line.slice(5).trim();if(!raw||raw==='[DONE]')continue;try{const event=JSON.parse(raw);if(event.type==='done'){full=event.fullText||full;done=true}else if(event.type==='delta'){const c=event.content||'';if(c){full+=c;feedSpeechStream(c)}}else if(event.choices?.[0]?.delta){const c=event.choices[0].delta.content||'';if(c){full+=c;feedSpeechStream(c)}}}catch{}}
+      if(done){flushStream();if(!streamedThisRun&&full)queueSpeech(cleanSpeech(full));if(chatAgentDisabled){try{window.agentSetEnabled?.(true)}catch{}chatAgentDisabled=false}waiting=false;if(active)setState('listening','Listening');scheduleListen(450)}else{waiting=false;scheduleListen()}
+    }).catch(()=>{if(active&&voiceSession===session){waiting=false;scheduleListen()}});
+  }
   document.addEventListener('keydown',event=>{if(active&&event.key==='Escape')stopVoice()});
   document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&active){holdWake();if(!waiting&&!speaking)scheduleListen(150)}});
   window.addEventListener('beforeunload',()=>stopVoice(''));
