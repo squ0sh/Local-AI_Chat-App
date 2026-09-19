@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.2.1 — Fit model suggestion
+
+- **Automatic model suggestion**: before any model has been chosen, the chat
+  selector opens on the Fit-best **installed** model (rather than the first one
+  in the list). Changing the **Fit level** re-selects the best installed model
+  for that level — until you pick one yourself, which is always respected.
+- **Fit card actions**: the suggested curated model now has a **Use this model**
+  button when it is already installed, and an **Install (~N GB)** button when it
+  is not — the latter opens the Model Library and starts the download there.
+- `/api/fit*` now also reports `top_installed_model` (name, size, predicted
+  tokens/second, interactivity) plus whether the curated suggestion is already
+  installed, using the same `recommendFit` engine against the live Ollama model
+  list.
+
 ## 1.2.0 — Fit and undo
 
 ### Undo everything

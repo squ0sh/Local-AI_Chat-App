@@ -167,7 +167,13 @@ uses. Predictions are self-correcting: every real chat stream and every real
 image job is quietly measured (tokens/second, minutes per megapixel) and
 blended into the next estimate, so the numbers drift toward this machine's
 actual behavior without any configuration. Fit only ever proposes — it never
-changes a model you have chosen yourself.
+changes a model you have chosen yourself. Fit also suggests the best
+**installed** model: on a fresh start, before any model has been picked, the
+chat selector opens on the Fit-best installed model, and switching Fit level
+re-selects it — but only until you choose a model yourself, which Fit always
+keeps. In the Fit card, a suggested model that is already installed offers
+**Use this model**; one that is not installed offers **Install (~N GB)**,
+which opens the Model Library and starts the download there.
 
 SIMD detection is cross-platform: Linux reads `/proc/cpuinfo`, macOS reads
 `sysctl`. On Windows it normally reports a conservative `baseline` tier; to

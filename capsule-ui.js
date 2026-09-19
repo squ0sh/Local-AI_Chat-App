@@ -495,28 +495,59 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
   if(ledgerDialog)ledgerDialog.addEventListener('close',()=>clearInterval(ledgerTimer),{once:true});
   const fitDialog=document.getElementById('fit-dialog');
   const fitScore=document.getElementById('fit-score'),fitLevelsEl=document.getElementById('fit-levels'),fitRecs=document.getElementById('fit-recs');
+  let fitCache=null;let userPickedModel=false;
+  const fitModelSelect=document.getElementById('model-select');
+  if(fitModelSelect&&!fitModelSelect.__fitSuggestionWatch){fitModelSelect.__fitSuggestionWatch=true;fitModelSelect.addEventListener('change',ev=>{if(ev.isTrusted)userPickedModel=true})}
   async function paintFit(){
     if(!fitDialog)return;
     let f;
     try{const r=await fetch('/api/fit',{headers:auth()});if(!r.ok)throw Error('Could not read Fit');f=await r.json()}catch(e){fitScore.innerHTML=`<p class="empty-history">${esc(e.message)}</p>`;return}
+    fitCache=f;
     const pct=Math.min(100,Math.round((f.benchmark.score/3)*100));
     fitScore.innerHTML=`<div class="fit-score-head"><b>${(f.benchmark.score).toFixed(2)}×</b><span>vs the reference build machine (i5-3570). Higher is faster.</span></div><div class="fit-bar"><i style="width:${pct}%"></i></div><div class="fit-bar-labels"><span>slow</span><span>reference</span><span>fast</span></div><div class="fit-meta"><span>Memory <b>${f.memory.free_gb} / ${f.memory.total_gb} GB</b></span><span>RAM bandwidth <b>${f.benchmark.mem_band_mbps} MB/s</b></span><span>SIMD <b>${esc(f.cpu.simd||'n/a')}</b></span><span>Image threads <b>${f.threads}</b></span></div>`;
     fitLevelsEl.replaceChildren(...Object.entries(f.levels).map(([id,L])=>{
       const btn=document.createElement('button');btn.type='button';btn.className='fit-level'+(id===f.level?' active':'');
       btn.innerHTML=`<b>${esc(L.label)}</b><span>${esc(L.summary)}</span>`;
-      btn.onclick=async()=>{const r=await fetch('/api/fit/level',{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({level:id})});if(r.ok)paintFit()};
+      btn.onclick=async()=>{const r=await fetch('/api/fit/level',{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({level:id})});if(r.ok){paintFit();applyFitImagePills();applyFitModel()}};
       return btn;
     }));
-    fitRecs.innerHTML=f.model
-      ?`<div class="fit-rec"><span>Suggested model</span><b>${esc(f.model.name)}</b><span>~${f.model.predicted_tokens_per_sec} tok/s</span></div>`
+    const top=f.top_installed_model;
+    const normName=x=>String(x||'').toLowerCase().replace(/:latest$/,'');
+    const samePick=top&&f.model&&normName(top.name)===normName(f.model.model||f.model.name);
+    const curated=!f.model?'':`<div class="fit-rec"><span>Suggested model</span><b>${esc(f.model.name)}</b><span>~${f.model.predicted_tokens_per_sec} tok/s</span>${f.model.installed||!f.model.download_gb?`<button type="button" class="plain-btn fit-rec-btn" data-fit-use="${esc(f.model.model||f.model.name)}">Use this model</button>`:`<button type="button" class="plain-btn fit-rec-btn" data-fit-install="${esc(f.model.id||'')}">Install (~${f.model.download_gb} GB)</button>`}</div>`;
+    const installedBest=top&&!samePick?`<div class="fit-rec"><span>Best installed</span><b>${esc(top.name)}</b><span>~${top.predicted_tokens_per_sec} tok/s</span></div>`:'';
+    const body=f.model||top;
+    fitRecs.innerHTML=body
+      ?curated+installedBest
       +`<div class="fit-rec"><span>Image ${f.image.default}×${f.image.default}</span><b>~${f.image.minutes[f.image.default]} min</b></div>`
       +`<div class="fit-rec"><span>Image 512×512 with hires upscale</span><b>~${f.image.minutes[512]} min</b></div>`
       +`<div class="fit-rec"><span>Image 1024×1024</span><b>~${f.image.minutes[1024]} min</b></div>`
       +`<div class="fit-rec"><span>Deep research</span><b>~${f.research_minutes} min</b></div>`
       +`<div class="fit-rec"><span>Voice engine</span><b>${esc(f.tts)}</b></div>`
-      +`${!f.model_fits_memory?`<div class="fit-warn">No curated model preset fits the memory that is free right now (${f.memory.free_gb} GB). The suggestion below needs more — closing apps or freeing memory unlocks better options.</div>`:f.below_interactive?`<div class="fit-warn">This level's suggested model may feel slow on this machine. A lighter model, or freeing memory, helps most.</div>`:`<div class="fit-ok">Good fit — this level is comfortable on this machine.</div>`}`
+      +(f.model?`${!f.model_fits_memory?`<div class="fit-warn">No curated model preset fits the memory that is free right now (${f.memory.free_gb} GB). The suggestion below needs more — closing apps or freeing memory unlocks better options.</div>`:f.below_interactive?`<div class="fit-warn">This level's suggested model may feel slow on this machine. A lighter model, or freeing memory, helps most.</div>`:`<div class="fit-ok">Good fit — this level is comfortable on this machine.</div>`}`:'')
       +`<div class="fit-meta">${f.observed.tokens_per_sec?`<span>Learned <b>${f.observed.tokens_per_sec} tok/s</b> from real chat</span>`:''}${f.observed.minutes_per_mpix?`<span>Learned <b>${f.observed.minutes_per_mpix} min/MP</b> from real images</span>`:''}</div>`
-      :'<p class="empty-history">No curated model preset fits current memory. Freeing some will unlock suggestions.</p>';
+      :'<p class="empty-history">No model suggestion fits current memory. Freeing some will unlock suggestions.</p>';
+    fitRecs.querySelectorAll('[data-fit-use]').forEach(btn=>btn.onclick=()=>{const name=btn.dataset.fitUse;fitUseModel(name);btn.disabled=true;btn.textContent='✓ Selected for this chat'});
+    fitRecs.querySelectorAll('[data-fit-install]').forEach(btn=>btn.onclick=()=>{const id=btn.dataset.fitInstall;if(window.openModelLibrary){window.openModelLibrary(id)}else{alert('Use "Model library" in the sidebar to install that model.')}});
+  }
+  function fitUseModel(name){
+    userPickedModel=true;
+    const select=document.getElementById('model-select');if(!select||!name)return;
+    const norm=x=>String(x||'').toLowerCase().replace(/:latest$/,'');
+    const option=[...select.options].find(o=>norm(o.value)===norm(name));
+    if(!option){alert('That model is not installed yet — install it from the sidebar first.');return}
+    if(select.value!==option.value){select.value=option.value;select.dispatchEvent(new Event('change'))}
+  }
+  function applyFitModel(){
+    if(!fitCache||!fitCache.top_installed_model)return;
+    if(window.isLocalChatStreaming?.())return;
+    if(userPickedModel)return;
+    const select=document.getElementById('model-select');if(!select)return;
+    const norm=x=>String(x||'').toLowerCase().replace(/:latest$/,'');
+    const option=[...select.options].find(o=>norm(o.value)===norm(fitCache.top_installed_model.name));
+    if(!option||select.value===option.value)return;
+    select.value=option.value;
+    select.dispatchEvent(new Event('change'));
   }
   function openFit(){if(!fitDialog)return;fitDialog.showModal();paintFit()}
   const fitButton=document.getElementById('agent-fit-button');
@@ -529,6 +560,8 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
       const n=Number(btn.dataset.size),t=f.image&&f.image.minutes&&f.image.minutes[n];
       if(t){btn.textContent=btn.textContent.replace(/~\s*[\d.]+ min/,'~'+Math.round(t)+' min');btn.title=`${n} × ${n} pixels · ~${Math.round(t)} min`}
     });
+    const def=f.image&&f.image.default?String(f.image.default):'';
+    if(def){const target=size.querySelector('.mode-btn[data-size="'+def+'"]');if(target){size.querySelectorAll('.mode-btn').forEach(b=>b.classList.remove('active'));target.classList.add('active')}}
   }
   applyFitImagePills();
   // These overrides replace the earlier declarations above: research progress
@@ -1340,6 +1373,14 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
   dialog.addEventListener('cancel',()=>{stopPolling();stopStreamWatch()});
   dialog.addEventListener('close',()=>{stopPolling();stopStreamWatch()});
   launch.onclick=()=>{state.streaming=chatStreaming();dialog.showModal();loadLibrary();watchStreamState()};
+  window.openModelLibrary=(presetId='')=>{
+    state.streaming=chatStreaming();dialog.showModal();watchStreamState();
+    const recommendedTab=dialog.querySelector('[data-tab="recommended"]');
+    if(recommendedTab&&state.tab!=='recommended')activateTab(recommendedTab);
+    loadLibrary().then(()=>{
+      if(presetId&&!mutationsLocked())startInstall({preset:presetId});
+    });
+  };
 })();
 
 /* ── Image generation mode (sd.cpp backend, local-only, full workspace) ───── */

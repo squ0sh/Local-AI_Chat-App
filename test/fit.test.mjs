@@ -91,6 +91,24 @@ test('observations correct the static prediction', () => {
   assert.equal(learned.observed.minutes_per_mpix, 1.2);
 });
 
+test('recommendFit ranks installed-like models by largest interactive fit (used for auto-suggest)', () => {
+  const b = runMicroBenchmark();
+  const installed = [
+    { id: 'huge:24b', name: 'huge:24b', model: 'huge:24b', memory_gb: 24 },
+    { id: 'mid:4b', name: 'mid:4b', model: 'mid:4b', memory_gb: 4 },
+    { id: 'small:3b', name: 'small:3b', model: 'small:3b', memory_gb: 3 },
+  ];
+  const rec = recommendFit({ presets: installed, memFreeGb: 20, memScore: b.memScore, score: b.score, cores: 4, state: { level: 'balanced', observed: { tokens_per_sec: [], minutes_per_mpix: [] } } });
+  assert.equal(rec.model.id, 'mid:4b');
+  assert.equal(rec.model_fits_memory, true);
+});
+
+test('recommendFit reports no memory fit when the only installed model is too big', () => {
+  const b = runMicroBenchmark();
+  const rec = recommendFit({ presets: [{ id: 'huge:24b', name: 'huge:24b', model: 'huge:24b', memory_gb: 24 }], memFreeGb: 5, memScore: b.memScore, score: b.score, cores: 4, state: { level: 'balanced', observed: { tokens_per_sec: [], minutes_per_mpix: [] } } });
+  assert.equal(rec.model_fits_memory, false);
+});
+
 test('fit level constants are coherent and exported', () => {
   assert.deepEqual(FIT_LEVEL_IDS.sort(), ['balanced', 'frugal', 'max']);
   assert.ok(FIT_LEVELS.frugal.image_default < FIT_LEVELS.balanced.image_default);

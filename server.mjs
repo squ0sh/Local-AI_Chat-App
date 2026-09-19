@@ -486,7 +486,7 @@ function recordFitTokenObservation(tokenCount, startedAt) {
   observeFit('tokens_per_sec', tokenCount / seconds);
 }
 
-function fitPayload() {
+async function fitPayload() {
   const b = currentFitBenchmark();
   const profile = localHardwareProfile();
   let cpu = {};
@@ -502,7 +502,9 @@ function fitPayload() {
     cores: cpu.cores || profile.cpu_cores || 4,
     state: fitState,
   });
-  return {
+  const suggestedPreset = CURATED_MODELS.find((p) => p.id === recommendation.model?.id);
+  if (suggestedPreset && recommendation.model) recommendation.model.download_gb = suggestedPreset.download_gb;
+  const payload = {
     ...recommendation,
     benchmark: {
       score: Math.round(b.score * 100) / 100,
@@ -515,6 +517,32 @@ function fitPayload() {
     cpu: { cores: cpu.cores || profile.cpu_cores, simd: cpu.simd, arch: cpu.arch },
     levels: FIT_LEVELS,
   };
+  try {
+    const tags = await ollamaTags();
+    if (tags.length) {
+      const installed = tags.map((tag) => ({
+        id: tag.name || tag.model,
+        name: tag.name || tag.model,
+        model: tag.name || tag.model,
+        memory_gb: Math.max(1, Number(tag.size || 0) / 1_000_000_000),
+      }));
+      const rec = recommendFit({ presets: installed, memFreeGb: profile.memory_free_gb, memScore: b.memScore, score: b.score, cores: cpu.cores || profile.cpu_cores || 4, state: fitState });
+      if (rec.model && rec.model_fits_memory !== false) {
+        payload.top_installed_model = {
+          name: rec.model.name,
+          memory_gb: Math.round((rec.model.estimated_gb || 0) * 10) / 10,
+          predicted_tokens_per_sec: rec.model.predicted_tokens_per_sec,
+          below_interactive: rec.below_interactive,
+        };
+      }
+      const suggestedModel = recommendation.model && recommendation.model.model;
+      if (suggestedModel) {
+        const normalized = (name) => String(name || '').trim().toLowerCase().replace(/:latest$/, '');
+        recommendation.model.installed = installed.some((tag) => normalized(tag.name) === normalized(suggestedModel));
+      }
+    }
+  } catch {}
+  return payload;
 }
 
 function perfSnapshot() {
@@ -3246,7 +3274,7 @@ async function handle(req, res) {
 
   // ── Fit: the machine's own settings ─────────────────────────────────────
   if (req.method === 'GET' && p === '/api/fit') {
-    return sendJSON(res, 200, fitPayload());
+    return sendJSON(res, 200, await fitPayload());
   }
   if (req.method === 'POST' && p === '/api/fit/level') {
     let body;
@@ -3255,7 +3283,7 @@ async function handle(req, res) {
     if (!FIT_LEVELS[level]) return sendJSON(res, 400, { error: 'Unknown fit level: use frugal, balanced, or max' });
     fitState = { ...fitState, level };
     saveFitState(DATA_DIR, fitState);
-    return sendJSON(res, 200, { ok: true, level, recommendation: fitPayload() });
+    return sendJSON(res, 200, { ok: true, level, recommendation: await fitPayload() });
   }
   if (req.method === 'POST' && p === '/api/fit/observe') {
     let body;
