@@ -29,6 +29,9 @@ if ambiguous; then
   exit 1
 fi
 
+echo "pre-commit: linting…"
+( cd "$ROOT" && node tools/lint.mjs )
+
 echo "pre-commit: refreshing capsule-integrity.json…"
 ( cd "$ROOT" && node tools/generate-integrity.mjs )
 git add "$MANIFEST"

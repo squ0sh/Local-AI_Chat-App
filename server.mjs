@@ -13,19 +13,20 @@
 
 import { createServer } from 'http';
 import * as https from 'https';
-import { readFileSync, existsSync, mkdirSync, createReadStream, createWriteStream, copyFileSync, chmodSync, readdirSync, rmdirSync, statSync, statfsSync, writeFileSync, renameSync, unlinkSync, accessSync, constants as fsConstants, appendFileSync } from 'fs';
+import { readFileSync, existsSync, mkdirSync, createReadStream, createWriteStream, copyFileSync, chmodSync, readdirSync, rmdirSync, rmSync, statSync, statfsSync, writeFileSync, renameSync, unlinkSync, accessSync, constants as fsConstants, appendFileSync } from 'fs';
 import { join, dirname, resolve, relative, sep, basename } from 'path';
 import { fileURLToPath } from 'url';
 import { spawn, execSync, execFileSync } from 'child_process';
 import { pipeline } from 'stream/promises';
 import { Readable, Transform } from 'stream';
-import { totalmem, freemem, cpus, loadavg, homedir } from 'os';
+import { totalmem, freemem, cpus, loadavg, homedir, networkInterfaces } from 'os';
 import { randomBytes, createHash } from 'crypto';
 import qrcode from './lib/vendor/qrcode-generator.mjs';
 import { portableIntegrityReport, rebuildManifest, repairReleaseFiles } from './lib/capsule-integrity.mjs';
 import { sealVault, openVault } from './lib/capsule-vault.mjs';
 import { ResearchEngine } from './lib/research-engine.mjs';
 import { pullOllamaModel } from './lib/resumable-ollama-pull.mjs';
+import { hardwareInfo, hardwareSummary } from './lib/hardware.mjs';
 import { RateLimiter, rateLimitResponse } from './lib/rate-limit.mjs';
 import { ChatStore } from './lib/chat-store.mjs';
 import { McpClient } from './lib/mcp-client.mjs';
@@ -454,6 +455,40 @@ function localHardwareProfile() {
     if (devices.length) gpu = { devices, total_vram_gb: devices.reduce((sum, device) => sum + device.total_vram_gb, 0), free_vram_gb: devices.reduce((sum, device) => sum + device.free_vram_gb, 0) };
   } catch {}
   return { memory_total_gb: memoryTotalGb, memory_free_gb: memoryFreeGb, disk_free_gb: diskFreeGb, cpu_cores: cpus().length, gpu, portable: Boolean(process.env.LOCAL_AI_DATA_DIR) && storage.portable, storage };
+}
+
+function perfSnapshot() {
+  const cores = cpus().length || 1;
+  const cpuPercent = Math.min(100, Math.max(0, Math.round((loadavg()[0] / cores) * 100)));
+  const memoryTotalGb = totalmem() / 1024 ** 3;
+  const memoryFreeGb = freemem() / 1024 ** 3;
+  let gpu = null;
+  try {
+    const h = hardwareInfo();
+    const dev = h.gpu?.devices?.[0];
+    if (dev) gpu = { name: dev.name, total_vram_gb: h.gpu.total_vram_gb, free_vram_gb: h.gpu.free_vram_gb };
+  } catch {}
+  return {
+    cpu_percent: cpuPercent,
+    memory_total_gb: memoryTotalGb,
+    memory_free_gb: memoryFreeGb,
+    memory_used_gb: memoryTotalGb - memoryFreeGb,
+    gpu,
+  };
+}
+
+function lanUrls(host, port) {
+  if (!host || LOOPBACK_HOSTS.has(String(host).toLowerCase())) return [];
+  const urls = [];
+  try {
+    const nets = networkInterfaces();
+    for (const name of Object.keys(nets)) {
+      for (const addr of nets[name] || []) {
+        if (addr.family === 'IPv4' && !addr.internal && !addr.address.startsWith('169.254.')) urls.push('http://' + addr.address + ':' + port);
+      }
+    }
+  } catch {}
+  return urls;
 }
 
 function pathIsInside(parent, child) {
@@ -1455,9 +1490,9 @@ const isWin = () => process.platform === 'win32';
 
 function log(...args) { console.log(new Date().toISOString(), ...args); }
 
-function runChild(cmd, args, { input } = {}) {
+function runChild(cmd, args, { input, env } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { stdio: input != null ? ['pipe', 'ignore', 'pipe'] : ['ignore', 'ignore', 'pipe'] });
+    const child = spawn(cmd, args, { stdio: input != null ? ['pipe', 'ignore', 'pipe'] : ['ignore', 'ignore', 'pipe'], env: env || process.env });
     let err = '';
     child.stderr.on('data', (d) => { err += d.toString(); });
     child.on('error', () => resolve(-1));
@@ -1466,17 +1501,29 @@ function runChild(cmd, args, { input } = {}) {
   });
 }
 
-// ── Offline speech: whisper.cpp + piper (optional, detected at runtime) ────
+// ── Offline speech: whisper.cpp (STT) + piper/kokoro (TTS), runtime-detected ─
 let speechInfo = null;
+function installedWhisperCli() {
+  const cli = join(SPEECH_DIR, 'whisper', 'whisper-cli');
+  return existsSync(cli) ? cli : '';
+}
+function installedWhisperModel() {
+  for (const name of ['ggml-base.bin', 'ggml-small.bin', 'ggml-base.en.bin']) {
+    const p = join(SPEECH_DIR, 'whisper', name);
+    if (existsSync(p)) return p;
+  }
+  return '';
+}
 function speechSupport() {
   if (speechInfo) return speechInfo;
   const speechDir = join(SPEECH_DIR, 'piper');
-  const whisper = process.env.WHISPER_CLI || findOnPath('whisper-cli') || findOnPath('whisper-cpp') || findOnPath('whisper');
+  const whisper = process.env.WHISPER_CLI || findOnPath('whisper-cli') || findOnPath('whisper-cpp') || findOnPath('whisper') || installedWhisperCli();
   const piper = process.env.PIPER_CLI || findOnPath('piper') || (existsSync(join(speechDir, 'piper')) ? join(speechDir, 'piper') : '');
-  const whisperModel = process.env.WHISPER_MODEL || join(__dirname, 'models', 'whisper', 'ggml-base.bin');
+  const whisperModel = process.env.WHISPER_MODEL || installedWhisperModel() || join(__dirname, 'models', 'whisper', 'ggml-base.bin');
   const piperVoice = process.env.PIPER_VOICE
     || (existsSync(join(SPEECH_DIR, 'piper-voices', 'en_US-lessac-medium.onnx')) ? join(SPEECH_DIR, 'piper-voices', 'en_US-lessac-medium.onnx') : '')
     || join(__dirname, 'models', 'piper', 'voice.onnx');
+  const kokoro = existsSync(join(SPEECH_DIR, 'tts-runtime', 'node_modules', 'kokoro-js'));
   speechInfo = {
     whisper: Boolean(whisper && existsSync(whisperModel)),
     whisper_cli: whisper ? whisper : '',
@@ -1484,13 +1531,16 @@ function speechSupport() {
     piper: Boolean(piper && existsSync(piperVoice)),
     piper_cli: piper ? piper : '',
     piper_voice: existsSync(piperVoice) ? piperVoice : '',
+    kokoro,
     installing: speechInstall != null && speechInstall.status !== 'ready' && speechInstall.status !== 'error',
   };
   return speechInfo;
 }
 
-// One-click offline voice install: pins piper + a voice by SHA-256, and guides
-// the whisper.cpp install (no official prebuilt binaries → shows a how-to).
+// One-click offline voice install: pins piper, whisper.cpp and kokoro (optional)
+// by SHA-256 and extracts them under SPEECH_DIR. The whisper.cpp prebuilt
+// Ubuntu archives are the official ggml-org builds; the codepath keeps the
+// env-var (WHISPER_CLI / WHISPER_MODEL / PIPER_CLI / PIPER_VOICE) overrides.
 const PIPER_RELEASE = '2023.11.14-2';
 const PIPER_ASSETS = {
   'linux-x64':   { url: `https://github.com/rhasspy/piper/releases/download/${PIPER_RELEASE}/piper_linux_x86_64.tar.gz`,   sha256: 'a50cb45f355b7af1f6d758c1b360717877ba0a398cc8cbe6d2a7a3a26e225992' },
@@ -1500,7 +1550,14 @@ const PIPER_VOICE_ASSETS = [
   { name: 'en_US-lessac-medium.onnx',        url: 'https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx',        sha256: '5efe09e69902187827af646e1a6e9d269dee769f9877d17b16b1b46eeaaf019f' },
   { name: 'en_US-lessac-medium.onnx.json',   url: 'https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json',   sha256: 'efe19c417bed055f2d69908248c6ba650fa135bc868b0e6abb3da181dab690a0' },
 ];
-const WHISPER_SETUP_HINT = 'whisper.cpp has no official Linux/macOS binaries. Set WHISPER_CLI and WHISPER_MODEL in ' + ENV_FILE + ', or use the browser mic for now.';
+const WHISPER_RELEASE = 'v1.9.2';
+const WHISPER_ASSETS = {
+  'linux-x64':   { url: `https://github.com/ggml-org/whisper.cpp/releases/download/${WHISPER_RELEASE}/whisper-bin-ubuntu-x64.tar.gz`,   sha256: '46811a3ecf584307480a220b9ef5ff81b7b22dc41577cbc274ce3afc61f753b1' },
+  'linux-arm64': { url: `https://github.com/ggml-org/whisper.cpp/releases/download/${WHISPER_RELEASE}/whisper-bin-ubuntu-arm64.tar.gz`, sha256: '7e26fa6a36d9174d5c0bf033ccbc026c3b5e569e2ee787058241346ef5392719' },
+};
+const WHISPER_MODEL_ASSET = { name: 'ggml-base.bin', url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin', sha256: '60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe' };
+const KOKORO_VERSION = '1.2.1';
+const WHISPER_SETUP_HINT = 'whisper.cpp can be installed with the one-click button below (official ggml-org binaries + ggml-base model, verified by SHA-256). Or set WHISPER_CLI and WHISPER_MODEL in ' + ENV_FILE + '.';
 let speechInstall = null;
 
 function streamDownload(url, destPath, onProgress) {
@@ -1509,7 +1566,8 @@ function streamDownload(url, destPath, onProgress) {
     let downloaded = 0, total = 0;
     https.get(url, { headers: { 'User-Agent': 'LocalAI-Chat-App' } }, (res) => {
       if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
-        return https.get(res.headers.location, { headers: { 'User-Agent': 'LocalAI-Chat-App' } }, (res2) => { pipe(res2); }).on('error', reject);
+        const next = new URL(res.headers.location, url).toString();
+        return https.get(next, { headers: { 'User-Agent': 'LocalAI-Chat-App' } }, (res2) => { pipe(res2); }).on('error', reject);
       }
       pipe(res);
       function pipe(res2) {
@@ -1524,43 +1582,78 @@ function streamDownload(url, destPath, onProgress) {
   });
 }
 
-async function installSpeechEngines() {
+async function installSpeechEngines({ kokoro = false } = {}) {
   const platformKey = process.platform === 'linux'
     ? (process.arch === 'x64' ? 'linux-x64' : process.arch === 'arm64' ? 'linux-arm64' : '')
     : '';
-  if (!platformKey) throw new Error('One-click speech install supports Linux x64/arm64. On other platforms set PIPER_CLI and PIPER_VOICE; ' + WHISPER_SETUP_HINT);
-  const dest = join(SPEECH_DIR, 'piper', 'piper');
-  if (existsSync(dest) && existsSync(join(SPEECH_DIR, 'piper-voices', PIPER_VOICE_ASSETS[0].name))) return 'already installed';
+  if (!platformKey) throw new Error('One-click speech install supports Linux x64/arm64. On other platforms set PIPER_CLI/PIPER_VOICE and WHISPER_CLI/WHISPER_MODEL. ' + WHISPER_SETUP_HINT);
   mkdirSync(SPEECH_DIR, { recursive: true });
   const tmpRoot = join(SPEECH_DIR, '.tmp'); mkdirSync(tmpRoot, { recursive: true });
-  const tall = PIPER_ASSETS[platformKey];
-  const tarPath = join(tmpRoot, 'piper.tar.gz');
+  const piperBin = join(SPEECH_DIR, 'piper', 'piper');
+  const whisperCli = join(SPEECH_DIR, 'whisper', 'whisper-cli');
+  const whisperModel = join(SPEECH_DIR, 'whisper', WHISPER_MODEL_ASSET.name);
+  const alreadyInstalled = existsSync(piperBin) && existsSync(join(SPEECH_DIR, 'piper-voices', PIPER_VOICE_ASSETS[0].name))
+    && existsSync(whisperCli) && existsSync(whisperModel);
   try {
-    speechInstall.status = 'downloading';
-    await streamDownload(tall.url, tarPath, (d, t) => { speechInstall.downloaded = d; speechInstall.total = t; });
-    const actual = createHash('sha256').update(readFileSync(tarPath)).digest('hex');
-    if (actual !== tall.sha256) throw new Error('piper checksum mismatch: ' + actual.slice(0, 12) + '…');
-    speechInstall.status = 'extracting';
-    execFileSync('tar', ['-xzf', tarPath, '-C', SPEECH_DIR]);
-    chmodSync(dest, 0o755);
-    execFileSync(dest, ['--version'], { stdio: 'ignore' });
-    mkdirSync(join(SPEECH_DIR, 'piper-voices'), { recursive: true });
-    let done = 0;
-    for (const a of PIPER_VOICE_ASSETS) {
-      speechInstall.status = 'downloading';
-      speechInstall.downloaded = 0; speechInstall.total = 0; speechInstall.current = 'piper-voices/' + a.name;
-      const vPath = join(tmpRoot, a.name);
-      await streamDownload(a.url, vPath, (d, t) => { speechInstall.downloaded = d; speechInstall.total = t; });
-      const vHash = createHash('sha256').update(readFileSync(vPath)).digest('hex');
-      if (vHash !== a.sha256) throw new Error(a.name + ' checksum mismatch: ' + vHash.slice(0, 12) + '…');
-      renameSync(vPath, join(SPEECH_DIR, 'piper-voices', a.name));
-      done++;
+    if (!alreadyInstalled) {
+      // Stage 1: piper + its voice (default TTS engine).
+      if (!(existsSync(piperBin) && existsSync(join(SPEECH_DIR, 'piper-voices', PIPER_VOICE_ASSETS[0].name)))) {
+        speechInstall.status = 'downloading';
+        speechInstall.current = 'piper';
+        const tall = PIPER_ASSETS[platformKey];
+        const tarPath = join(tmpRoot, 'piper.tar.gz');
+        await streamDownload(tall.url, tarPath, (d, t) => { speechInstall.downloaded = d; speechInstall.total = t; });
+        const actual = createHash('sha256').update(readFileSync(tarPath)).digest('hex');
+        if (actual !== tall.sha256) throw new Error('piper checksum mismatch: ' + actual.slice(0, 12) + '…');
+        speechInstall.status = 'extracting';
+        mkdirSync(join(SPEECH_DIR, 'piper'), { recursive: true });
+        execFileSync('tar', ['-xzf', tarPath, '-C', join(SPEECH_DIR, 'piper'), '--strip-components=1']);
+        chmodSync(piperBin, 0o755);
+        execFileSync(piperBin, ['--version'], { stdio: 'ignore' });
+        mkdirSync(join(SPEECH_DIR, 'piper-voices'), { recursive: true });
+        for (const a of PIPER_VOICE_ASSETS) {
+          speechInstall.current = 'piper-voices/' + a.name;
+          speechInstall.downloaded = 0; speechInstall.total = 0;
+          const vPath = join(tmpRoot, a.name);
+          await streamDownload(a.url, vPath, (d, t) => { speechInstall.downloaded = d; speechInstall.total = t; });
+          const vHash = createHash('sha256').update(readFileSync(vPath)).digest('hex');
+          if (vHash !== a.sha256) throw new Error(a.name + ' checksum mismatch: ' + vHash.slice(0, 12) + '…');
+          renameSync(vPath, join(SPEECH_DIR, 'piper-voices', a.name));
+        }
+      }
+      // Stage 2: whisper.cpp official prebuilt binary + a ggml model (offline STT).
+      if (!(existsSync(whisperCli) && existsSync(whisperModel))) {
+        speechInstall.status = 'downloading';
+        speechInstall.current = 'whisper';
+        const tall = WHISPER_ASSETS[platformKey];
+        const tarPath = join(tmpRoot, 'whisper.tar.gz');
+        await streamDownload(tall.url, tarPath, (d, t) => { speechInstall.downloaded = d; speechInstall.total = t; });
+        const actual = createHash('sha256').update(readFileSync(tarPath)).digest('hex');
+        if (actual !== tall.sha256) throw new Error('whisper checksum mismatch: ' + actual.slice(0, 12) + '…');
+        speechInstall.status = 'extracting';
+        mkdirSync(join(SPEECH_DIR, 'whisper'), { recursive: true });
+        execFileSync('tar', ['-xzf', tarPath, '-C', join(SPEECH_DIR, 'whisper'), '--strip-components=1']);
+        chmodSync(whisperCli, 0o755);
+        execFileSync(whisperCli, ['--help'], { stdio: 'ignore' });
+        if (!existsSync(whisperModel)) {
+          speechInstall.current = 'whisper/' + WHISPER_MODEL_ASSET.name;
+          speechInstall.downloaded = 0; speechInstall.total = 0;
+          const mPath = join(tmpRoot, WHISPER_MODEL_ASSET.name);
+          await streamDownload(WHISPER_MODEL_ASSET.url, mPath, (d, t) => { speechInstall.downloaded = d; speechInstall.total = t; });
+          const mHash = createHash('sha256').update(readFileSync(mPath)).digest('hex');
+          if (mHash !== WHISPER_MODEL_ASSET.sha256) throw new Error(WHISPER_MODEL_ASSET.name + ' checksum mismatch: ' + mHash.slice(0, 12) + '…');
+          renameSync(mPath, whisperModel);
+        }
+      }
     }
+    // Stage 3: optional Kokoro runtime (better TTS voice; opt-in, onnxruntime ~40-80 MB).
+    if (kokoro) await installKokoroRuntime();
     speechInstall.status = 'ready';
     speechInstall.downloaded = speechInstall.total = 0;
     speechInstall.current = '';
     speechInfo = null;
-    log('Installed offline speech engines (piper ' + platformKey + ' + ' + PIPER_VOICE_ASSETS[0].name + ').');
+    log('Installed offline speech engines (piper + whisper.cpp + ggml-base).' + (kokoro ? ' Kokoro TTS runtime installed.' : ''));
+    return kokoro ? 'installed with kokoro' : 'already installed';
   } catch (e) {
     speechInstall.status = 'error';
     speechInstall.error = e.message;
@@ -1569,6 +1662,301 @@ async function installSpeechEngines() {
   } finally {
     try { rmdirSync(tmpRoot, { recursive: true }); } catch {}
   }
+}
+
+async function installKokoroRuntime() {
+  const runtimeDir = join(SPEECH_DIR, 'tts-runtime');
+  speechInstall.status = 'downloading';
+  speechInstall.current = 'kokoro-runtime';
+  speechInstall.downloaded = 0; speechInstall.total = 0;
+  mkdirSync(runtimeDir, { recursive: true });
+  const pkg = join(runtimeDir, 'package.json');
+  if (!existsSync(pkg)) {
+    writeFileSync(pkg, JSON.stringify({ name: 'capsule-tts-runtime', private: true, type: 'module', dependencies: { 'kokoro-js': KOKORO_VERSION } }, null, 2));
+  }
+  const nodeDir = dirname(dirname(process.execPath));
+  const npm = join(nodeDir, 'bin', process.platform === 'win32' ? 'npm.cmd' : 'npm');
+  if (!existsSync(npm)) throw new Error('Portable npm not found at ' + npm);
+  const env = { ...process.env, ONNXRUNTIME_NODE_INSTALL_CUDA: 'skip', TRANSFORMERS_CACHE: join(SPEECH_DIR, 'tts-cache'), HF_HOME: join(SPEECH_DIR, 'tts-cache') };
+  const code = await runChild(npm, ['install', '--no-audit', '--no-fund', '--prefer-online', '--no-progress', '--loglevel=error'], { env });
+  if (code !== 0) {
+    console.log('  ⚠ npm install returned exit ' + code + '; re-running with stdout visible.');
+    const code2 = await runChild(npm, ['install', '--no-audit', '--no-fund', '--prefer-online'], { env });
+    if (code2 !== 0) throw new Error('npm install of kokoro-js failed with exit code ' + code2);
+  }
+  if (!existsSync(join(runtimeDir, 'node_modules', 'kokoro-js'))) throw new Error('kokoro-js runtime did not install');
+}
+
+// ── Offline image generation: stable-diffusion.cpp (CPU) + SD 1.5 Q4_K ─────
+// sd-cpp is pinned to a verified release archive; the model is the public
+// kostakoff SD1.5 Q4_K GGUF (single-file: CLIP text encoder + UNet + VAE), so
+// detection, quantization and VAE all come from one ~3.2 GB file that fits on
+// modest, GPU-less machines (~1.7 GB resident RAM once loaded).
+const IMAGE_DIR = join(DATA_DIR, 'image');
+const IMAGE_BIN_DIR = join(IMAGE_DIR, 'bin');
+const IMAGE_MODEL_DIR = join(IMAGE_DIR, 'models');
+const IMAGE_OUT_DIR = join(IMAGE_DIR, 'out');
+const SDCPP_RELEASE = 'master-872-cc515a0';
+const IMAGE_BACKEND_ASSETS = {
+  'linux-x64': {
+    url: `https://github.com/leejet/stable-diffusion.cpp/releases/download/${SDCPP_RELEASE}/sd-master-cc515a0-bin-Linux-Ubuntu-24.04-x86_64.zip`,
+    sha256: '7be80528b36515665f91267d5906333b46d923919040e449dbe0a9593531ae9b',
+  },
+};
+const IMAGE_MODEL_ASSET = {
+  name: 'realistic-vision-v6-q8.gguf',
+  url: 'https://huggingface.co/second-state/Realistic_Vision_V6.0_B1-GGUF/resolve/main/realisticVisionV60B1_v51HyperVAE-Q8_0.gguf',
+  sha256: '1325806de9a9a552c143fee1912a21aface359e01b7330ac72dce5aca9c193da',
+};
+const IMAGE_SETUP_HINT = 'Image generation installs stable-diffusion.cpp (CPU-only sd-cli) plus the Realistic Vision v6 Q8_0 model (~1.8 GB download). Everything runs locally and offline — no GPU, no API key.';
+const IMAGE_HIRES_STEPS = 15;
+const IMAGE_HIRES_DENOISE = 0.55;
+const DEFAULT_IMAGE_NEGATIVE = 'blurry, low quality, watermark, text, ugly, deformed hands, extra fingers, mutated';
+const SAMPLER_METHODS = ['euler', 'euler_a', 'heun', 'dpm2', 'dpm++2s_a', 'dpm++2m', 'dpm++2mv2', 'ipndm', 'ipndm_v', 'lcm', 'ddim_trailing', 'tcd', 'res_multistep', 'res_2s', 'er_sde', 'euler_cfg_pp', 'euler_a_cfg_pp', 'euler_ge', 'dpm++2m_sde', 'dpm++2m_sde_bt', 'lms'];
+const SCHEDULER_METHODS = ['discrete', 'karras', 'exponential', 'ays', 'gits', 'sgm_uniform', 'simple', 'smoothstep', 'kl_optimal', 'lcm', 'bong_tangent', 'ltx2', 'logit_normal', 'beta'];
+let imageInstall = null;
+let imageJob = null;
+
+function imagePlatformKey() {
+  return process.platform === 'linux' && process.arch === 'x64' ? 'linux-x64' : '';
+}
+
+function imageSupport() {
+  const platformKey = imagePlatformKey();
+  const sdCli = join(IMAGE_BIN_DIR, 'sd-cli');
+  const model = join(IMAGE_MODEL_DIR, IMAGE_MODEL_ASSET.name);
+  return {
+    engine: platformKey ? 'sd-cpp' : '',
+    accel: 'cpu',
+    model: IMAGE_MODEL_ASSET.name,
+    installed: existsSync(sdCli) && existsSync(model),
+    sd_cli: existsSync(sdCli) ? sdCli : '',
+    model_path: existsSync(model) ? model : '',
+    supported: Boolean(platformKey),
+    install_size_gb: 1.8,
+    installing: imageInstall != null && imageInstall.status !== 'ready' && imageInstall.status !== 'error',
+    busy: imageJob != null && (imageJob.status === 'starting' || imageJob.status === 'running'),
+  };
+}
+
+function unzipTo(targetDir, zipPath) {
+  if (findOnPath('unzip')) { execFileSync('unzip', ['-o', '-q', zipPath, '-d', targetDir]); return; }
+  if (findOnPath('python3')) { execFileSync('python3', ['-m', 'zipfile', '-e', zipPath, targetDir]); return; }
+  throw new Error('No unzip or python3 available to extract the sd-cpp archive');
+}
+
+async function installImageStack() {
+  const platformKey = imagePlatformKey();
+  if (!platformKey) throw new Error('Image generation install supports Linux x64 only in this build. ' + IMAGE_SETUP_HINT);
+  mkdirSync(IMAGE_DIR, { recursive: true });
+  const tmpRoot = join(IMAGE_DIR, '.tmp'); mkdirSync(tmpRoot, { recursive: true });
+  const sdCli = join(IMAGE_BIN_DIR, 'sd-cli');
+  const modelPath = join(IMAGE_MODEL_DIR, IMAGE_MODEL_ASSET.name);
+  try {
+    const backend = IMAGE_BACKEND_ASSETS[platformKey];
+    if (!existsSync(sdCli)) {
+      imageInstall.status = 'downloading';
+      imageInstall.current = 'sd-cpp ' + SDCPP_RELEASE;
+      imageInstall.downloaded = 0; imageInstall.total = 0;
+      const zipPath = join(tmpRoot, 'sd-cpp.zip');
+      await streamDownload(backend.url, zipPath, (d, t) => { imageInstall.downloaded = d; imageInstall.total = t; });
+      const actual = createHash('sha256').update(readFileSync(zipPath)).digest('hex');
+      if (actual !== backend.sha256) throw new Error('sd-cpp archive checksum mismatch: ' + actual.slice(0, 12) + '…');
+      imageInstall.status = 'extracting';
+      imageInstall.downloaded = imageInstall.total = 0;
+      mkdirSync(IMAGE_BIN_DIR, { recursive: true });
+      unzipTo(IMAGE_BIN_DIR, zipPath);
+      chmodSync(sdCli, 0o755);
+      execFileSync(sdCli, ['--help'], { stdio: 'ignore' });
+    }
+    if (!existsSync(modelPath)) {
+      imageInstall.status = 'downloading';
+      imageInstall.current = IMAGE_MODEL_ASSET.name;
+      imageInstall.downloaded = 0; imageInstall.total = 0;
+      const dl = join(tmpRoot, IMAGE_MODEL_ASSET.name);
+      await streamDownload(IMAGE_MODEL_ASSET.url, dl, (d, t) => { imageInstall.downloaded = d; imageInstall.total = t; });
+      const actual = createHash('sha256').update(readFileSync(dl)).digest('hex');
+      if (actual !== IMAGE_MODEL_ASSET.sha256) throw new Error(IMAGE_MODEL_ASSET.name + ' checksum mismatch: ' + actual.slice(0, 12) + '…');
+      mkdirSync(IMAGE_MODEL_DIR, { recursive: true });
+      renameSync(dl, modelPath);
+    }
+    imageInstall.status = 'ready';
+    imageInstall.downloaded = imageInstall.total = 0;
+    imageInstall.current = '';
+    log('Installed offline image generation (sd-cpp ' + SDCPP_RELEASE + ' + ' + IMAGE_MODEL_ASSET.name + ').');
+    return 'installed';
+  } catch (e) {
+    imageInstall.status = 'error';
+    imageInstall.error = e.message;
+    log('Image install failed:', e.message);
+    throw e;
+  } finally {
+    try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+  }
+}
+
+// One generation at a time: a job target dir under IMAGE_OUT_DIR, sd-cli run
+// with a pinned cpu thread count, progress surfaced to /api/image/status and
+// each finished PNG recorded (name + sidecar meta.json) for the gallery.
+function startImageJob(params) {
+  const prompt = String(params.prompt || '').trim().slice(0, 4000);
+  if (!prompt) return { error: 'prompt is required', code: 400 };
+  const sampler = String(params.sampler || 'euler_a');
+  if (!SAMPLER_METHODS.includes(sampler)) return { error: 'Unknown sampler "' + sampler + '"', code: 400 };
+  const scheduler = String(params.scheduler || 'karras');
+  if (!SCHEDULER_METHODS.includes(scheduler)) return { error: 'Unknown scheduler "' + scheduler + '"', code: 400 };
+  const clipSkip = Math.max(1, Math.min(2, Math.round(Number(params.clip_skip) || 1)));
+  const s = imageSupport();
+  if (!s.installed) return { error: 'Image generation is not installed yet. Use the install button first.', code: 400 };
+  if (s.busy) return { error: 'Another image is already being generated', code: 409 };
+  const width = Math.min(1024, Math.max(64, Math.round(Number(params.width) || 512)));
+  const height = Math.min(1024, Math.max(64, Math.round(Number(params.height) || 512)));
+  const steps = Math.min(50, Math.max(1, Math.round(Number(params.steps) || 24)));
+  const cfgScale = Math.min(15, Math.max(1, Number(params.cfg_scale) || 7));
+  const seed = Number.isFinite(Number(params.seed)) ? Math.round(Number(params.seed)) : -1;
+  const count = Math.max(1, Math.min(4, Math.round(Number(params.count) || 1)));
+  let negative = String(params.negative_prompt || '').trim().slice(0, 2000);
+  if (!negative) negative = DEFAULT_IMAGE_NEGATIVE;
+  const threads = Math.max(1, Math.min(8, cpus().length - 1));
+  const dir = join(IMAGE_OUT_DIR, 'job-' + Date.now() + '-' + randomBytes(3).toString('hex'));
+  mkdirSync(dir, { recursive: true });
+  const baseW = Math.max(128, Math.round(width / 2));
+  const baseH = Math.max(128, Math.round(height / 2));
+  const meta = {
+    id: basename(dir), prompt, negative_prompt: negative, width, height, steps, cfg_scale: cfgScale,
+    sampler, scheduler, clip_skip: clipSkip,
+    hires: true, base_width: baseW, base_height: baseH,
+    hires_steps: IMAGE_HIRES_STEPS, hires_denoise: IMAGE_HIRES_DENOISE,
+    seed: seed < 0 ? -1 : seed, count, threads, created: Date.now(), status: 'running',
+  };
+  const job = { ...meta, cli: s.sd_cli, model: s.model_path, dir, child: null, exitCode: null };
+  imageJob = job;
+  runImageJob(job);
+  return job;
+}
+
+// One sd-cli call per image (this build reuses -n for the negative prompt, so
+// the count is satisfied with sequential single-image runs, each with an
+// explicit seed step and an explicit output path). Every image is a 2-pass
+// latent hires run: a cheap half-resolution base, then a detail-refining
+// second pass at the requested size.
+function sdCliArgs(job, index) {
+  const out = index === 0 ? join(job.dir, 'img.png') : join(job.dir, 'img_' + index + '.png');
+  const args = ['-m', job.model, '-p', job.prompt,
+    '-H', String(job.base_height || Math.max(128, Math.round(job.height / 2))),
+    '-W', String(job.base_width || Math.max(128, Math.round(job.width / 2))),
+    '--steps', String(job.steps), '--cfg-scale', String(job.cfg_scale),
+    '--sampling-method', job.sampler || 'euler_a', '--scheduler', job.scheduler || 'karras',
+    '--clip-skip', String(job.clip_skip || 1),
+    '--hires', '--hires-width', String(job.width), '--hires-height', String(job.height),
+    '--hires-steps', String(job.hires_steps || IMAGE_HIRES_STEPS),
+    '--hires-denoising-strength', String(job.hires_denoise || IMAGE_HIRES_DENOISE),
+    '-t', String(job.threads), '-s', String(job.seed >= 0 ? job.seed + index : -1),
+    '-o', out];
+  if (job.negative_prompt) args.push('-n', job.negative_prompt);
+  return args;
+}
+
+function runOneSdCli(job, args) {
+  return new Promise((resolve) => {
+    const child = spawn(job.cli, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    job.child = child;
+    let buffer = '';
+    const onData = (d) => {
+      buffer += d.toString();
+      if (buffer.length > 32_000) buffer = buffer.slice(-32_000);
+      const tail = buffer.slice(-6000);
+      const it = [...tail.matchAll(/(\d+)\s*\/\s*(\d+)\s*-\s*\d+(?:\.\d+)?s\/it/g)];
+      if (it.length) { const m = it[it.length - 1]; job.step = Number(m[1]); job.totalSteps = Number(m[2]); job.progress = job.totalSteps ? m[1] / job.totalSteps : 0; return; }
+      const mb = [...tail.matchAll(/(\d+)\s*\/\s*(\d+)\s*-\s*\d+(?:\.\d+)?MB\/s/g)];
+      if (mb.length) { job.step = Number(mb[mb.length - 1][1]); job.totalSteps = Number(mb[mb.length - 1][2]); }
+    };
+    const lastErrorLine = (text) => {
+      const lines = text.split(/\r?\n/).filter(Boolean);
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].replace(/\[K/g, '');
+        if (/ERROR|error|failed|abort|bad_alloc|out of memory/i.test(line)) return line.slice(0, 300);
+      }
+      return text.slice(-300);
+    };
+    child.stdout.on('data', onData);
+    child.stderr.on('data', onData);
+    child.on('error', () => { buffer += 'Failed to start sd-cli'; job.buffer = buffer; resolve(-1); });
+    child.on('exit', (code) => {
+      job.child = null;
+      job.buffer = buffer;
+      resolve(code ?? -1);
+    });
+  });
+}
+
+async function runImageJob(job) {
+  let allOk = true;
+  for (let i = 0; i < job.count; i += 1) {
+    if (job.aborted) break;
+    const code = await runOneSdCli(job, sdCliArgs(job, i));
+    job.exitCode = code;
+    if (job.aborted) break;
+    if (code !== 0) { allOk = false; job.status = 'error'; job.error = job.buffer ? lastErrorLineFrom(job.buffer) : 'sd-cli failed with exit code ' + code; break; }
+  }
+  if (job.aborted && job.status !== 'error') { job.status = 'aborted'; job.error = 'Stopped by the user.'; }
+  job.finished = Date.now();
+  job.durationMs = job.finished - job.created;
+  if (allOk && !job.aborted) {
+    const files = readdirSync(job.dir).filter((f) => f.endsWith('.png')).sort();
+    if (!files.length) { job.status = 'error'; job.error = 'sd-cli exited 0 but produced no PNG'; }
+    else {
+      job.status = 'done'; job.files = files;
+      writeFileSync(join(job.dir, 'meta.json'), JSON.stringify({ ...job, cli: undefined, child: undefined, buffer: undefined, progress: undefined, step: undefined, totalSteps: undefined, files }, null, 2), 'utf8');
+    }
+  }
+  log('Image job ' + job.id + (job.status === 'done' ? ' done in ' + Math.round(job.durationMs / 1000) + 's (' + (job.files || []).length + ' image(s))' : ' ended as ' + job.status + (job.error ? ': ' + job.error : '')));
+}
+
+function lastErrorLineFrom(text) {
+  const lines = String(text || '').split(/\r?\n/).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].replace(/\[K/g, '');
+    if (/ERROR|error|failed|abort|bad_alloc|out of memory/i.test(line)) return line.slice(0, 300);
+  }
+  return String(text || '').slice(-300);
+}
+
+function abortImageJob() {
+  if (!imageJob) return false;
+  if (imageJob.child) { try { imageJob.child.kill('SIGTERM'); } catch {} }
+  imageJob.aborted = true;
+  return true;
+}
+
+function imageJobSummaries() {
+  if (!existsSync(IMAGE_OUT_DIR)) return [];
+  return readdirSync(IMAGE_OUT_DIR, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith('job-'))
+    .map((entry) => {
+      const dir = join(IMAGE_OUT_DIR, entry.name);
+      let meta = null;
+      try { meta = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8')); } catch {}
+      const pngs = existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith('.png')).sort() : [];
+      return {
+        id: entry.name,
+        images: pngs,
+        prompt: meta?.prompt || '',
+        width: meta?.width || 0, height: meta?.height || 0, steps: meta?.steps || 0,
+        seed: meta?.seed ?? -1, count: meta?.count || 1,
+        created: meta?.created || statSync(dir).mtimeMs,
+        durationMs: meta?.durationMs || 0,
+        status: meta?.status || 'done',
+      };
+    })
+    .sort((a, b) => b.created - a.created);
+}
+
+function imageJobDir(id) {
+  if (!/^[A-Za-z0-9._-]{1,120}$/.test(String(id || '')) || !String(id).startsWith('job-')) return null;
+  const dir = resolve(join(IMAGE_OUT_DIR, String(id)));
+  if (!dir.startsWith(resolve(IMAGE_OUT_DIR) + sep)) return null;
+  return existsSync(dir) ? dir : null;
 }
 
 function sendJSON(res, code, obj) {
@@ -1722,7 +2110,7 @@ async function handle(req, res) {
   const rateLimited =
     p.startsWith('/api/agent/')
     || (req.method === 'POST'
-      && (p === '/api/auth/login' || p === '/api/chat' || p === '/api/research' || p === '/api/chatstate' || p.startsWith('/api/speech/') || p.startsWith('/api/models/') || p.startsWith('/api/vault/') || p.startsWith('/api/cloud/') || p.startsWith('/api/agent/') || p.startsWith('/v1/')));
+      && (p === '/api/auth/login' || p === '/api/chat' || p === '/api/research' || p === '/api/chatstate' || p.startsWith('/api/speech/') || p.startsWith('/api/image/') || p.startsWith('/api/models/') || p.startsWith('/api/vault/') || p.startsWith('/api/cloud/') || p.startsWith('/api/agent/') || p.startsWith('/v1/')));
   if (rateLimited) {
     const verdict = sharedRateLimiter.check(req);
     if (!verdict.allowed) return rateLimitResponse(res, verdict.retryAfter);
@@ -1898,8 +2286,8 @@ async function handle(req, res) {
   }
 
   // ── Offline speech: whisper.cpp (STT) and piper (TTS), local-only ─────────
-  if (p.startsWith('/api/speech/') && !localControlAllowed(req)) {
-    return sendJSON(res, 403, { error: 'Speech tools are available only in the local app' });
+  if ((p.startsWith('/api/speech/') || p.startsWith('/api/image/')) && !localControlAllowed(req)) {
+    return sendJSON(res, 403, { error: 'Speech and image tools are available only in the local app' });
   }
   if (req.method === 'GET' && p === '/api/speech/status') {
     return sendJSON(res, 200, speechSupport());
@@ -1909,24 +2297,31 @@ async function handle(req, res) {
     return sendJSON(res, 200, {
       installing: s.installing,
       supported: ['linux-x64', 'linux-arm64'].includes(process.platform === 'linux' ? (process.arch === 'x64' ? 'linux-x64' : 'linux-arm64') : ''),
-      whisper_setup_hint: process.platform === 'linux' ? WHISPER_SETUP_HINT : 'Offline whisper.cpp has no official Linux/macOS binaries; set WHISPER_CLI and WHISPER_MODEL to enable. Browser mic works meanwhile.',
+      whisper_setup_hint: WHISPER_SETUP_HINT,
       status: speechInstall ? speechInstall.status : 'idle',
       downloaded: speechInstall ? speechInstall.downloaded : 0,
       total: speechInstall ? speechInstall.total : 0,
       current: speechInstall ? (speechInstall.current || '') : '',
       error: speechInstall ? (speechInstall.error || '') : '',
+      piper_installed: s.piper,
+      whisper_installed: s.whisper,
+      kokoro_installed: s.kokoro,
+      kokoro_cost_hint: 'Kokoro adds a higher-quality neural voice (~40-80 MB onnxruntime). Optional.',
     });
   }
   if (req.method === 'POST' && p === '/api/speech/install') {
     if (speechSupport().installing) return sendJSON(res, 409, { error: 'Speech engines are already being installed' });
-    speechInstall = { status: 'starting', downloaded: 0, total: 0, current: 'piper', error: '', controller: null };
+    let body = {};
+    try { body = JSON.parse(await readBody(req, 50_000)); } catch {}
+    const kokoro = body.kokoro === true || body.kokoro === 'true' || req.headers['x-install-kokoro'] === '1';
+    speechInstall = { status: 'starting', downloaded: 0, total: 0, current: kokoro ? 'kokoro' : 'piper', error: '', controller: null };
     speechInfo = null;
-    installSpeechEngines().catch(() => {});
-    return sendJSON(res, 202, { ok: true, message: 'Installing offline speech engines in the background' });
+    installSpeechEngines({ kokoro }).catch(() => {});
+    return sendJSON(res, 202, { ok: true, message: kokoro ? 'Installing offline engines + Kokoro voice in the background' : 'Installing offline speech engines in the background' });
   }
   if (req.method === 'POST' && p === '/api/speech/transcribe') {
     const s = speechSupport();
-    if (!s.whisper) return sendJSON(res, 400, { error: 'whisper.cpp not detected. Install whisper-cli and set WHISPER_MODEL.' });
+    if (!s.whisper) return sendJSON(res, 400, { error: 'whisper.cpp not detected. Use the one-click speech install or set WHISPER_CLI and WHISPER_MODEL.' });
     let audio = null, lang = 'en';
     const raw = await readRawBody(req, 50_000_000);
     try { const j = JSON.parse(raw.toString('utf8')); if (j && typeof j === 'object') { audio = j.audioBase64 ? Buffer.from(j.audioBase64, 'base64') : null; lang = j.lang || lang; } } catch {}
@@ -1945,11 +2340,26 @@ async function handle(req, res) {
   }
   if (req.method === 'POST' && p === '/api/speech/tts') {
     const s = speechSupport();
-    if (!s.piper) return sendJSON(res, 400, { error: 'piper not detected. Install piper and set PIPER_VOICE.' });
     let body; try { body = JSON.parse(await readBody(req, 20_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
     const text = String(body.text || '').trim();
     if (!text || text.length > 4000) return sendJSON(res, 400, { error: 'text up to 4000 chars required' });
     const tmpRoot = join(DATA_DIR, 'tmp'); mkdirSync(tmpRoot, { recursive: true });
+    const engine = body.engine === 'kokoro' ? 'kokoro' : body.engine === 'piper' ? 'piper' : 'piper';
+    if (engine === 'kokoro') {
+      if (!s.kokoro) return sendJSON(res, 400, { error: 'Kokoro TTS not installed. Run the speech install with the Kokoro option, or use piper.' });
+      const worker = join(__dirname, 'lib', 'kokoro-worker.mjs');
+      const outFile = join(tmpRoot, 'tts-kokoro-' + process.pid + '-' + randomBytes(4).toString('hex') + '.wav');
+      const payload = JSON.stringify({ text, voice: String(body.voice || 'af_heart'), speed: Math.min(2, Math.max(0.5, Number(body.speed) || 1)), output: outFile, cacheDir: join(SPEECH_DIR, 'tts-cache'), workerDir: join(SPEECH_DIR, 'tts-runtime') });
+      try {
+        const code = await runChild(process.execPath, [worker, payload]);
+        if (code !== 0) return sendJSON(res, 500, { error: 'kokoro TTS failed with exit code ' + code });
+        const wav = readFileSync(outFile);
+        res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': wav.length, 'Cache-Control': 'no-store' });
+        res.end(wav);
+        return;
+      } finally { try { unlinkSync(outFile); } catch {} }
+    }
+    if (!s.piper) return sendJSON(res, 400, { error: 'piper not detected. Install piper and set PIPER_VOICE.' });
     const outFile = join(tmpRoot, 'tts-' + process.pid + '-' + randomBytes(4).toString('hex') + '.wav');
     try {
       const code = await runChild(s.piper_cli, ['--model', s.piper_voice, '--output_file', outFile], { input: text });
@@ -1961,6 +2371,61 @@ async function handle(req, res) {
     } finally { try { unlinkSync(outFile); } catch {} }
   }
 
+  // ── Offline image generation: sd.cpp (CPU) + SD 1.5 Q4_K, local-only ───
+  if (req.method === 'GET' && p === '/api/image/status') {
+    const s = imageSupport();
+    return sendJSON(res, 200, {
+      ...s,
+      setup_hint: IMAGE_SETUP_HINT,
+      install: imageInstall ? { status: imageInstall.status, downloaded: imageInstall.downloaded, total: imageInstall.total, current: imageInstall.current || '', error: imageInstall.error || '' } : { status: 'idle' },
+      job: imageJob
+        ? { id: imageJob.id, status: imageJob.status, prompt: imageJob.prompt, progress: imageJob.progress || 0, step: imageJob.step || 0, totalSteps: imageJob.totalSteps || imageJob.steps, width: imageJob.width, height: imageJob.height, error: imageJob.error || '', files: imageJob.files || [], aborted: Boolean(imageJob.aborted) }
+        : null,
+    });
+  }
+  if (req.method === 'POST' && p === '/api/image/install') {
+    if (imageSupport().installing) return sendJSON(res, 409, { error: 'Image stack is already being installed' });
+    if (speechSupport().installing) return sendJSON(res, 409, { error: 'A speech-engine install is in progress; wait for it to finish first' });
+    imageInstall = { status: 'starting', downloaded: 0, total: 0, current: 'sd-cpp', error: '' };
+    installImageStack().catch(() => {});
+    return sendJSON(res, 202, { ok: true, message: 'Installing image generation stack in the background (~3.2 GB download)' });
+  }
+  if (req.method === 'POST' && p === '/api/image/generate') {
+    let body; try { body = JSON.parse(await readBody(req, 20_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const result = startImageJob(body || {});
+    if (result.error) return sendJSON(res, result.code || 400, { error: result.error });
+    return sendJSON(res, 202, { ok: true, job: { id: result.id, status: result.status, width: result.width, height: result.height, steps: result.steps } });
+  }
+  if (req.method === 'POST' && p === '/api/image/abort') {
+    return sendJSON(res, 200, { ok: true, aborted: abortImageJob() });
+  }
+  if (req.method === 'GET' && p === '/api/image/files') {
+    return sendJSON(res, 200, { images: imageJobSummaries() });
+  }
+  if (req.method === 'DELETE' && p.startsWith('/api/image/file/')) {
+    const dir = imageJobDir(p.slice('/api/image/file/'.length));
+    if (!dir) return sendJSON(res, 404, { error: 'Image not found' });
+    try { rmSync(dir, { recursive: true, force: true }); return sendJSON(res, 200, { ok: true }); }
+    catch (e) { return sendJSON(res, 500, { error: e.message }); }
+  }
+  if (req.method === 'GET' && p.startsWith('/api/image/file/')) {
+    const rest = p.slice('/api/image/file/'.length).split('/');
+    const dir = imageJobDir(rest[0]);
+    if (!dir) return sendJSON(res, 404, { error: 'Image not found' });
+    const pngs = readdirSync(dir).filter((f) => f.endsWith('.png')).sort();
+    const index = Number(rest[1] || 0);
+    const file = pngs[Number.isInteger(index) ? index : 0];
+    if (!file) return sendJSON(res, 404, { error: 'Image not found' });
+    const data = readFileSync(join(dir, file));
+    res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': data.length, 'Cache-Control': 'no-store', ...securityHeaders() });
+    return res.end(data);
+  }
+
+  // ── Hardware capability profile (drives backend/model choices) ──────────
+  if (req.method === 'GET' && p === '/api/hardware') {
+    return sendJSON(res, 200, hardwareInfo());
+  }
+
   // ── Health probe (drives the UI connection pill) ─────────────────────────
   if (req.method === 'GET' && p === '/health') {
     let ollama = false, version = '';
@@ -1970,6 +2435,7 @@ async function handle(req, res) {
         if (u.ok) { ollama = true; const j = await u.json().catch(() => ({})); version = j.version || ''; }
       } catch {}
     }
+    const lan = lanUrls(cfg.host, cfg.port);
     return sendJSON(res, 200, {
       ok: true,
       ollama,
@@ -1978,6 +2444,9 @@ async function handle(req, res) {
       mode: cfg.mode,
       provider: cfg.aiProvider || 'ollama',
       model: cfg.model || '',
+      perf: perfSnapshot(),
+      lan_url: lan[0] || '',
+      hardware: { image_backend: hardwareInfo().image_backend, cpu_cores: hardwareInfo().cpu.cores },
     });
   }
 
@@ -3983,7 +4452,10 @@ server.listen(cfg.port, cfg.host, async () => {
   console.log('  Provider        : ' + (cfg.aiProvider || 'ollama'));
   console.log('  Backend         : ' + (isCloudProvider() ? openaiBase() : cfg.ollamaUrl));
   console.log('  Mode            : ' + cfg.mode + (cfg.authToken ? '  (auth token enabled)' : ''));
+  console.log('  Hardware        : ' + hardwareSummary());
   console.log('  Models folder   : ' + MODELS_DIR);
+  const imgSupp = imageSupport();
+  console.log('  Image gen       : ' + (imgSupp.installed ? 'sd-cpp · ' + imgSupp.model.replace(/\.gguf$/i, '') + ' ready' : 'not installed — one-click in the app'));
   try {
     const integrity = portableIntegrityReport(__dirname, INTEGRITY_FILE, { allowUnsigned: process.env.CAPSULE_ALLOW_UNSIGNED === '1' });
     if (integrity.verified) console.log('  Capsule files   : ' + integrity.files.length + ' files verified');
@@ -3992,6 +4464,8 @@ server.listen(cfg.port, cfg.host, async () => {
     if (lastIntegrityRepair?.restored?.length) console.log('  Self-heal       : restored ' + lastIntegrityRepair.restored.length + ' missing release file(s)');
   } catch {}
   if (cfg.mode === 'tunnel') await startTunnel();
+  const lan = lanUrls(cfg.host, cfg.port);
+  if (lan.length) console.log('  LAN access      : ' + lan.join('   '));
   // Auto-register any .gguf files dropped into the models folder (local providers).
   if (!isCloudProvider()) {
     try { await autoRegisterLocalModels(); } catch (e) { log('Local model auto-register error:', e); }

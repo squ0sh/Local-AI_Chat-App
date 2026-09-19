@@ -83,6 +83,7 @@ test('speech endpoints: status and install report idle without touching the netw
     assert.equal(status.status, 200);
     assert.equal(status.body.whisper, false, 'no whisper-cli in the test environment');
     assert.equal(status.body.piper, false, 'no piper in the test environment');
+    assert.equal(status.body.kokoro, false, 'no kokoro in the test environment');
     assert.equal(status.body.installing, false);
     assert.ok('whisper_model' in status.body && 'piper_voice' in status.body, 'status carries the engine paths');
 
@@ -90,6 +91,11 @@ test('speech endpoints: status and install report idle without touching the netw
     assert.equal(install.status, 200);
     assert.equal(install.body.status, 'idle');
     assert.equal(install.body.installing, false);
+    assert.match(install.body.whisper_setup_hint, /one-click button below/, 'hint points at the one-click install');
+    assert.equal(install.body.whisper_installed, false);
+    assert.equal(install.body.piper_installed, false);
+    assert.equal(install.body.kokoro_installed, false);
+    assert.ok(install.body.kokoro_cost_hint.length > 0, 'kokoro cost hint is present for the opt-in option');
     assert.equal(existsSync(join(dataDir, 'speech')), false, 'reading install status does not create the speech dir');
 
     const transcribe = await call('/api/speech/transcribe', jsonInit({ audioBase64: 'AAAA' }));

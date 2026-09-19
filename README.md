@@ -144,34 +144,31 @@ Ollama model name or register GGUF files placed in `models/`. All model
 management, including memory controls, remains local-only and is unavailable
 to Remote guests.
 
-Agent Mode starts with plain language. The **Start** screen (open the Start
-button, or `/start`) turns on **Use Agent Mode**, then offers one-click
-starters: **Ask my files** (answers that cite your project), **Write something**,
-**Improve my writing**, **Summarize**, **Translate**, and **Organize my files**
-(sort a folder by year or type — preview the plan, approve, and **Undo** any
-move afterwards). Research, Skills, and a model-readiness check stay one click
-away, and the Deep Research panel remains available through `#agent-start-research`
-and `/research`.
+Agent Mode starts with plain language. Turn on **Use Agent Mode**, and the Start
+screen offers a few one-click starters: **Start a task** (describe anything),
+**Ask my files** (answers that cite your project), **Text tools** (draft,
+summarize, polish, or translate in one card), and **Organize my files** (sort a
+folder by year or type — preview the plan, approve, and **Undo** any move
+afterwards). Deep Research, Skills, a model-readiness check, and **Our Norms**
+stay one click away, and the research panel remains available through
+`/research`.
 
 Each chat keeps its own agent memory: the conversation the agent saw is saved,
 and relaunching a task in the same chat continues from where you left off. A new
-chat starts fresh. `/help` and `/forget` clear that memory.
+chat starts fresh. `/forget` clears that memory.
 
-The **Tools** button beside the message bar opens the optional `/` command menu;
-the same commands also run from the Start screen's terminal field, which lives
-under Advanced together with a **Write a file** panel and MCP server
-registration. `/help` lists everything; the most useful ones:
+The **Tools** button beside the message bar opens the optional `/` command menu.
+There are few commands on purpose — most things you might type are better
+described in plain words and the agent handles them itself. `/help` lists
+everything; the ones worth knowing:
 
-- `/start` — reopen the friendly Start screen.
-- `/grep <pattern>`, `/find *.<ext>` — search file contents or file names.
-- `/git status`, `/git diff` — read-only git, allowlisted, no force pushes.
-- `/test`, `/test <name>` — run the test suite (or just matching tests).
-- `/plan <task>` — draft a plan first, then `/go` to execute it.
-- `/undo` — reverts the agent's last file change (writes and moves).
-- `/forget` — clear this chat's agent memory.
-- `/search <topic>`, `/research <topic>` — web search and cited deep research.
-- `/ask <question>` — a plain chat turn with no tools involved.
-- `/env` — show model, tunnel, and workspace context.
+- `/status` — model, memory, workspace, and mode at a glance.
+- `/run <command>` — run a command after your confirmation.
+- `/write [path]` — review and write a file.
+- `/undo` — revert the agent's last file change (writes and moves).
+- `/research [topic]` — cited deep research (own Quick and Deep modes).
+- `/mcp` — list or call MCP tools (connect a local server via the MCP panel).
+- `/new`, `/model`, `/agent`, `/skills`, `/norms`, `/stop`, `/clear`, `/forget`.
 
 Offline behavior packs live inside Agent Mode. Choose **Choose a skill** or use
 `/skills`; the selected pack updates the current chat's system prompt. Skills
@@ -218,6 +215,29 @@ some platforms may use an online speech service. The microphone indicator is
 red while Voice Mode is listening, blue while waiting for the model, and green
 while speaking. Capsule Remote can use Voice Mode over its HTTPS private link
 when the mobile browser grants microphone access.
+
+### Image Generation
+
+Open **Images** in the Capsule sidebar to generate pictures locally with
+[stable-diffusion.cpp](https://github.com/ggml-org/stable-diffusion.cpp). The
+first run installs the image engine and the bundled **Realistic Vision v6**
+(Q8_0) model (~1.8 GB); images render offline on the CPU and never leave this
+computer. The UI is intentionally minimal — type a prompt and pick a size:
+
+| Size button | Output | Typical time on a mid-range CPU |
+|-------------|--------|----------------------------------|
+| Detailed     | 512 × 512 | ~18 min |
+| Balanced     | 384 × 384 | ~8 min  |
+| Quick        | 256 × 256 | ~4 min  |
+
+Everything else (steps, sampler, guidance, negative prompt) is tuned
+automatically. Each image runs two passes for quality: the sampler pass plus a
+high-resolution refinement pass. Generated images appear in the chat area, can
+be opened full-size, re-run, or saved, and are written to `data/image/out/`
+(normally `.portable/data/image/out/`) with their settings in `meta.json`.
+
+Generation runs as a single internal job per prompt and is stopped if you leave
+the app. Requests are queued, and only jobs that complete are presented.
 
 ### Share over the web
 
