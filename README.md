@@ -151,7 +151,29 @@ summarize, polish, or translate in one card), and **Organize my files** (sort a
 folder by year or type — preview the plan, approve, and **Undo** any move
 afterwards). Deep Research, Skills, a model-readiness check, and **Our Norms**
 stay one click away, and the research panel remains available through
-`/research`.
+`/research`. A **Changes** card opens the change ledger: every write, folder
+organization, image generation, and saved research report is listed with its own
+**Undo** button, so anything the agent did on this run can be put back — in any
+order, not just the last change.
+
+### Fit — the machine's own settings
+A **Fit** card measures this computer once with a small dependency-free
+benchmark and normalizes it against the reference build machine (an Intel
+Core i5-3570 = 1.0×). One **level** — **Frugal**, **Balanced**, or **Max** —
+then picks a coherent bundle of defaults: which curated model to suggest,
+how big generated images can be, whether high-res refinement stays on, which
+offline voice engine to prefer, and how many CPU threads the image engine
+uses. Predictions are self-correcting: every real chat stream and every real
+image job is quietly measured (tokens/second, minutes per megapixel) and
+blended into the next estimate, so the numbers drift toward this machine's
+actual behavior without any configuration. Fit only ever proposes — it never
+changes a model you have chosen yourself.
+
+SIMD detection is cross-platform: Linux reads `/proc/cpuinfo`, macOS reads
+`sysctl`. On Windows it normally reports a conservative `baseline` tier; to
+report real SIMD regardless, build the tiny optional helper with
+`tools/build-cpuid.ps1` (C source in `tools/cpuid.c`) and it is picked up
+automatically.
 
 Each chat keeps its own agent memory: the conversation the agent saw is saved,
 and relaunching a task in the same chat continues from where you left off. A new
@@ -165,7 +187,7 @@ everything; the ones worth knowing:
 - `/status` — model, memory, workspace, and mode at a glance.
 - `/run <command>` — run a command after your confirmation.
 - `/write [path]` — review and write a file.
-- `/undo` — revert the agent's last file change (writes and moves).
+- `/undo` — revert the most recent change (files, moves, images, research).
 - `/research [topic]` — cited deep research (own Quick and Deep modes).
 - `/mcp` — list or call MCP tools (connect a local server via the MCP panel).
 - `/new`, `/model`, `/agent`, `/skills`, `/norms`, `/stop`, `/clear`, `/forget`.

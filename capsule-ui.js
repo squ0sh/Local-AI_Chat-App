@@ -397,10 +397,10 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
       const path=dialog.querySelector('#agent-path'),editor=dialog.querySelector('#agent-write');dialog.showModal();if(path&&arg)path.value=arg;setTimeout(()=>{(arg?editor:path)?.focus()},0);return;
     }
     if(name==='/undo'){
-      if(!confirm('Revert the last Agent file change?\n\nRestores the previous file contents (or removes files the agent created).')){appendEvent('info','undo cancelled');return}
-      const update=appendEvent('pending','reverting last change…');
-      try{const result=await json('/api/agent/undo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
-        update(result.ok?'success':'error',result.ok?`undo · ${result.path}`:'nothing to undo',result.ok?`${result.action==='removed'?'Removed (the file was created by the agent)':'Restored previous contents'}\n${result.path}`:(result.error||'No agent file change recorded yet.'));
+      if(!confirm('Undo the most recent change?\n\nRestores the previous file contents, undoes folder organization, or removes what Agent created.')){appendEvent('info','undo cancelled');return}
+      const update=appendEvent('pending','reverting most recent change…');
+      try{const result=await json('/api/agent/undo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})}),detail=result.ok?`${result.message}${result.count>1?`\n${result.count} item(s) reversed.`:(result.path?`\n${result.path}`:'')}`:(result.error||'No changes to undo yet.');
+        update(result.ok?'success':'error',result.ok?('undo · '+result.kind):'nothing to undo',detail);
       }catch(error){update('error','undo failed',error.message)}return;
     }
     if(name==='/research'){openResearch(arg);return}
@@ -483,8 +483,54 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
     normsStatus.hidden=false;normsStatus.textContent='Saving…';
     try{const r=await json('/api/agent/norms',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content,adopt:true})});normsStatus.textContent='Saved. The agent will follow this on its next run.';normsAdopt.checked=true;normsAdopt.disabled=true}catch(e){normsStatus.textContent='Save failed: '+e.message}
   };
-
-  // ── Deep research in the open chat terminal ────────────────────────────
+  const ledgerDialog=document.getElementById('changes-dialog');let ledgerTimer=null;
+  const ledgerKindIcon=kind=>({write:'✎',move:'↔',image:'◉',research:'⌕'}[kind]||'·');
+  const ledgerRelTime=when=>{const s=Math.max(0,(Date.now()-when)/1000);if(s<60)return'just now';if(s<3600)return Math.round(s/60)+'m ago';if(s<86400)return Math.round(s/3600)+'h ago';return Math.round(s/86400)+'d ago'};
+  async function paintLedger(){const list=document.getElementById('ledger-list');if(!list)return;try{const r=await fetch('/api/agent/ledger'),j=await r.json(),entries=j.entries||[];if(!entries.length){list.innerHTML='<p class="empty-history">No changes yet. When Agent writes a file, organizes a folder, or generates an image or research report, it appears here — and you can put it back.</p>';return}list.replaceChildren(...entries.map(en=>{const row=document.createElement('div');row.className='ledger-row'+(en.undone?' undone':'');const kind=document.createElement('span');kind.className='ledger-kind';kind.textContent=ledgerKindIcon(en.kind);const body=document.createElement('div');body.className='ledger-body';const title=document.createElement('b');title.textContent=en.label;const meta=document.createElement('small');meta.textContent=ledgerRelTime(en.when)+(en.undone?' · undone':'');body.append(title,meta);row.append(kind,body);if(!en.undone){const btn=document.createElement('button');btn.type='button';btn.className='plain-btn ledger-undo';btn.textContent='Undo';btn.onclick=async()=>{btn.disabled=true;btn.textContent='Undoing…';try{const u=await fetch('/api/agent/undo',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:en.id})}),uj=await u.json();if(!uj.ok){alert(uj.error||'Could not undo that change.');btn.disabled=false;btn.textContent='Undo'}paintLedger()}catch(e){alert('Undo failed: '+e.message);btn.disabled=false;btn.textContent='Undo'}};row.append(btn)}return row}))}catch{list.innerHTML='<p class="empty-history">Could not load changes.</p>'}}
+  function openLedger(){if(!ledgerDialog)return;ledgerDialog.showModal();paintLedger();clearInterval(ledgerTimer);ledgerTimer=setInterval(paintLedger,8000)}
+  const changesButton=document.getElementById('agent-changes-button');
+  if(changesButton)changesButton.onclick=()=>{document.getElementById('close-agent')?.click();openLedger()};
+  const closeChanges=ledgerDialog&&ledgerDialog.querySelector('#close-changes');
+  if(closeChanges)closeChanges.onclick=()=>{clearInterval(ledgerTimer);ledgerDialog.close()};
+  if(ledgerDialog)ledgerDialog.addEventListener('close',()=>clearInterval(ledgerTimer),{once:true});
+  const fitDialog=document.getElementById('fit-dialog');
+  const fitScore=document.getElementById('fit-score'),fitLevelsEl=document.getElementById('fit-levels'),fitRecs=document.getElementById('fit-recs');
+  async function paintFit(){
+    if(!fitDialog)return;
+    let f;
+    try{const r=await fetch('/api/fit',{headers:auth()});if(!r.ok)throw Error('Could not read Fit');f=await r.json()}catch(e){fitScore.innerHTML=`<p class="empty-history">${esc(e.message)}</p>`;return}
+    const pct=Math.min(100,Math.round((f.benchmark.score/3)*100));
+    fitScore.innerHTML=`<div class="fit-score-head"><b>${(f.benchmark.score).toFixed(2)}×</b><span>vs the reference build machine (i5-3570). Higher is faster.</span></div><div class="fit-bar"><i style="width:${pct}%"></i></div><div class="fit-bar-labels"><span>slow</span><span>reference</span><span>fast</span></div><div class="fit-meta"><span>Memory <b>${f.memory.free_gb} / ${f.memory.total_gb} GB</b></span><span>RAM bandwidth <b>${f.benchmark.mem_band_mbps} MB/s</b></span><span>SIMD <b>${esc(f.cpu.simd||'n/a')}</b></span><span>Image threads <b>${f.threads}</b></span></div>`;
+    fitLevelsEl.replaceChildren(...Object.entries(f.levels).map(([id,L])=>{
+      const btn=document.createElement('button');btn.type='button';btn.className='fit-level'+(id===f.level?' active':'');
+      btn.innerHTML=`<b>${esc(L.label)}</b><span>${esc(L.summary)}</span>`;
+      btn.onclick=async()=>{const r=await fetch('/api/fit/level',{method:'POST',headers:{...auth(),'Content-Type':'application/json'},body:JSON.stringify({level:id})});if(r.ok)paintFit()};
+      return btn;
+    }));
+    fitRecs.innerHTML=f.model
+      ?`<div class="fit-rec"><span>Suggested model</span><b>${esc(f.model.name)}</b><span>~${f.model.predicted_tokens_per_sec} tok/s</span></div>`
+      +`<div class="fit-rec"><span>Image ${f.image.default}×${f.image.default}</span><b>~${f.image.minutes[f.image.default]} min</b></div>`
+      +`<div class="fit-rec"><span>Image 512×512 with hires upscale</span><b>~${f.image.minutes[512]} min</b></div>`
+      +`<div class="fit-rec"><span>Image 1024×1024</span><b>~${f.image.minutes[1024]} min</b></div>`
+      +`<div class="fit-rec"><span>Deep research</span><b>~${f.research_minutes} min</b></div>`
+      +`<div class="fit-rec"><span>Voice engine</span><b>${esc(f.tts)}</b></div>`
+      +`${!f.model_fits_memory?`<div class="fit-warn">No curated model preset fits the memory that is free right now (${f.memory.free_gb} GB). The suggestion below needs more — closing apps or freeing memory unlocks better options.</div>`:f.below_interactive?`<div class="fit-warn">This level's suggested model may feel slow on this machine. A lighter model, or freeing memory, helps most.</div>`:`<div class="fit-ok">Good fit — this level is comfortable on this machine.</div>`}`
+      +`<div class="fit-meta">${f.observed.tokens_per_sec?`<span>Learned <b>${f.observed.tokens_per_sec} tok/s</b> from real chat</span>`:''}${f.observed.minutes_per_mpix?`<span>Learned <b>${f.observed.minutes_per_mpix} min/MP</b> from real images</span>`:''}</div>`
+      :'<p class="empty-history">No curated model preset fits current memory. Freeing some will unlock suggestions.</p>';
+  }
+  function openFit(){if(!fitDialog)return;fitDialog.showModal();paintFit()}
+  const fitButton=document.getElementById('agent-fit-button');
+  if(fitButton)fitButton.onclick=()=>{document.getElementById('close-agent')?.click();openFit()};
+  if(fitDialog)fitDialog.querySelector('#fit-close').onclick=()=>fitDialog.close();
+  async function applyFitImagePills(){
+    const size=document.getElementById('img-size');if(!size)return;
+    let f;try{const r=await fetch('/api/fit',{headers:auth()});if(!r.ok)return;f=await r.json()}catch{return}
+    size.querySelectorAll('.mode-btn').forEach(btn=>{
+      const n=Number(btn.dataset.size),t=f.image&&f.image.minutes&&f.image.minutes[n];
+      if(t){btn.textContent=btn.textContent.replace(/~\s*[\d.]+ min/,'~'+Math.round(t)+' min');btn.title=`${n} × ${n} pixels · ~${Math.round(t)} min`}
+    });
+  }
+  applyFitImagePills();
   // These overrides replace the earlier declarations above: research progress
   // and report render into the #messages terminal instead of a popup dialog.
   async function pollResearch(){

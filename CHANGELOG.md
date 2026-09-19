@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.2.0 — Fit and undo
+
+### Undo everything
+- **Change ledger + global undo**: every write, folder organization, image generation, and saved research report is recorded as you go. A **Changes** card lists each one with its own **Undo** button — restore any change, in any order, not just the most recent (and not just the agent's last write).
+- Oversized existing-file rewrites skip the ledger snapshot; image/research records persist even after the download model is unloaded.
+
+### Fit engine
+- **Fit** measures this computer once with a pure-JS benchmark (reference = the i5-3570 build machine ≈ 1.0×), then maps one **level** (Frugal/Balanced/Max) to coherent defaults: suggested curated model, image size + hires, voice engine, and image CPU threads.
+- **Self-correcting estimates**: real chat streams and image jobs are measured (tokens/second, minutes/megapixel) and blended into future predictions via the Fit dialog.
+- Minimal, honest `/api/fit*` endpoints, cached benchmark, per-level persistence in `fit-state.json`.
+- Cross-platform SIMD detection: Linux `/proc/cpuinfo`, macOS `sysctl`, and an optional Windows `cpuid.exe` helper (`tools/cpuid.c`, `tools/build-cpuid.ps1`) with a conservative `baseline` fallback when absent.
+
 ## 1.1.0 — Local AI on your terms
 
 ### Image Generation

@@ -1,11 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync } from 'fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, readFileSync, existsSync, renameSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { spawn } from 'child_process';
 import { createServer as netCreateServer } from 'net';
-import { globSearch, revertLastAgentWrite, WRITE_HISTORY, executeTool } from '../lib/agent-loop.mjs';
+import { globSearch, agentWriteFile, undoChange, listLedger, recordChange, CHANGE_LEDGER_MAX, executeTool } from '../lib/agent-loop.mjs';
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -42,31 +42,83 @@ test('globSearch finds files by pattern and skips ignored folders', () => {
   }
 });
 
-test('revertLastAgentWrite removes files the agent created and restores old contents', () => {
-  const root = mkdtempSync(join(tmpdir(), 'agent-undo-'));
+test('change ledger: undo by id (any order) and most-recent fallback', () => {
+  const root = mkdtempSync(join(tmpdir(), 'agent-ledger-'));
   try {
-    const created = 'notes/new-file.txt';
-    WRITE_HISTORY.push({ existed: false, path: created, content: null });
-    let result = revertLastAgentWrite(root);
-    assert.equal(result.ok, true);
-    assert.equal(result.action, 'removed');
-    assert.equal(result.path, created);
+    const createdPath = 'notes/new-file.txt';
+    assert.deepEqual(agentWriteFile(root, createdPath, 'hello').ok, true);
+    assert.equal(existsSync(join(root, createdPath)), true);
 
-    // A file that existed before: simulate "old" content, then snapshot a new write.
-    const edited = 'notes/plan.txt';
-    mkdirSync(dirname(join(root, edited)), { recursive: true });
-    writeFileSync(join(root, edited), 'old version');
-    WRITE_HISTORY.push({ existed: true, path: edited, content: 'old version' });
-    writeFileSync(join(root, edited), 'new version');
-    result = revertLastAgentWrite(root);
-    assert.equal(result.ok, true);
-    assert.equal(result.action, 'restored');
-    assert.equal(result.path, edited);
-    assert.equal(readFileSync(join(root, edited), 'utf8'), 'old version');
+    const editedPath = 'notes/plan.txt';
+    mkdirSync(dirname(join(root, editedPath)), { recursive: true });
+    writeFileSync(join(root, editedPath), 'old version');
+    assert.deepEqual(agentWriteFile(root, editedPath, 'new version').ok, true);
 
-    // Empty history → nothing to undo.
-    assert.deepEqual(revertLastAgentWrite(root), { ok: false, error: 'Nothing to undo' });
-    assert.equal(WRITE_HISTORY.length, 0);
+    const ledger = listLedger();
+    assert.equal(ledger.length, 2);
+    assert.equal(ledger[0].kind, 'write');
+    assert.equal(ledger[1].undone, false);
+
+    let r = undoChange(root, ledger[1].id);
+    assert.equal(r.ok, true);
+    assert.equal(r.action, 'restored');
+    assert.equal(r.kind, 'write');
+    assert.equal(readFileSync(join(root, editedPath), 'utf8'), 'old version');
+    assert.equal(listLedger()[1].undone, true);
+
+    assert.equal(undoChange(root, ledger[1].id).ok, false);
+    assert.match(undoChange(root, ledger[1].id).error, /already undone/);
+
+    r = undoChange(root);
+    assert.equal(r.ok, true);
+    assert.equal(r.action, 'removed');
+    assert.equal(existsSync(join(root, createdPath)), false);
+
+    assert.deepEqual(undoChange(root), { ok: false, error: 'Nothing to undo' });
+    assert.match(undoChange(root, 'g99').error, /not found/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('change ledger: move, image, and research kinds undo cleanly; ledger is capped', () => {
+  const root = mkdtempSync(join(tmpdir(), 'agent-ledger2-'));
+  try {
+    const from = 'a.txt', to = 'Archives/a.txt';
+    mkdirSync(join(root, 'Archives'), { recursive: true });
+    writeFileSync(join(root, from), 'x');
+    renameSync(join(root, from), join(root, to));
+    const moveId = recordChange('move', { plan: [{ from, to }] }, 'moved 1 file(s) into folders');
+    let r = undoChange(root, moveId);
+    assert.equal(r.ok, true);
+    assert.equal(r.kind, 'move');
+    assert.equal(existsSync(join(root, from)), true);
+    assert.equal(existsSync(join(root, to)), false);
+    assert.equal(undoChange(root, moveId).ok, false, 'already undone');
+
+    const imgDir = join(root, 'out', 'job-x');
+    mkdirSync(imgDir, { recursive: true });
+    const png = join(imgDir, 'i.png');
+    writeFileSync(png, '');
+    const imgId = recordChange('image', { dir: imgDir, files: [png] }, 'generated 1 image(s)');
+    r = undoChange(root, imgId);
+    assert.equal(r.ok, true);
+    assert.equal(r.kind, 'image');
+    assert.equal(existsSync(png), false);
+
+    const report = join(root, 'data', 'research', 'abc123.json');
+    mkdirSync(dirname(report), { recursive: true });
+    writeFileSync(report, '{}');
+    const researchId = recordChange('research', { file: report }, 'saved research report');
+    r = undoChange(root, researchId);
+    assert.equal(r.ok, true);
+    assert.equal(r.kind, 'research');
+    assert.equal(existsSync(report), false);
+
+    for (let i = 0; i < CHANGE_LEDGER_MAX; i += 1) {
+      recordChange('write', { existed: false, path: `tmp-${i}`, content: null }, `tmp-${i}`);
+    }
+    assert.equal(listLedger().length, CHANGE_LEDGER_MAX);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

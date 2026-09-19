@@ -20,6 +20,7 @@ import { spawn, execSync, execFileSync } from 'child_process';
 import { pipeline } from 'stream/promises';
 import { Readable, Transform } from 'stream';
 import { totalmem, freemem, cpus, loadavg, homedir, networkInterfaces } from 'os';
+import { performance } from 'node:perf_hooks';
 import { randomBytes, createHash } from 'crypto';
 import qrcode from './lib/vendor/qrcode-generator.mjs';
 import { portableIntegrityReport, rebuildManifest, repairReleaseFiles } from './lib/capsule-integrity.mjs';
@@ -31,8 +32,9 @@ import { RateLimiter, rateLimitResponse } from './lib/rate-limit.mjs';
 import { ChatStore } from './lib/chat-store.mjs';
 import { McpClient } from './lib/mcp-client.mjs';
 import { UserStore } from './lib/user-store.mjs';
-import { runAgentLoop, globSearch, agentWriteFile, revertLastAgentWrite, buildOrganizePlan, applyOrganizePlan, webSearch } from './lib/agent-loop.mjs';
+import { runAgentLoop, globSearch, agentWriteFile, undoChange, listLedger, recordChange, buildOrganizePlan, applyOrganizePlan, webSearch } from './lib/agent-loop.mjs';
 import { shouldFreeMemory, otherModelNames } from './lib/memory.mjs';
+import { runMicroBenchmark, loadFitState, saveFitState, recordObservation, recommendFit, FIT_LEVELS } from './lib/fit-engine.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -457,6 +459,64 @@ function localHardwareProfile() {
   return { memory_total_gb: memoryTotalGb, memory_free_gb: memoryFreeGb, disk_free_gb: diskFreeGb, cpu_cores: cpus().length, gpu, portable: Boolean(process.env.LOCAL_AI_DATA_DIR) && storage.portable, storage };
 }
 
+// ── Fit engine (the machine's own settings) ─────────────────────────────────
+let fitState = loadFitState(DATA_DIR);
+let fitBenchmark = null;
+let fitBenchmarkAt = 0;
+const FIT_BENCHMARK_TTL = 10 * 60 * 1000;
+
+function currentFitBenchmark() {
+  if (!fitBenchmark || Date.now() - fitBenchmarkAt > FIT_BENCHMARK_TTL) {
+    try { fitBenchmark = runMicroBenchmark(); } catch { fitBenchmark = fitBenchmark || { score: 1, aluScore: 1, memScore: 1, memBandMbps: 0 }; }
+    fitBenchmarkAt = Date.now();
+  }
+  return fitBenchmark;
+}
+
+function observeFit(kind, value) {
+  const before = fitState.observed[kind]?.length || 0;
+  fitState = recordObservation(fitState, kind, value);
+  if ((fitState.observed[kind]?.length || 0) > before) saveFitState(DATA_DIR, fitState);
+}
+
+function recordFitTokenObservation(tokenCount, startedAt) {
+  if (!tokenCount || tokenCount < 30) return;
+  const seconds = (performance.now() - startedAt) / 1000;
+  if (seconds < 0.3) return;
+  observeFit('tokens_per_sec', tokenCount / seconds);
+}
+
+function fitPayload() {
+  const b = currentFitBenchmark();
+  const profile = localHardwareProfile();
+  let cpu = {};
+  try {
+    const h = hardwareInfo();
+    cpu = { cores: h.cpu.cores || profile.cpu_cores, simd: h.cpu.simd, arch: h.cpu.arch };
+  } catch {}
+  const recommendation = recommendFit({
+    presets: CURATED_MODELS,
+    memFreeGb: profile.memory_free_gb,
+    memScore: b.memScore,
+    score: b.score,
+    cores: cpu.cores || profile.cpu_cores || 4,
+    state: fitState,
+  });
+  return {
+    ...recommendation,
+    benchmark: {
+      score: Math.round(b.score * 100) / 100,
+      alu_score: Math.round(b.aluScore * 100) / 100,
+      mem_score: Math.round(b.memScore * 100) / 100,
+      mem_band_mbps: Math.round(b.memBandMbps),
+      generated_at: fitBenchmarkAt,
+    },
+    memory: { free_gb: Math.round(profile.memory_free_gb * 10) / 10, total_gb: Math.round(profile.memory_total_gb * 10) / 10 },
+    cpu: { cores: cpu.cores || profile.cpu_cores, simd: cpu.simd, arch: cpu.arch },
+    levels: FIT_LEVELS,
+  };
+}
+
 function perfSnapshot() {
   const cores = cpus().length || 1;
   const cpuPercent = Math.min(100, Math.max(0, Math.round((loadavg()[0] / cores) * 100)));
@@ -788,6 +848,7 @@ async function streamOllamaChat({ model, messages, signal, numCtx, temperature =
     }
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
+    const startedAt = performance.now();
     let buffer = '', content = '', toolCalls = [], tokenCount = 0;
     while (true) {
       const { done, value } = await reader.read();
@@ -807,8 +868,10 @@ async function streamOllamaChat({ model, messages, signal, numCtx, temperature =
         if (Array.isArray(chunk.message?.tool_calls) && chunk.message.tool_calls.length) toolCalls = chunk.message.tool_calls;
       }
     }
+    recordFitTokenObservation(tokenCount, startedAt);
     return { content, toolCalls, tokenCount };
   } catch (error) {
+    recordFitTokenObservation(tokenCount, startedAt);
     if (signal?.aborted || controller.signal.aborted) {
       const abortError = new DOMException('Request cancelled', 'AbortError');
       throw abortError;
@@ -1407,6 +1470,13 @@ const researchEngine = new ResearchEngine({
   complete: researchModelCompletion,
   searxngUrl: process.env.RESEARCH_SEARXNG_URL || '',
   denyEgress: cfg.denyEgress,
+  onComplete: (job) => {
+    if (job?.id && job.status === 'complete') {
+      try {
+        recordChange('research', { file: join(RESEARCH_DIR, `${job.id}.json`) }, `saved research report${job.query ? ' · ' + String(job.query).replace(/\s+/g, ' ').slice(0, 60) : ''}`);
+      } catch {}
+    }
+  },
 });
 const chatStore = new ChatStore(CHATS_DIR);
 const mcpClients = new Map();
@@ -1817,7 +1887,7 @@ function startImageJob(params) {
   const count = Math.max(1, Math.min(4, Math.round(Number(params.count) || 1)));
   let negative = String(params.negative_prompt || '').trim().slice(0, 2000);
   if (!negative) negative = DEFAULT_IMAGE_NEGATIVE;
-  const threads = Math.max(1, Math.min(8, cpus().length - 1));
+  const threads = Math.max(1, Math.min(8, Math.round(cpus().length * (FIT_LEVELS[fitState.level]?.threads_to_cpu || 0.75))));
   const dir = join(IMAGE_OUT_DIR, 'job-' + Date.now() + '-' + randomBytes(3).toString('hex'));
   mkdirSync(dir, { recursive: true });
   const baseW = Math.max(128, Math.round(width / 2));
@@ -1908,6 +1978,12 @@ async function runImageJob(job) {
     else {
       job.status = 'done'; job.files = files;
       writeFileSync(join(job.dir, 'meta.json'), JSON.stringify({ ...job, cli: undefined, child: undefined, buffer: undefined, progress: undefined, step: undefined, totalSteps: undefined, files }, null, 2), 'utf8');
+      recordChange('image', { dir: job.dir, files: files.map((f) => join(job.dir, f)) }, `generated ${files.length} image(s)`);
+      try {
+        const mp = (Number(job.width) || 0) * (Number(job.height) || 0) / 1_000_000;
+        const minutes = job.durationMs / 60_000;
+        if (mp > 0 && minutes >= 0.1 && Number.isFinite(minutes)) observeFit('minutes_per_mpix', minutes / mp);
+      } catch {}
     }
   }
   log('Image job ' + job.id + (job.status === 'done' ? ' done in ' + Math.round(job.durationMs / 1000) + 's (' + (job.files || []).length + ' image(s))' : ' ended as ' + job.status + (job.error ? ': ' + job.error : '')));
@@ -2830,9 +2906,14 @@ async function handle(req, res) {
       return sendJSON(res, 200, output);
     }
 
-    // ── Agent: undo the last agent file change ──────────────────────────────
+    // ── Agent: change ledger + undo (any entry, or the most recent) ─────────
+    if (req.method === 'GET' && p === '/api/agent/ledger') {
+      return sendJSON(res, 200, { entries: listLedger() });
+    }
     if (req.method === 'POST' && p === '/api/agent/undo') {
-      const result = revertLastAgentWrite(__dirname);
+      let id;
+      try { const body = JSON.parse(await readBody(req)); id = body && body.id; } catch {}
+      const result = undoChange(__dirname, id);
       return sendJSON(res, result.ok ? 200 : 400, result);
     }
 
@@ -3161,6 +3242,29 @@ async function handle(req, res) {
     }
 
     return sendJSON(res, 404, { error: 'Unknown agent tool' });
+  }
+
+  // ── Fit: the machine's own settings ─────────────────────────────────────
+  if (req.method === 'GET' && p === '/api/fit') {
+    return sendJSON(res, 200, fitPayload());
+  }
+  if (req.method === 'POST' && p === '/api/fit/level') {
+    let body;
+    try { body = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const level = body && body.level;
+    if (!FIT_LEVELS[level]) return sendJSON(res, 400, { error: 'Unknown fit level: use frugal, balanced, or max' });
+    fitState = { ...fitState, level };
+    saveFitState(DATA_DIR, fitState);
+    return sendJSON(res, 200, { ok: true, level, recommendation: fitPayload() });
+  }
+  if (req.method === 'POST' && p === '/api/fit/observe') {
+    let body;
+    try { body = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const before = fitState.observed[body && body.kind]?.length || 0;
+    fitState = recordObservation(fitState, body && body.kind, body && body.value);
+    const recorded = (fitState.observed[body && body.kind]?.length || 0) > before;
+    if (recorded) saveFitState(DATA_DIR, fitState);
+    return sendJSON(res, 200, { ok: true, recorded });
   }
 
   // ── Local-only Model Library ─────────────────────────────────────────────

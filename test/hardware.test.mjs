@@ -5,7 +5,7 @@ import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { spawn } from 'child_process';
 import { createServer as netCreateServer } from 'net';
-import { hardwareInfo, hardwareSummary, resetHardwareProfile } from '../lib/hardware.mjs';
+import { hardwareInfo, hardwareSummary, resetHardwareProfile, normalizeFlags } from '../lib/hardware.mjs';
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -38,6 +38,20 @@ test('hardwareSummary renders a compact one-line label', () => {
   const summary = hardwareSummary();
   assert.match(summary, /^CPU \d+×[a-z0-9_]+( · GPU [^·]+)? · image: (cpu|cuda|vulkan|rocm)( · NPU)?$/);
   resetHardwareProfile();
+});
+
+test('normalizeFlags maps macOS/Windows flag spellings onto the Linux set', () => {
+  const mac = normalizeFlags(['AVX1.0', 'SSE4.2', 'SSE4.1', 'AVX2', 'F16C', 'RDSEED.', 'CLEARDBI.']);
+  assert.ok(mac.has('avx'), 'AVX1.0 maps to avx');
+  assert.ok(mac.has('sse4_2'), 'SSE4.2 maps to sse4_2');
+  assert.ok(mac.has('sse4_1'), 'SSE4.1 maps to sse4_1');
+  assert.ok(mac.has('avx2'), 'AVX2 maps lowercased');
+  assert.ok(mac.has('rdseed'), 'trailing dots are stripped');
+  assert.ok(!mac.has('avx1.0'), 'the raw spelling is not kept');
+  const win = normalizeFlags(['avx512f', 'avx2', 'amx_bf16', 'gfni']);
+  assert.ok(win.has('avx512f') && win.has('amx_bf16') && win.has('gfni'));
+  const linux = normalizeFlags(['avx', 'sse4_2', 'sse4_2', '']);
+  assert.equal(linux.size, 2, 'duplicates and empties collapse');
 });
 
 test('hardware endpoints: /api/hardware and /health perf are available', async () => {
