@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.2.2 — Bigger Agent dialog, toggle switch
+
+- The **Agent** popup is wider (up to 820px) and scrolls internally instead of
+  filling the page; card labels wrap instead of nudging horizontal scrollbars.
+- "Use Agent Mode" is now a proper **toggle switch** (still a checkbox
+  underneath, so the existing persistence logic is unchanged); the option card
+  highlights while the mode is on.
+
 ## 1.2.1 — Fit model suggestion
 
 - **Automatic model suggestion**: before any model has been chosen, the chat
