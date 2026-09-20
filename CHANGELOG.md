@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.3.0 — Option cards align, "Code" agent mode, chat export
+
+- Agent option cards (Start Agent switch, Autonomy radios, Organize styles)
+  no longer fall back to the settings label's stacked `display:block` — they
+  keep their icon-left / text-right flex layout again.
+- The topbar now fits viewports around 780px (project picker hides, gaps and
+  the chat-title input shrink below 880px; the live agent status bar also
+  compacts).
+- The supervised coding-plan profile (previously an unreachable Agent option)
+  returns as a proper third mode: **Code — supervised plan, write, review**.
+  Pick it from the terminal mode chip (◈ Code), the Agent dialog segment, or
+  `/agent`; the shell badge and voice pill show `CODE`. As a mode it is
+  permissioned like Build, so files and commands still pause for approval,
+  and guarded chat messages get the dedicated coding profile.
+- Chat settings now offers **Export Markdown** (render the current chat to a
+  `.md` file), **Backup JSON** (all chats + projects in one portable file),
+  and **Restore…** (import a JSON backup, merging chats and projects and
+  keeping anything already present). Backups are plain files that leave only
+  your machine; Restore is hidden when reached through a shared Remote link.
+
 ## 1.2.3 — Bigger dialogs everywhere, shared switch
 
 - All dialogs (Deep Research, Fit, Changes, Model Cockpit, Chat settings,

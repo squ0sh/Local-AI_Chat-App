@@ -3002,8 +3002,8 @@ async function handle(req, res) {
     if (req.method === 'POST' && p === '/api/agent/mode') {
       let payload;
       try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
-      const nextMode = payload.mode === 'plan' || payload.mode === 'build' ? payload.mode : null;
-      if (!nextMode) return sendJSON(res, 400, { error: 'mode must be "plan" or "build"' });
+      const nextMode = payload.mode === 'plan' || payload.mode === 'build' || payload.mode === 'code' ? payload.mode : null;
+      if (!nextMode) return sendJSON(res, 400, { error: 'mode must be "plan", "build", or "code"' });
       currentAgentMode = nextMode;
       return sendJSON(res, 200, { mode: currentAgentMode });
     }
@@ -3043,7 +3043,7 @@ async function handle(req, res) {
       const autonomy = ['supervised', 'selective', 'auto'].includes(payload.autonomy) ? payload.autonomy : 'selective';
       const skillPrompt = String(payload.skill_prompt || '').trim();
       const norms = readNorms();
-      const mode = payload.mode === 'plan' || payload.mode === 'build' ? payload.mode : (payload.plan ? 'plan' : 'build');
+      const mode = payload.mode === 'plan' || payload.mode === 'build' || payload.mode === 'code' ? payload.mode : (payload.plan ? 'plan' : 'build');
       const readonly = mode === 'plan';
       if (mode === 'plan') currentAgentMode = 'plan';
       const supportsTools = await modelSupportsTools(model);
