@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.2.3 — Bigger dialogs everywhere, shared switch
+
+- All dialogs (Deep Research, Fit, Changes, Model Cockpit, Chat settings,
+  Skills, Norms, Cloud, Vault, Remote, Model Library, installer) now open up
+  to 720px wide (Agent / Research / Model Library up to 820px) and scroll
+  internally instead of filling the page.
+- The Deep Research popup width now applies to the dialog itself (it was only
+  sizing an inner element, which overflowed the 560px box).
+- New shared `.capsule-switch` toggle style; the "Use Agent Mode", "I adopt
+  these norms", and cloud "Remember on this computer" checkboxes all render
+  as pill switches.
+
 ## 1.2.2 — Bigger Agent dialog, toggle switch
 
 - The **Agent** popup is wider (up to 820px) and scrolls internally instead of
