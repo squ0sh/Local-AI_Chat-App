@@ -864,6 +864,8 @@ async function streamOllamaChat({ model, messages, signal, numCtx, temperature =
   const timer = setTimeout(() => controller.abort(), stepTimeout);
   const abort = () => controller.abort();
   signal?.addEventListener('abort', abort, { once: true });
+  let buffer = '', content = '', toolCalls = [], tokenCount = 0;
+  const startedAt = performance.now();
   try {
     const body = { model, messages, stream: true, temperature, options: { num_ctx: numCtx } };
     if (tools?.length) body.tools = tools;
@@ -876,8 +878,6 @@ async function streamOllamaChat({ model, messages, signal, numCtx, temperature =
     }
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
-    const startedAt = performance.now();
-    let buffer = '', content = '', toolCalls = [], tokenCount = 0;
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -909,6 +909,65 @@ async function streamOllamaChat({ model, messages, signal, numCtx, temperature =
     clearTimeout(timer);
     signal?.removeEventListener('abort', abort);
   }
+}
+
+const CHAT_COMPACT_PROMPT =
+  'You condense the earlier part of a conversation into a compact, faithful digest. ' +
+  'Keep every decision, fact, number, path, file name, and open question. ' +
+  'Write plain text in a few dense sentences or short bullets; no markdown headers; do not invent anything.';
+
+async function ollamaSummarizeChat(model, messages) {
+  const lines = (messages || [])
+    .filter((m) => m && typeof m.content === 'string')
+    .map((m) => (m.role === 'assistant' ? 'Assistant: ' : m.role === 'user' ? 'User: ' : '') + m.content)
+    .join('\n\n')
+    .trim();
+  if (!lines) return '';
+  const input = lines.length > 140_000 ? '…(earlier part trimmed to fit)\n' + lines.slice(-140_000) : lines;
+  let context;
+  try { context = await ollamaContextFor(model); } catch { context = 4096; }
+  const out = await streamOllamaChat({
+    model,
+    numCtx: context,
+    temperature: 0.3,
+    messages: [
+      { role: 'system', content: CHAT_COMPACT_PROMPT },
+      { role: 'user', content: 'Condense the earlier conversation below so the thread can continue without it being repeated:\n\n' + input },
+    ],
+  });
+  return String((out && out.content) || '').trim();
+}
+
+// Keeps the model's context window clear of overflow: when the conversation
+// outgrows the usable context, the older messages are condensed into a single
+// digest just before the request is sent to Ollama. The visible history in the
+// UI is untouched; only what we send to the model is compressed.
+async function maybeCompactChatMessages(messages, model) {
+  if (!Array.isArray(messages) || messages.length < 6) return messages;
+  const textable = messages.filter((m) => m && typeof m.role === 'string' && typeof m.content === 'string');
+  if (textable.length < 6) return messages;
+  const text = textable
+    .map((m) => (m.role === 'user' ? 'User: ' : m.role === 'assistant' ? 'Assistant: ' : m.role + ': ') + m.content)
+    .join('\n\n');
+  const estimatedTokens = Math.ceil(text.length / 4) + textable.length * 10;
+  let context;
+  try { context = await ollamaContextFor(model); } catch { return messages; }
+  const budget = Math.floor(context * 0.6);
+  if (estimatedTokens <= budget) return messages;
+  const remaining = textable.slice();
+  const headSystem = remaining[0] && remaining[0].role === 'system' ? remaining.shift() : null;
+  const keepCount = Math.min(4, Math.max(2, Math.ceil(remaining.length / 3)));
+  const older = remaining.slice(0, Math.max(1, remaining.length - keepCount));
+  const kept = remaining.slice(Math.max(1, remaining.length - keepCount));
+  let summary;
+  try { summary = await ollamaSummarizeChat(model, older); } catch { summary = ''; }
+  if (!summary) return messages;
+  const digest = '[Earlier messages in this conversation were condensed to fit the model context.]\n' + summary;
+  const result = headSystem
+    ? [{ ...headSystem, content: String(headSystem.content || '') + '\n\n' + digest }, ...kept]
+    : [{ role: 'system', content: digest }, ...kept];
+  console.log(`[compact] ${model}: condensed ${older.length} earlier message(s) (estimated ${estimatedTokens} tokens over the ${budget} budget), keeping last ${kept.length}`);
+  return result;
 }
 
 async function modelSupportsTools(model) {
@@ -2214,7 +2273,7 @@ async function handle(req, res) {
   const rateLimited =
     p.startsWith('/api/agent/')
     || (req.method === 'POST'
-      && (p === '/api/auth/login' || p === '/api/chat' || p === '/api/research' || p === '/api/chatstate' || p.startsWith('/api/speech/') || p.startsWith('/api/image/') || p.startsWith('/api/models/') || p.startsWith('/api/vault/') || p.startsWith('/api/cloud/') || p.startsWith('/api/agent/') || p.startsWith('/v1/')));
+      && (p === '/api/auth/login' || p === '/api/chat' || p === '/api/chat/summarize' || p === '/api/research' || p === '/api/chatstate' || p.startsWith('/api/speech/') || p.startsWith('/api/image/') || p.startsWith('/api/models/') || p.startsWith('/api/vault/') || p.startsWith('/api/cloud/') || p.startsWith('/api/agent/') || p.startsWith('/v1/')));
   if (rateLimited) {
     const verdict = sharedRateLimiter.check(req);
     if (!verdict.allowed) return rateLimitResponse(res, verdict.retryAfter);
@@ -3746,6 +3805,27 @@ async function handle(req, res) {
     return sendJSON(res, 200, { downloads: [...downloads.values()].map(publicModelJob) });
   }
 
+  // ── Condense part of a chat with the local model (used by the bundled UI) ─
+  if (p === '/api/chat/summarize' && req.method === 'POST') {
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    let payload;
+    try { payload = JSON.parse(body || '{}'); }
+    catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const model = String(payload.model || '').trim() || String(cfg.model || '').trim();
+    if (!model) return sendJSON(res, 400, { error: 'model is required' });
+    const messages = Array.isArray(payload.messages) ? payload.messages : [];
+    const textable = messages.filter((m) => m && typeof m.role === 'string' && typeof m.content === 'string');
+    if (!textable.length) return sendJSON(res, 400, { error: 'Nothing to summarize' });
+    if (textable.length > 200) return sendJSON(res, 400, { error: 'Too many messages; summarize in smaller chunks' });
+    if (body.length > 5_000_000) return sendJSON(res, 413, { error: 'Payload too large to summarize' });
+    try {
+      const summary = await ollamaSummarizeChat(model, textable);
+      if (!summary) return sendJSON(res, 502, { error: 'The model returned an empty summary' });
+      return sendJSON(res, 200, { summary });
+    } catch (e) { console.error('[summarize] ' + e.message); return sendJSON(res, 500, { error: 'Summarize failed: ' + e.message }); }
+  }
+
   // ── Native streaming chat (used by the bundled UI) ───────────────────────
   if (p === '/api/chat' && req.method === 'POST') {
     let body;
@@ -4062,12 +4142,23 @@ async function streamChat(payload, res) {
   // leave the Capsule. Local history, project excerpts, prompts, and tool
   // output are discarded server-side even if a browser misbehaves.
   const incomingMessages = payload.messages || [];
-  const messages = payload.mode === 'cloud'
+  let messages = payload.mode === 'cloud'
     ? incomingMessages.filter((m) => m && m.role === 'user').slice(-1)
     : incomingMessages;
 
   if (provider === 'ollama' && modelUnloadActive) {
     return sendJSON(res, 409, { error: 'A model memory operation is running. Try again in a moment.' });
+  }
+
+  // Auto-compaction: condense the older messages locally when the pending
+  // conversation would overflow the model's context window. Only ever runs for
+  // the local provider and never touches cloud-bound messages (those were
+  // already trimmed to the last user turn above).
+  if (provider === 'ollama' && payload.mode !== 'cloud') {
+    try {
+      const condensed = await maybeCompactChatMessages(messages, String(payload.model || cfg.model || '').trim());
+      if (condensed) messages = condensed;
+    } catch {}
   }
 
   res.writeHead(200, {

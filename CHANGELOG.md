@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.3.1 — Long-chat compaction (auto + manual)
+
+- Long conversations can no longer overflow the local model's context window.
+  When a chat's estimated size passes ~60% of the model's usable context, the
+  server condenses the older messages into a short digest locally (Ollama only;
+  cloud-bound messages still shrink to the last user turn) and keeps working
+  with the newest messages. The visible history in the chat is left intact.
+- Chat settings gain **Summarize & compress**: a one-click way to condense the
+  earlier part of a conversation with your local model. The older messages are
+  replaced by a collapsible "Compacted earlier part of this conversation" note,
+  the newest few are kept, and the result is saved to this machine's history.
+- The `/api/chat/summarize` endpoint (rate-limited, local-only) runs a
+  non-streaming summary through the local model and validates its inputs.
+- Fixed a latent `streamOllamaChat` bug where a failing Ollama request could
+  throw `tokenCount is not defined` (temporal dead zone in the catch block) and
+  mask the real error.
+- The encrypted chat store now preserves the `kind` marker on compact-note
+  messages so they render correctly after a reload.
+
 ## 1.3.0 — Option cards align, "Code" agent mode, chat export
 
 - Agent option cards (Start Agent switch, Autonomy radios, Organize styles)
