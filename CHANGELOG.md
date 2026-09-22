@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.3.3 — No dead ends: guided first run, friendly errors, live status
+
+- **Sending without a model no longer dead-ends.** The chat shows a guidance
+  row instead of a red error: it names the model that fits this machine
+  (size included) and an **Install it for me** button that opens the Model
+  library and starts the download. Your typed message stays in the input box,
+  and the row updates to “press send again” once the model is ready.
+- **Errors speak human.** A shared humanizer maps the common failure shapes
+  (engine offline, rejected API key, missing model, rate limit, server error,
+  over-long chat) to one plain sentence plus one fix button, replacing the
+  `HTTP 500: {…}` dumps that used to land directly in the chat. Vault unlock,
+  backup/restore, summarize, and Remote errors went through the same pass.
+- **The status dot is now a button.** Clicking the bottom-left status (“Engine
+  ready” / “Engine off — tap for help”) opens a dialog that explains in plain
+  language what is running, what isn’t, and the one thing to do about it —
+  including on a Remote link (“the link expired, ask for a fresh one”).
+- **Sidebar launchers now report state.** Model library shows the installed
+  count and live download percentage, the Vault button shows sealed/open, and
+  the Remote button refreshes on its own (its live label was being clobbered
+  by the sidebar rename). The empty model dropdown also points at the fix.
+
 ## 1.3.2 — FreeLLMAPI cloud connection
 
 - The **Cloud connection** dialog gains a **FreeLLMAPI (local router)** provider.
