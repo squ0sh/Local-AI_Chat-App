@@ -1316,6 +1316,178 @@ function saveCloudVault() {
   saveConfig({ AI_PROVIDER: cfg.aiProvider, AI_DISPLAY_MODEL: cfg.model, OPENAI_BASE_URL: cfg.openaiBaseUrl, OPENAI_API_KEY: '', ANTHROPIC_API_KEY: '', GEMINI_API_KEY: '' });
 }
 
+// ── Optional local FreeLLMAPI router ───────────────────────────────────────
+// The Cloud connection dialog can start an already-installed FreeLLMAPI router
+// (dashboard/API on the configured loopback port) so the user never has to open
+// a terminal for restarts. Note: the npm package `freellmapi` is only a
+// coding-agent setup CLI — running it does NOT serve anything. The router
+// itself runs in Docker via the official installer, which drops a
+// docker-compose.yml into ~/freellmapi. Everything here is strictly
+// loopback-originated, fixed-argv work: no shell strings are ever built.
+const routerTracker = { pid: 0, port: 0, mode: '', state: 'idle', at: 0 };
+
+const ROUTER_INSTALL_HINT = 'Install it once with: curl -fsSL https://freellmapi.co/install.sh | bash (needs Docker), then press Start again.';
+
+function routerBaseParts() {
+  let base = String(cfg.openaiBaseUrl || 'http://localhost:3001/v1').trim();
+  if (!/^https?:\/\//i.test(base)) base = 'http://' + base;
+  try {
+    const url = new URL(base);
+    const portExplicit = Boolean(url.port);
+    const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
+    const host = url.hostname || 'localhost';
+    const loopback = host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]' || host === '0.0.0.0';
+    return { host, port: Number.isInteger(port) && port >= 1 && port <= 65535 ? port : 3001, loopback, portExplicit };
+  } catch {
+    return { host: 'localhost', port: 3001, loopback: true, portExplicit: false };
+  }
+}
+
+async function probeRouterPort(port, timeoutMs = 600) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/`, { method: 'GET', signal: controller.signal });
+    return (res.ok || res.status < 500) ? '/' : '';
+  } catch { return ''; }
+  finally { clearTimeout(timer); }
+}
+
+// First reachable among the configured port and the router's built-in 3001
+// default (freellmapi may not honor --port on every version). The 3001 fallback
+// only applies when the base URL carried no explicit port, so a dead configured
+// port is never misreported as reachable.
+async function detectReporterPort(configPort, portExplicit) {
+  const preferred = await probeRouterPort(configPort);
+  if (preferred) return { detectedPort: configPort, probed: preferred };
+  if (configPort !== 3001 && !portExplicit) {
+    const fallback = await probeRouterPort(3001);
+    if (fallback) return { detectedPort: 3001, probed: fallback };
+  }
+  return { detectedPort: 0, probed: '' };
+}
+
+// Locates an installed router: the official installer keeps its compose file
+// in ~/freellmapi (overridable with FREELLMAPI_DIR).
+function routerComposeDir() {
+  const dirs = [process.env.FREELLMAPI_DIR, join(homedir(), 'freellmapi')].filter(Boolean);
+  for (const dir of dirs) {
+    try { if (existsSync(join(dir, 'docker-compose.yml'))) return dir; } catch {}
+  }
+  return '';
+}
+
+// The Windows/macOS desktop app carries the router + dashboard without Docker.
+const ROUTER_DESKTOP_CANDIDATES = {
+  win32: [join(process.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local'), 'Programs', 'FreeLLMAPI', 'FreeLLMAPI.exe')],
+  darwin: ['/Applications/FreeLLMAPI.app', join(homedir(), 'Applications', 'FreeLLMAPI.app')],
+};
+
+function routerDesktopApp() {
+  if (process.env.FREELLMAPI_DESKTOP) {
+    try { return existsSync(process.env.FREELLMAPI_DESKTOP) ? process.env.FREELLMAPI_DESKTOP : ''; } catch { return ''; }
+  }
+  for (const p of ROUTER_DESKTOP_CANDIDATES[process.platform] || []) {
+    try { if (existsSync(p)) return p; } catch {}
+  }
+  return '';
+}
+
+// Docker CLI presence + daemon reachability + any installed (possibly stopped)
+// router container. Probing docker costs 50–150ms, so it is cached briefly —
+// the status endpoint is polled by the UI on every Base-URL edit.
+let dockerCache = { at: 0, value: null };
+function dockerProbe() {
+  if (dockerCache.value && Date.now() - dockerCache.at < 5000) return dockerCache.value;
+  const docker = findOnPath('docker');
+  let value = { bin: docker || '', daemon: false, container: '' };
+  if (docker) {
+    try {
+      execFileSync(docker, ['info'], { stdio: 'ignore', timeout: 5000 });
+      value.daemon = true;
+      try {
+        const out = execFileSync(docker, ['ps', '-a', '--filter', 'name=freellmapi', '--format', '{{.Names}} {{.State}}'], { timeout: 5000, encoding: 'utf8' });
+        const line = String(out || '').split('\n').map((s) => s.trim()).filter(Boolean)[0] || '';
+        if (line) value.container = line;
+      } catch {}
+    } catch {}
+  }
+  dockerCache = { at: Date.now(), value };
+  return value;
+}
+
+// Busted in tests when they need a fresh probe.
+function dockerProbeReset() { dockerCache = { at: 0, value: null }; }
+
+// Runs the given fixed-argv command to (re)start the router. Resolves once the
+// child has been spawned far enough to consider it launched; reachability is
+// left to the polling /status endpoint.
+function startRouterChild({ bin, args, kind, cwd }) {
+  let failed = false;
+  const child = spawn(bin, args, { detached: true, stdio: 'ignore', ...(cwd ? { cwd } : {}) });
+  routerTracker.pid = child.pid || 0;
+  routerTracker.mode = kind;
+  routerTracker.state = 'launching';
+  routerTracker.at = Date.now();
+  child.on('error', () => { failed = true; routerTracker.pid = 0; routerTracker.state = 'error'; });
+  child.on('exit', (code) => {
+    // docker compose/start exit 0 once launched; the daemon keeps it alive.
+    if (code !== 0 && routerTracker.pid === child.pid) { routerTracker.pid = 0; routerTracker.state = 'error'; }
+  });
+  child.unref();
+  if (kind === 'docker') dockerProbeReset();
+  setTimeout(() => { if (routerTracker.pid === child.pid && !failed) routerTracker.state = 'launching'; }, 0);
+  return child;
+}
+
+
+
+// Launches the router. Never throws; returns { ok, error?, mode?, status }.
+async function ensureRouterRunning(port, portExplicit = true) {
+  const detected = await detectReporterPort(port, portExplicit);
+  if (detected.detectedPort) {
+    routerTracker.pid = 0; routerTracker.state = 'running';
+    return { ok: true, already_running: true, detectedPort: detected.detectedPort };
+  }
+  if (routerTracker.pid && routerTracker.state === 'launching') {
+    return { ok: true, launching: true, detectedPort: 0 };
+  }
+  // Test hook: an explicit launcher command wins (fixed argv, no shell).
+  if (process.env.FREELLMAPI_CMD) {
+    const args = (process.env.FREELLMAPI_ARGS || '').split(/\s+/).filter(Boolean);
+    startRouterChild({ bin: process.env.FREELLMAPI_CMD, args, kind: 'custom' });
+    return { ok: true, mode: 'custom', state: 'launching', detectedPort: 0 };
+  }
+  const docker = dockerProbe();
+  const dir = routerComposeDir();
+  if (docker.daemon && dir) {
+    startRouterChild({ bin: docker.bin, args: ['compose', 'up', '-d'], kind: 'docker', cwd: dir });
+    log('Started FreeLLMAPI router via docker compose in ' + dir);
+    return { ok: true, mode: 'docker', state: 'launching', detectedPort: 0 };
+  }
+  if (docker.daemon && docker.container) {
+    // Installed but stopped container without a compose dir — start by name.
+    const name = docker.container.split(/\s+/)[0];
+    startRouterChild({ bin: docker.bin, args: ['start', name], kind: 'docker' });
+    log('Started FreeLLMAPI router container ' + name);
+    return { ok: true, mode: 'docker', state: 'launching', detectedPort: 0 };
+  }
+  const desktop = routerDesktopApp();
+  if (desktop) {
+    if (process.platform === 'darwin') startRouterChild({ bin: 'open', args: ['-a', desktop], kind: 'desktop' });
+    else startRouterChild({ bin: desktop, args: [], kind: 'desktop' });
+    log('Launched FreeLLMAPI desktop app: ' + desktop);
+    return { ok: true, mode: 'desktop', state: 'launching', detectedPort: 0 };
+  }
+  if (!docker.bin) {
+    return { ok: false, code: 'no_docker', error: 'FreeLLMAPI is not installed yet. ' + ROUTER_INSTALL_HINT };
+  }
+  if (!docker.daemon) {
+    return { ok: false, code: 'docker_down', error: 'Docker is installed but not running. Start Docker (Docker Desktop or the docker service), then press Start again.' };
+  }
+  return { ok: false, code: 'not_installed', error: 'FreeLLMAPI is not installed yet. ' + ROUTER_INSTALL_HINT };
+}
+
 // ------------------------------------------------------------------ local models folder
 // Locate the bundled Ollama binary (used to serve .gguf models from models/).
 function ollamaBin() {
@@ -1597,7 +1769,7 @@ const CORS = {
   'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
-const RESP_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', ...CORS };
+const RESP_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...CORS };
 
 // Defense-in-depth response headers applied to every reply, including proxied
 // streams. The UI is fully self-contained, so a strict CSP costs nothing.
@@ -2874,6 +3046,42 @@ async function handle(req, res) {
     return sendJSON(res, 200, { ok: true });
   }
 
+  // The FreeLLMAPI router row in the Cloud connection dialog runs entirely
+  // against loopback-only endpoints; the /api/cloud/* gate above already
+  // rejects every non-loopback request, so these can never be reached over a
+  // tunnel or remote deployment.
+  if (req.method === 'GET' && p === '/api/cloud/router/status') {
+    const parts = routerBaseParts();
+    // The row may display an unsaved Base-URL edit; the client passes its
+    // locally derived port so the probe matches what the user is typing.
+    const qPort = Number(url.searchParams.get('port') || '');
+    const probePort = Number.isInteger(qPort) && qPort >= 1 && qPort <= 65535 ? qPort : parts.port;
+    const probeExplicit = Boolean(url.searchParams.get('port')) || parts.portExplicit;
+    const detection = await detectReporterPort(probePort, probeExplicit);
+    const running = Boolean(detection.detectedPort);
+    routerTracker.state = running ? 'running' : (routerTracker.pid ? routerTracker.state : 'idle');
+    const docker = dockerProbe();
+    const desktop = routerDesktopApp();
+    return sendJSON(res, 200, {
+      host: parts.host, port: probePort, loopback: parts.loopback,
+      reachable: running, detectedPort: detection.detectedPort,
+      state: routerTracker.state, mode: routerTracker.mode || '',
+      platform: process.platform,
+      docker: { installed: Boolean(docker.bin || process.env.FREELLMAPI_CMD), daemon: docker.daemon, container: docker.container || '' },
+      installedVia: process.env.FREELLMAPI_CMD ? 'custom' : (docker.container ? 'container' : (routerComposeDir() ? 'compose' : (desktop ? 'desktop' : ''))),
+      desktopApp: Boolean(desktop),
+    });
+  }
+  if (req.method === 'POST' && p === '/api/cloud/router/start') {
+    const parts = routerBaseParts();
+    if (!parts.loopback) return sendJSON(res, 400, { error: 'Starting a router only makes sense for a local (loopback) base URL. Open the dashboard and start FreeLLMAPI manually for remote endpoints.' });
+    const result = await ensureRouterRunning(parts.port, parts.portExplicit);
+    if (!result.ok) return sendJSON(res, 500, { error: result.error, code: result.code || '' });
+    if (result.already_running) return sendJSON(res, 200, { ok: true, already_running: true, detectedPort: result.detectedPort });
+    if (result.launching) return sendJSON(res, 200, { ok: true, launching: true });
+    return sendJSON(res, 200, { ok: true, state: result.state, mode: result.mode, detectedPort: result.detectedPort });
+  }
+
   // ── Local model cockpit ─────────────────────────────────────────────────
   // This intentionally exposes only coarse local machine stats plus Ollama's
   // own running-model metadata; it never uploads machine or model information.
@@ -3987,6 +4195,16 @@ function openaiBase() {
   return (cfg.openaiBaseUrl || 'https://api.openai.com/v1').replace(/\/+$/, '');
 }
 
+// Join an OpenAI-style absolute path (/v1/...) to the configured base without
+// doubling the "/v1" suffix the base already carries (e.g. FreeLLMAPI's
+// http://localhost:3001/v1 or the default api.openai.com/v1).
+function openaiUrl(path) {
+  const base = openaiBase();
+  let sub = String(path || '').replace(/^\/+/, '');
+  if (sub.startsWith('v1/') && /\/v1$/.test(base)) sub = sub.slice(3);
+  return base + '/' + sub;
+}
+
 // Convert OpenAI chat-completions message list into Anthropic's wire format.
 function toAnthropicMessages(messages) {
   let system = '';
@@ -4038,7 +4256,7 @@ function mapProviderPath(path, method, body) {
   try { payload = body ? JSON.parse(body) : {}; } catch { payload = {}; }
 
   if (cfg.aiProvider === 'openai') {
-    const url = openaiBase() + path;
+    const url = openaiUrl(path);
     const headers = { 'Authorization': 'Bearer ' + (cfg.openaiApiKey || '') };
     if (openaiBase().includes('openrouter')) {
       headers['HTTP-Referer'] = 'http://localhost:5173';

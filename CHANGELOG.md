@@ -1,5 +1,43 @@
 # Changelog
 
+## 1.3.2 — FreeLLMAPI cloud connection
+
+- The **Cloud connection** dialog gains a **FreeLLMAPI (local router)** provider.
+  Point it at your router (base URL prefilled as `http://localhost:3001/v1`),
+  paste the unified `freellmapi-…` key from the router's Keys page, and keep the
+  model on `auto` so the router picks the smartest route for each request. The
+  connection wires through the OpenAI-compatible endpoint and the mock-verified
+  cloud plumbing (per-chat Data route still controls cloud vs. local sending).
+- Fixed a latent bug in the `/v1/*` proxy: base URLs that already end in `/v1`
+  (both `api.openai.com/v1` and any local router such as FreeLLMAPI) produced
+  doubled `/v1/v1/...` request paths. A new `openaiUrl()` helper strips the
+  leading segment correctly, so proxied model/upload/chat requests now reach the
+  target at the right path.
+- Fixed the Send button: `<button id="send">` creates a named `window.send`
+  global that shadows the app's real `send` function, so clicking the arrow in
+  cloud mode always threw `priorSend is not a function` (typing Enter worked,
+  which is why it went unnoticed). The agent wrapper now resolves the app's
+  send handler explicitly. The FreeLLMAPI end-to-end flow is covered by the
+  offline mock router tests.
+- While FreeLLMAPI is selected, the dialog shows a live **router status row**
+  (loopback base URLs only) plus a state-aware guidance panel:
+  Running links the dashboard and tells you exactly where the unified key lives
+  (Keys page); installed-but-stopped offers **Start router**; missing Docker /
+  stopped Docker / nothing installed each produce platform-correct next steps —
+  a download link to the desktop installer on Windows/macOS (which the app can
+  also launch itself once installed), or the copyable official one-liner
+  (`curl -fsSL https://freellmapi.co/install.sh | bash`) on Linux. The app never
+  downloads or executes anything by itself. The probe follows the Base URL
+  field as you type (via a `?port=` override), so the status always reflects
+  the address you're about to connect to, and the dialog copy now states
+  plainly that FreeLLMAPI is a *local router for cloud providers*: keys stay on
+  your machine, but messages still leave it. When cloud mode is on through a
+  loopback base URL, the **Cloud** button flips to a visible
+  "Cloud · router down" warning if the router stops answering, so silent
+  failures can't hide.
+  (The router itself is the Docker/desktop app — the npm package `freellmapi`
+  is only a coding-agent setup CLI and cannot serve the dashboard.)
+
 ## 1.3.1 — Long-chat compaction (auto + manual)
 
 - Long conversations can no longer overflow the local model's context window.
