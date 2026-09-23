@@ -144,6 +144,16 @@ await sleep(900);
 ok('status dialog offers a plain verdict', /not reachable|Everything is running|Cloud mode|Cannot reach/i.test(await ev("document.querySelector('#engine-kind')?.textContent || ''")));
 await ev("document.querySelector('#engine-close')?.click()");
 
+// ── Setup checklist on the welcome screen ────────────────────────────────────
+await sleep(1200);
+ok('setup checklist appears on empty chat', await ev("!!document.querySelector('.welcome .setup-card')"));
+const checklistText = await ev("document.querySelector('.welcome .setup-card')?.textContent || ''");
+ok('checklist flags the missing engine+model', /Start the local engine/i.test(checklistText) && /Install your first model/i.test(checklistText), checklistText.slice(0, 120));
+ok('checklist offers optional extras', /Optional/i.test(checklistText) && /FreeLLMAPI/i.test(checklistText));
+await ev("document.querySelector('.setup-card .setup-head .plain-btn')?.click()");
+await sleep(300);
+ok('checklist hides on demand', !(await ev("!!document.querySelector('.welcome .setup-card')")));
+
 // ── Voice guided setup (speech APIs were removed above) ─────────────────────
 await ev("window.__lastAlert=''; document.getElementById('mic-button').click()");
 await sleep(1200);

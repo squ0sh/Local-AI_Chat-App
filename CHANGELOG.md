@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.4.0 — Setup checklist on the welcome screen
+
+- A dismissible **Get set up** card now lives on the empty-chat welcome screen:
+  it checks the engine, models, vault backup, voice, image generation, and the
+  FreeLLMAPI cloud option live, ticks what's done, and turns everything else
+  into a one-click jump to its fix (model library, vault dialog, voice setup,
+  image mode, cloud dialog). Once the engine and a model are in place the card
+  stays quietly collapsed behind “Optional extras…”.
+- Welcome suggestion chips now match the selected model's abilities — vision
+  models get image prompts, coding models get code prompts, everyone else keeps
+  the classic starters.
+
 ## 1.3.5 — Durable UI probes + loose ends
 
 - New **`npm run ui-probe`**: a repeatable browser-level regression suite

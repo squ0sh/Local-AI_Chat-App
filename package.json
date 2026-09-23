@@ -1,6 +1,6 @@
 {
   "name": "local-chat",
-  "version": "1.3.5",
+  "version": "1.4.0",
   "description": "Local AI chat app + OpenAI-compatible API server for Ollama models, exposed locally or via a Cloudflare tunnel.",
   "type": "module",
   "main": "server.mjs",
