@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.3.4 — Guided feature setup everywhere
+
+- **Voice Mode onboards instead of alerting.** Tapping the mic without a model
+  drops the chat's model-install nudge; unsupported browsers open the Voice
+  overlay in a setup view that explains the one-time offline install and keeps
+  the Install button front and center — gone are the `WHISPER_CLI` env-var
+  alerts. The voice install itself is now a real progress bar with a friendly
+  failure message and a Retry button (used to be a terse monospace `%` and
+  "voice install failed.").
+- **Image mode matches.** The image-stack install shows the same progress bar
+  as model downloads, errors are humanized, and an empty gallery tells you
+  what to expect (“…once the image engine is installed”) or offers a one-tap
+  starter prompt once the form is live.
+- **Agent failures are recoverable.** The load-timeout message no longer names
+  a Retry action that didn't exist — a real **Retry** button now appears on
+  failed/timeout agent cards, and failure text goes through the shared
+  humanizer. Missing-model agent starts also trigger the model-install nudge.
+- **Remote dialog decluttered.** The chat link + QR carry the whole story for
+  normal use; the raw `API base` / `Access key` pair moved behind a collapsed
+  “Advanced” details, and the idle state actually tells you what Start does.
+
 ## 1.3.3 — No dead ends: guided first run, friendly errors, live status
 
 - **Sending without a model no longer dead-ends.** The chat shows a guidance

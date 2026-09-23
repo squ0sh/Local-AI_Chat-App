@@ -167,6 +167,8 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
     update.item=item; update.detail=detail; update.elements={mark,heading,detail,content,item};
     return update;
   }
+  // Attaches a real Retry action to a failed agent event card.
+  function attachAgentRetry(upd){if(!upd||!upd.elements)return;const b=document.createElement('button');b.className='plain-btn';b.style.cssText='margin-top:8px;padding:5px 10px;font-size:12px;border-color:var(--agent-green);color:var(--agent-green)';b.textContent='Retry';b.onclick=()=>{b.remove();runAgentTask(agentLoop.task||'',agentLoop.autonomy||'selective','',agentLoop.plan)};upd.elements.content.append(b)}
   async function json(path,options={}){const response=await fetch(path,options),result=await response.json().catch(()=>({}));if(!response.ok)throw Error(result.error||`Request failed (${response.status})`);return result}
   const trimContext=value=>String(value||'').slice(0,60000);
   const researchDialog=document.createElement('dialog');researchDialog.id='agent-research-dialog';researchDialog.innerHTML='<div class="settings"><h2>Deep Research <span class="agent-badge">local model</span></h2><p>Searches the web, reads public pages, follows linked sources, cross-checks claims, and writes a cited report with a cross-domain synthesis. Your question, source extracts, and report stay in this Capsule; internet access is required to retrieve sources.</p><label for="research-question">Research question</label><textarea id="research-question" rows="3" placeholder="What should I investigate?"></textarea><div class="research-mode-row"><label class="research-mode"><input type="radio" name="research-mode" value="quick" checked><div><b>Quick</b><span>1 round · up to 4 sources</span></div></label><label class="research-mode"><input type="radio" name="research-mode" value="deep"><div><b>Deep</b><span>3 rounds · 10 sources · follow links · fact-check</span></div></label><label class="research-mode"><input type="radio" name="research-mode" value="exhaustive"><div><b>Exhaustive</b><span>4 rounds · 20 sources · link hops · re-review</span></div></label></div><p class="research-offline-note">Research always uses the selected local Ollama model. Fast & light 1B models may struggle; an 8B-or-larger Agent-capable model is recommended for Deep and Exhaustive. A running study saves checkpoints so an interrupted run can be resumed.</p><pre id="research-status" class="notice research-status">Ready.</pre><div id="research-report" class="research-report" hidden></div><div id="research-sources" class="research-sources"></div><details id="research-saved"><summary>Saved reports</summary><div id="research-recent" class="research-recent">Loading…</div></details><div class="dialog-actions"><button type="button" class="plain-btn danger" id="research-cancel" hidden>Cancel</button><button type="button" class="plain-btn" id="research-export" hidden>Export Markdown</button><button type="button" class="plain-btn" id="research-continue" hidden>Continue in chat</button><button type="button" class="plain-btn" id="research-start">Start research</button><button type="button" class="plain-btn" id="research-close">Done</button></div></div>';document.body.append(researchDialog);
@@ -270,13 +272,13 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
     if(data.type==='approval_needed'){approveDialog(data.approval_id,data.name,data.arguments,data.kind,data.rule);return}
     if(data.type==='completed'){finalizer('success','agent complete',data.content||'');agentLoop.running=false;return}
     if(data.type==='cancelled'){finalizer('info','agent cancelled');agentLoop.running=false;agentLoop.plan=false;paintMode();return}
-    if(data.type==='error'){finalizer('error','agent error',data.message||data.error||'');agentLoop.running=false;agentLoop.plan=false;paintMode();return}
+    if(data.type==='error'){finalizer('error','agent error',window.humanizeErrorText?window.humanizeErrorText(data.message||data.error||''):(data.message||data.error||''));attachAgentRetry(finalizer);agentLoop.running=false;agentLoop.plan=false;paintMode();return}
     if(data.type==='loop_started'){agentLoop.loopId=data.loop_id;return}
-    if(data.type==='loop_complete'){agentLoop.running=false;agentLoop.plan=false;paintMode();if(data.status==='cancelled')finalizer('info','agent cancelled');else if(data.status==='error')finalizer('error','agent error',data.error);return}
+    if(data.type==='loop_complete'){agentLoop.running=false;agentLoop.plan=false;paintMode();if(data.status==='cancelled')finalizer('info','agent cancelled');else if(data.status==='error'){finalizer('error','agent error',window.humanizeErrorText?window.humanizeErrorText(data.error):data.error);attachAgentRetry(finalizer)}return}
   }
   async function runAgentTask(task,autonomy='selective',skillPrompt='',plan=null){
     if(agentLoop.running){appendEvent('error','agent already running','Stop or finish the current task first.');return}
-    if(!model.value){appendEvent('error','no model selected','Choose or install a model first.');return}
+    if(!model.value){appendEvent('error','no model selected','Choose or install a model first.');if(window.showModelNudge)window.showModelNudge();return}
     const isPlan=plan===null?agentMode()==='plan':plan===true;
     let chatId='',history=[];
     try{
@@ -327,8 +329,8 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
       }
       if(buffer.trim()){for(const line of buffer.split('\n')){if(line.startsWith('data: ')){try{handleAgentEvent(JSON.parse(line.slice(6)),finalizer)}catch{}}}}
     }catch(error){
-      if(timedOut)finalizer('error','model load timed out',`No first response from ${(model.value||'the local model').split('/').pop()} after 6 minutes (${new Date().toLocaleTimeString()}). It likely failed to start in the available memory — another model may still be resident. Pick the 1.9 GiB Llama-3.2-3B or Qwen3-4B model, then Retry.`);
-      else if(!controller.signal.aborted)finalizer('error','agent failed',error.message);
+      if(timedOut){finalizer('error','model load timed out',`No answer from ${(model.value||'the local model').split('/').pop()} within 6 minutes — it is probably too heavy for this machine right now. A smaller model (the 1.9 GB “Fast & light” pick) usually fixes this; install it from the Model library, then Retry.`);attachAgentRetry(finalizer)}
+      else if(!controller.signal.aborted){finalizer('error','agent failed',window.humanizeErrorText?window.humanizeErrorText(error.message):error.message);attachAgentRetry(finalizer)}
       agentLoop.running=false;
     }finally{
       clearInterval(watchdog);
@@ -661,7 +663,7 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
 
 
 
-(()=>{const b=document.createElement('button'),d=document.createElement('dialog');b.textContent='Remote';b.style.cssText='position:fixed;right:548px;bottom:27px;z-index:9;height:34px;border:1px solid var(--line);border-radius:9px;background:#162237;color:#a7bcff;padding:0 10px;font-size:12px;font-weight:700';d.innerHTML='<div class="settings"><h2>Capsule Remote</h2><p>Start a temporary private chat you can use away from home or share with someone you trust. Vaults, projects, cloud keys, and agent tools remain local-only.</p><div id="remote-qr" hidden style="width:220px;max-width:100%;margin:14px auto;padding:10px;border-radius:12px;background:#fff;line-height:0"><img alt="QR code for the complete Private chat link" style="display:block;width:100%;height:auto"></div><p id="remote-qr-help" class="privacy" hidden style="text-align:center">Scan with a phone camera to open the complete private link.</p><pre id="remote-details" class="code-wrap" style="padding:10px">Remote is off.</pre><div class="dialog-actions"><button class="plain-btn" id="remote-copy" hidden>Copy chat link</button><button class="plain-btn" id="remote-start">Start Remote</button><button class="plain-btn danger" id="remote-stop">Stop</button><button class="plain-btn" id="remote-close">Done</button></div></div>';document.body.append(b,d);const details=d.querySelector('#remote-details'),copyButton=d.querySelector('#remote-copy'),qrBox=d.querySelector('#remote-qr'),qrHelp=d.querySelector('#remote-qr-help'),qrImage=qrBox.querySelector('img'),headers=()=>{const t=localStorage.getItem('lc.token');return t?{Authorization:'Bearer '+t}:{}};let pollTimer=0,pollUntil=0,chatUrl='',qrUrl='';const stopPolling=()=>{if(pollTimer)clearTimeout(pollTimer);pollTimer=0};const hideQr=()=>{qrBox.hidden=true;qrHelp.hidden=true;qrImage.removeAttribute('src');qrUrl=''};const showQr=url=>{if(qrUrl!==url){qrUrl=url;qrImage.src='/api/remote/qr?v='+Date.now()}qrBox.hidden=false;qrHelp.hidden=false};const scheduleStatus=()=>{stopPolling();if(Date.now()<pollUntil)pollTimer=setTimeout(status,1000)};async function status(){try{const r=await fetch('/api/remote/status',{headers:headers()}),j=await r.json();if(!r.ok)throw Error(j.error||'Could not read Remote status');b.textContent=j.active?'Remote on':'Remote';if(j.active&&j.url){chatUrl=j.url+'/remote/'+encodeURIComponent(j.token);copyButton.hidden=false;showQr(chatUrl);details.textContent=`Private chat link:\n${chatUrl}\n\nAPI base: ${j.api_url}\nAccess key: ${j.token}\n\nAnyone with the chat link can use your local model until you stop Remote or it expires after two hours.`;stopPolling();return}chatUrl='';copyButton.hidden=true;hideQr();details.textContent=j.active?'Starting tunnel… waiting for its public address.':'Remote is off.';if(j.active){if(Date.now()>=pollUntil)pollUntil=Date.now()+60000;scheduleStatus()}else stopPolling()}catch(error){hideQr();details.textContent=window.humanizeErrorText?window.humanizeErrorText(error.message):('Remote error: '+error.message);stopPolling()}}b.onclick=async()=>{d.showModal();await status()};copyButton.onclick=async()=>{if(!chatUrl)return;try{await navigator.clipboard.writeText(chatUrl);copyButton.textContent='Copied';setTimeout(()=>copyButton.textContent='Copy chat link',1200)}catch{details.textContent+='\n\nCopy failed. Select and copy the complete Private chat link above.'}};d.querySelector('#remote-start').onclick=async()=>{stopPolling();hideQr();details.textContent='Starting tunnel…';try{const r=await fetch('/api/remote/start',{method:'POST'}),j=await r.json();if(!r.ok)throw Error(j.error||'Could not start Remote');if(!j.token)throw Error('Remote did not return an access key');localStorage.setItem('lc.token',j.token);pollUntil=Date.now()+60000;await status()}catch(error){details.textContent=window.humanizeErrorText?window.humanizeErrorText(error.message):('Remote could not start: '+error.message)}};d.querySelector('#remote-stop').onclick=async()=>{stopPolling();hideQr();await fetch('/api/remote/stop',{method:'POST',headers:headers()});localStorage.removeItem('lc.token');await status()};d.querySelector('#remote-close').onclick=()=>d.close();status();setInterval(()=>{status().catch(()=>{})},30000)})();
+(()=>{const b=document.createElement('button'),d=document.createElement('dialog');b.textContent='Remote';b.style.cssText='position:fixed;right:548px;bottom:27px;z-index:9;height:34px;border:1px solid var(--line);border-radius:9px;background:#162237;color:#a7bcff;padding:0 10px;font-size:12px;font-weight:700';d.innerHTML='<div class="settings"><h2>Capsule Remote</h2><p>Start a temporary private chat you can use away from home or share with someone you trust. Vaults, projects, cloud keys, and agent tools remain local-only.</p><div id="remote-qr" hidden style="width:220px;max-width:100%;margin:14px auto;padding:10px;border-radius:12px;background:#fff;line-height:0"><img alt="QR code for the complete Private chat link" style="display:block;width:100%;height:auto"></div><p id="remote-qr-help" class="privacy" hidden style="text-align:center">Scan with a phone camera to open the complete private link.</p><pre id="remote-details" class="code-wrap" style="padding:10px">Remote is off.</pre><details id="remote-advanced" hidden style="margin-top:10px"><summary style="cursor:pointer;color:var(--muted);font-size:11px">Advanced: connect other tools to this session</summary><pre id="remote-advanced-body" class="code-wrap" style="padding:10px;margin-top:8px"></pre></details><div class="dialog-actions"><button class="plain-btn" id="remote-copy" hidden>Copy chat link</button><button class="plain-btn" id="remote-start">Start Remote</button><button class="plain-btn danger" id="remote-stop">Stop</button><button class="plain-btn" id="remote-close">Done</button></div></div>';document.body.append(b,d);const details=d.querySelector('#remote-details'),adv=d.querySelector('#remote-advanced'),advBody=d.querySelector('#remote-advanced-body'),copyButton=d.querySelector('#remote-copy'),qrBox=d.querySelector('#remote-qr'),qrHelp=d.querySelector('#remote-qr-help'),qrImage=qrBox.querySelector('img'),headers=()=>{const t=localStorage.getItem('lc.token');return t?{Authorization:'Bearer '+t}:{}};let pollTimer=0,pollUntil=0,chatUrl='',qrUrl='';const stopPolling=()=>{if(pollTimer)clearTimeout(pollTimer);pollTimer=0};const hideQr=()=>{qrBox.hidden=true;qrHelp.hidden=true;qrImage.removeAttribute('src');qrUrl=''};const showQr=url=>{if(qrUrl!==url){qrUrl=url;qrImage.src='/api/remote/qr?v='+Date.now()}qrBox.hidden=false;qrHelp.hidden=false};const scheduleStatus=()=>{stopPolling();if(Date.now()<pollUntil)pollTimer=setTimeout(status,1000)};async function status(){try{const r=await fetch('/api/remote/status',{headers:headers()}),j=await r.json();if(!r.ok)throw Error(j.error||'Could not read Remote status');b.textContent=j.active?'Remote on':'Remote';if(j.active&&j.url){chatUrl=j.url+'/remote/'+encodeURIComponent(j.token);copyButton.hidden=false;showQr(chatUrl);details.textContent=`Share this private chat link:\n${chatUrl}\n\nAnyone with the link can chat with your local model until you press Stop or the link expires after two hours.`;adv.hidden=false;advBody.textContent=`API base: ${j.api_url}\nAccess key: ${j.token}\n\nFor tools that support an OpenAI-compatible base URL.`;stopPolling();return}chatUrl='';copyButton.hidden=true;hideQr();adv.hidden=true;details.textContent=j.active?'Creating the private link… waiting for its public address.':'Remote is off. Start it to get a shareable link and QR code.';if(j.active){if(Date.now()>=pollUntil)pollUntil=Date.now()+60000;scheduleStatus()}else stopPolling()}catch(error){hideQr();details.textContent=window.humanizeErrorText?window.humanizeErrorText(error.message):('Remote error: '+error.message);stopPolling()}}b.onclick=async()=>{d.showModal();await status()};copyButton.onclick=async()=>{if(!chatUrl)return;try{await navigator.clipboard.writeText(chatUrl);copyButton.textContent='Copied';setTimeout(()=>copyButton.textContent='Copy chat link',1200)}catch{details.textContent+='\n\nCopy failed. Select and copy the complete Private chat link above.'}};d.querySelector('#remote-start').onclick=async()=>{stopPolling();hideQr();details.textContent='Creating a private link… this can take up to a minute. The link stops working on its own after two hours.';try{const r=await fetch('/api/remote/start',{method:'POST'}),j=await r.json();if(!r.ok)throw Error(j.error||'Could not start Remote');if(!j.token)throw Error('Remote did not return an access key');localStorage.setItem('lc.token',j.token);pollUntil=Date.now()+60000;await status()}catch(error){details.textContent=window.humanizeErrorText?window.humanizeErrorText(error.message):('Remote could not start: '+error.message)}};d.querySelector('#remote-stop').onclick=async()=>{stopPolling();hideQr();await fetch('/api/remote/stop',{method:'POST',headers:headers()});localStorage.removeItem('lc.token');await status()};d.querySelector('#remote-close').onclick=()=>d.close();status();setInterval(()=>{status().catch(()=>{})},30000)})();
 
 
 
@@ -701,12 +703,14 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
     .voice-engine-pill{color:var(--muted);font:10px var(--mono);text-align:center}
     .voice-brain-pill{display:inline-flex;align-items:center;gap:8px;padding:7px 14px;border:1px solid var(--line);border-radius:999px;background:var(--panel2);color:var(--text);font:12px var(--mono);cursor:pointer}.voice-brain-pill:hover{border-color:var(--blue)}.voice-brain-pill i{width:8px;height:8px;border-radius:50%;background:var(--blue2);display:inline-block}.voice-brain-pill.agent i{background:var(--agent-green)}.voice-brain-pill.plan i{background:#ffd27d}
     .voice-call-button.voice-install{width:auto;border-radius:999px;padding:0 13px;border-color:var(--blue);color:var(--blue2);font-size:11px}
+    .voice-progress{order:99;flex-basis:100%;height:5px;border-radius:99px;background:#242d3e;overflow:hidden;margin-top:8px}.voice-progress>div{height:100%;width:0;background:var(--blue2);transition:width .3s}
+    .voice-mode[data-state="setup"] .voice-orb{opacity:.35;filter:grayscale(1)}
     .voice-kokoro-opt{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font:11px var(--mono);cursor:pointer;user-select:none}.voice-kokoro-opt input{accent-color:var(--blue2)}.voice-kokoro-opt[hidden]{display:none}
     @keyframes voice-pulse{0%{transform:scale(.86);opacity:.65}100%{transform:scale(1.18);opacity:0}}@keyframes voice-think{50%{transform:scale(.92)}}@keyframes voice-speak{to{transform:scale(1.06)}}@media(max-width:600px){.voice-mode{padding:0}.voice-mode-card{min-height:100dvh;border:0;border-radius:0;padding:22px 18px}.voice-orb{width:150px;height:150px}}@media(prefers-reduced-motion:reduce){.voice-orb,.voice-orb::before,.voice-orb::after{animation:none!important}}
   `;document.head.append(style);
   const pill=document.createElement('span');pill.className='voice-live-pill';pill.setAttribute('role','status');pill.setAttribute('aria-live','polite');foot.prepend(pill);
-  const overlay=document.createElement('section');overlay.className='voice-mode';overlay.hidden=true;overlay.dataset.state='idle';overlay.dataset.muted='false';overlay.setAttribute('role','dialog');overlay.setAttribute('aria-modal','true');overlay.setAttribute('aria-label','Voice Mode');overlay.innerHTML='<div class="voice-mode-card"><div class="voice-mode-head"><span class="voice-mode-title">Voice Mode</span><span class="voice-mode-model"></span></div><div class="voice-mode-stage"><button class="voice-orb" type="button" aria-label="Pause or resume listening"></button><div class="voice-state" role="status" aria-live="polite">Ready</div><div class="voice-hint">A spoken conversation with your selected local model</div><div class="voice-transcript" aria-live="polite"></div></div><div class="voice-mode-actions"><div><button class="voice-call-button voice-mute" type="button" aria-label="Mute microphone">🎙</button><span class="voice-call-label">Mute</span></div><button class="voice-call-button end" type="button">End voice</button></div><div class="voice-mode-footer"><div class="voice-engine-pill">checking voice engines…</div><button class="voice-call-button voice-install" type="button" hidden>⬇ Install offline voice</button><label class="voice-kokoro-opt" hidden><input class="voice-kokoro-check" type="checkbox">+ Kokoro voice</label><button class="voice-brain-pill" type="button"><i></i><span>chat</span></button></div></div>';document.body.append(overlay);
-  const orb=overlay.querySelector('.voice-orb'),stateText=overlay.querySelector('.voice-state'),hint=overlay.querySelector('.voice-hint'),transcript=overlay.querySelector('.voice-transcript'),modelText=overlay.querySelector('.voice-mode-model'),mute=overlay.querySelector('.voice-mute'),end=overlay.querySelector('.end'),engineLine=overlay.querySelector('.voice-engine-pill'),installBtn=overlay.querySelector('.voice-install'),kokoroCheck=overlay.querySelector('.voice-kokoro-check'),brainPill=overlay.querySelector('.voice-brain-pill');
+  const overlay=document.createElement('section');overlay.className='voice-mode';overlay.hidden=true;overlay.dataset.state='idle';overlay.dataset.muted='false';overlay.setAttribute('role','dialog');overlay.setAttribute('aria-modal','true');overlay.setAttribute('aria-label','Voice Mode');overlay.innerHTML='<div class="voice-mode-card"><div class="voice-mode-head"><span class="voice-mode-title">Voice Mode</span><span class="voice-mode-model"></span></div><div class="voice-mode-stage"><button class="voice-orb" type="button" aria-label="Pause or resume listening"></button><div class="voice-state" role="status" aria-live="polite">Ready</div><div class="voice-hint">A spoken conversation with your selected local model</div><div class="voice-transcript" aria-live="polite"></div></div><div class="voice-mode-actions"><div><button class="voice-call-button voice-mute" type="button" aria-label="Mute microphone">🎙</button><span class="voice-call-label">Mute</span></div><button class="voice-call-button end" type="button">End voice</button></div><div class="voice-mode-footer"><div class="voice-engine-pill">checking voice engines…</div><button class="voice-call-button voice-install" type="button" hidden>⬇ Install offline voice</button><label class="voice-kokoro-opt" hidden><input class="voice-kokoro-check" type="checkbox">+ Kokoro voice</label><button class="voice-brain-pill" type="button"><i></i><span>chat</span></button><div class="voice-progress" hidden><div></div></div></div></div>';document.body.append(overlay);
+  const orb=overlay.querySelector('.voice-orb'),stateText=overlay.querySelector('.voice-state'),hint=overlay.querySelector('.voice-hint'),transcript=overlay.querySelector('.voice-transcript'),modelText=overlay.querySelector('.voice-mode-model'),mute=overlay.querySelector('.voice-mute'),end=overlay.querySelector('.end'),engineLine=overlay.querySelector('.voice-engine-pill'),installBtn=overlay.querySelector('.voice-install'),kokoroCheck=overlay.querySelector('.voice-kokoro-check'),brainPill=overlay.querySelector('.voice-brain-pill'),voiceProgress=overlay.querySelector('.voice-progress');
   let active=false,muted=false,recognition=null,waiting=false,speaking=false,restartTimer=0,wakeLock=null,session=0,previousOverflow='';
   let brain='chat',engines={whisper:false,piper:false,kokoro:false,installing:false},enginesFetched=false;
   let expectingDecision=null,pendingApproval=null,pendingHandoff=null,speakQueue=[],speakingChunk=false,streamBuf='',leadSpoken=false,streamedThisRun=false,chatAgentDisabled=false;
@@ -777,7 +781,7 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
   function startListening(){
     clearRestart();if(!active||muted||waiting||speaking)return;
     if(engines.whisper&&navigator.mediaDevices?.getUserMedia&&window.MediaRecorder){startRecorderListen();return}
-    if(!Recognition){if(engines.whisper){startRecorderListen();return}stopVoice('Speech input unavailable');alert('Voice Mode speech input is not available in this browser. You can still type and use Read aloud.');return}
+    if(!Recognition){if(engines.whisper){startRecorderListen();return}stopVoice('Speech input unavailable');openVoiceSetup();return}
     try{
       recognition=new Recognition();recognition.lang=navigator.language||'en-US';recognition.interimResults=true;recognition.continuous=false;recognition.maxAlternatives=1;
       recognition.onstart=()=>{if(active&&!muted){mic.classList.add('recording');setState('listening','Listening',expectingDecision!=null?'Say yes or no':'')}};
@@ -861,24 +865,28 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
   function bytesToBase64(buf){const b=new Uint8Array(buf);let s='';for(let i=0;i<b.length;i+=0x8000)s+=String.fromCharCode(...b.subarray(i,i+0x8000));return btoa(s)}
   function pollInstall(){
     clearInterval(installTimer);
+    voiceProgress.hidden=false;
     installTimer=setInterval(()=>{
       fetch('/api/speech/install').then(r=>r.json()).then(s=>{
         const pct=s.total?Math.round(s.downloaded/s.total*100):-1;
-        engineLine.textContent=`voice · ${s.status||'installing'}${s.current?` · ${s.current}`:''}${pct>=0?` · ${pct}%`:''}`;
-        if(s.status==='ready'){clearInterval(installTimer);installTimer=0;refreshEngines();queueSpeech('Offline voice engines are installed.',{cut:true});return}
-        if(s.status==='error'){clearInterval(installTimer);installTimer=0;refreshEngines();engineLine.textContent='voice install failed.';}
+        if(pct>=0)voiceProgress.firstElementChild.style.width=pct+'%';
+        engineLine.textContent=`installing voice${s.current?` · ${s.current}`:''}${pct>=0?` · ${pct}%`:''}`;
+        if(s.status==='ready'){clearInterval(installTimer);installTimer=0;voiceProgress.firstElementChild.style.width='100%';refreshEngines();if(overlay.dataset.state==='setup'){stateText.textContent='Voice is ready';hint.textContent='Close this and tap the mic to start talking.';engineLine.textContent='✓ offline voice ready';installBtn.hidden=true;setTimeout(()=>{voiceProgress.hidden=true},1500)}else{engineLine.textContent='✓ offline voice ready';queueSpeech('Offline voice engines are installed.',{cut:true});setTimeout(()=>{voiceProgress.hidden=true},1500)}return}
+        if(s.status==='error'){clearInterval(installTimer);installTimer=0;voiceProgress.hidden=true;refreshEngines();engineLine.textContent=window.humanizeErrorText?window.humanizeErrorText(s.error||'install failed'):'voice install failed — check the network and try again';installBtn.hidden=false;installBtn.textContent='Retry install';kokoroCheck.disabled=false;}
       }).catch(()=>{});
     },600);
   }
   function installVoices(){
     if(engines.installing)return;
     kokoroCheck.disabled=true;
-    engineLine.textContent='voice · starting install…';
+    installBtn.hidden=true;
+    voiceProgress.hidden=false;voiceProgress.firstElementChild.style.width='2%';
+    engineLine.textContent='starting voice install…';
     const kokoro=!engines.piper&&kokoroCheck.checked;
     fetch('/api/speech/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kokoro})}).then(r=>r.json()).then(j=>{
-      if(!j.ok){kokoroCheck.disabled=false;engineLine.textContent='voice · install could not start'+(j.error?' · '+j.error:'');refreshEngines();return}
+      if(!j.ok){kokoroCheck.disabled=false;installBtn.hidden=false;voiceProgress.hidden=true;engineLine.textContent=window.humanizeErrorText?window.humanizeErrorText(j.error||'install could not start'):('voice · install could not start'+(j.error?' · '+j.error:''));refreshEngines();return}
       pollInstall();
-    }).catch(()=>{kokoroCheck.disabled=false;engineLine.textContent='voice · install unavailable';refreshEngines()});
+    }).catch(()=>{kokoroCheck.disabled=false;installBtn.hidden=false;voiceProgress.hidden=true;engineLine.textContent='Could not reach the app — check that it is still running, then retry.';refreshEngines()});
   }
   window.__voiceAgentFeed=data=>{
     if(!active)return;
@@ -926,10 +934,11 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
     try{recognition?.abort()}catch{}recognition=null;releaseWake();overlay.hidden=true;overlay.dataset.muted='false';document.body.style.overflow=previousOverflow;mic.classList.remove('voice-live','recording');mic.setAttribute('aria-pressed','false');mic.title='Start Voice Mode';mic.setAttribute('aria-label','Start Voice Mode');pill.textContent=message;setTimeout(()=>{if(!active)pill.className='voice-live-pill'},1300);
   }
   function toggleMute(){if(!active)return;muted=!muted;overlay.dataset.muted=String(muted);mute.textContent=muted?'🔇':'🎙';mute.setAttribute('aria-label',muted?'Unmute microphone':'Mute microphone');mute.nextElementSibling.textContent=muted?'Unmute':'Mute';if(muted){clearRestart();try{recognition?.abort()}catch{}recognition=null;clearRecorderListen();setState('muted','Muted')}else{setState('listening','Listening');scheduleListen(100)}}
+  function openVoiceSetup(){overlay.hidden=false;previousOverflow=document.body.style.overflow;document.body.style.overflow='hidden';overlay.dataset.state='setup';overlay.dataset.muted='true';stateText.textContent='Voice needs a one-time setup';hint.textContent='Install the free offline voice engines below — after that, voice runs fully on this machine. (A Chromium-based browser also works without any install.)';transcript.textContent='';engineLine.textContent='checking voice engines…';refreshEngines();end.focus()}
   async function startVoice(){
-    const selected=document.getElementById('model-select')?.value;if(!selected){alert('Choose or install a model before starting Voice Mode.');return}if(send.disabled){alert('Wait for the current response to finish, then start Voice Mode.');return}
+    const selected=document.getElementById('model-select')?.value;if(!selected){if(window.showModelNudge)window.showModelNudge();return}if(send.disabled){pill.className='voice-live-pill on';pill.textContent='finishing the current reply — tap the mic again when it’s done';setTimeout(()=>{if(!active)pill.className='voice-live-pill'},3000);return}
     await refreshEngines();
-    if(!Recognition&&!engines.whisper){alert('Voice Mode speech input is not available in this browser. Install whisper.cpp (set WHISPER_CLI and WHISPER_MODEL) or use a Chromium-based browser that supports speech input.');return}if(!window.speechSynthesis&&!engines.piper){alert('Spoken output is not available in this browser.');return}
+    if((!Recognition&&!engines.whisper)||(!window.speechSynthesis&&!engines.piper)){openVoiceSetup();return}
     brain=agentEnabled()?agentModeValue():'chat';renderVoiceFooter();
     active=true;muted=false;session+=1;waiting=false;speaking=false;expectingDecision=null;pendingApproval=null;pendingHandoff=null;transcript.textContent='';resetLead();modelText.textContent=selected;modelText.title=selected;overlay.hidden=false;overlay.dataset.muted='false';previousOverflow=document.body.style.overflow;document.body.style.overflow='hidden';setState('listening','Requesting microphone…');await holdWake();try{window.speechSynthesis.cancel()}catch{}const warmup=new SpeechSynthesisUtterance('');warmup.volume=0;window.speechSynthesis.speak(warmup);startListening();end.focus();
   }
@@ -1393,6 +1402,8 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
     install:document.getElementById('img-install'),
     installBtn:document.getElementById('img-install-btn'),
     installProgress:document.getElementById('img-install-progress'),
+    installBar:document.getElementById('img-install-bar'),
+    installFill:document.getElementById('img-install-fill'),
     form:document.getElementById('img-form'),
     prompt:document.getElementById('img-prompt'),
     size:document.getElementById('img-size'),
@@ -1443,7 +1454,7 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
   function renderGallery(images){
     files=images;
     el.galleryCount.textContent=images.length?`${images.length} job${images.length>1?'s':''}`:'';
-    if (!images.length){el.gallery.innerHTML='<p class="img-hint">Generated images will appear here.</p>';return}
+    if (!images.length){el.gallery.innerHTML='<p class="img-hint">'+(el.form&&!el.form.hidden?'No images yet — everything you make stays on this computer. Try a starter prompt:':'Generated images will appear here once the image engine is installed.')+'</p>';if(el.form&&!el.form.hidden){const starter=document.createElement('button');starter.className='plain-btn';starter.style.cssText='font-size:12px;padding:6px 10px';starter.textContent='“A tiny red fox sitting in the snow, cute cartoon render”';starter.onclick=()=>{el.prompt.value='A tiny red fox sitting in the snow, cute cartoon render';el.prompt.scrollIntoView({behavior:'smooth',block:'center'});el.prompt.focus()};el.gallery.append(starter)}return}
     el.gallery.innerHTML=images.map(job=>{
       const thumbs=(job.images||[]).map((f,i)=>`<img class="img-thumb" src="${fileUrl(job.id,i)}" alt="" loading="lazy" data-id="${encodeURIComponent(job.id)}" data-i="${i}">`).join('');
       const meta=jobMeta(job);
@@ -1469,6 +1480,7 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
         el.installProgress.hidden=false;
         const total=s.install.total||0,pct=total?Math.round(100*s.install.downloaded/total):0;
         el.installProgress.textContent=`Installing ${esc(s.install.current||'image stack')}… ${pct}% (${(s.install.downloaded/1e9).toFixed(2)} / ${(total/1e9).toFixed(2)} GB)`;
+        if(el.installBar){el.installBar.hidden=false;el.installFill.style.width=pct+'%'}
         poll(1500);
       } else if (s.installed){
         el.install.hidden=true;el.form.hidden=false;
@@ -1488,18 +1500,22 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
         renderGallery(images);
       } else if (s.install&&s.install.status==='error'){
         el.install.hidden=false;el.form.hidden=true;el.installBtn.hidden=false;el.installBtn.disabled=false;
-        el.installProgress.hidden=false;el.installProgress.textContent='Install failed: '+(s.install.error||'unknown error');
+        el.installProgress.hidden=false;el.installProgress.textContent=window.humanizeErrorText?window.humanizeErrorText(s.install.error||'install failed'):('Install failed: '+(s.install.error||'unknown error'));
+        if(el.installBar){el.installBar.hidden=true;el.installFill.style.width='0'}
+        renderGallery((await api('/api/image/files').catch(()=>({images:[]}))).images||[]);
       } else {
         el.install.hidden=false;el.form.hidden=true;el.installBtn.hidden=false;el.installBtn.disabled=false;
         el.installProgress.hidden=true;el.installProgress.textContent='';
+        if(el.installBar){el.installBar.hidden=true;el.installFill.style.width='0'}
+        renderGallery((await api('/api/image/files').catch(()=>({images:[]}))).images||[]);
       }
-    }catch(e){el.status.textContent='Image status unavailable: '+e.message}
+    }catch(e){el.status.textContent=window.humanizeErrorText?window.humanizeErrorText(e.message):('Image status unavailable: '+e.message)}
   }
   el.installBtn.onclick=async()=>{
     if (el.installBtn.disabled)return;
     el.installBtn.disabled=true;el.installProgress.hidden=false;el.installProgress.textContent='Starting install…';
     try{await api('/api/image/install',{method:'POST'});poll(1500)}
-    catch(e){el.installProgress.textContent=e.message;el.installBtn.disabled=false}
+    catch(e){el.installProgress.textContent=window.humanizeErrorText?window.humanizeErrorText(e.message):e.message;el.installBtn.disabled=false}
   };
   el.generate.onclick=async()=>{
     if (el.generate.disabled)return;
@@ -1509,9 +1525,9 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
       el.output.innerHTML='<p class="img-hint">Starting generation…</p>';
       await api('/api/image/generate',{method:'POST',body:JSON.stringify({prompt:el.prompt.value,width:sizeValue(),height:sizeValue()})});
       poll(1000);
-    }catch(e){el.generate.disabled=false;el.abort.hidden=true;el.progressText.textContent=e.message;el.progress.hidden=false}
+    }catch(e){el.generate.disabled=false;el.abort.hidden=true;el.progressText.textContent=window.humanizeErrorText?window.humanizeErrorText(e.message):e.message;el.progress.hidden=false}
   };
-  el.abort.onclick=async()=>{try{await api('/api/image/abort',{method:'POST'});poll(1000)}catch(e){el.progressText.textContent=e.message;el.progress.hidden=false}};
+  el.abort.onclick=async()=>{try{await api('/api/image/abort',{method:'POST'});poll(1000)}catch(e){el.progressText.textContent=window.humanizeErrorText?window.humanizeErrorText(e.message):e.message;el.progress.hidden=false}};
   lbDel.onclick=async()=>{
     if (!lbId)return;
     try{
