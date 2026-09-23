@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.5.0 — USB installer: the whole Capsule onto a stick, no copying by hand
+
+- The Pack dialog gains a **“Copy everything to a USB drive”** section: it
+  lists detected removable drives with free space and filesystem, sizes every
+  payload live (models / voice / image / private data / per-platform
+  runtimes), and builds a verified, ready-to-run kit at `capsule/` on the
+  stick. FAT32 (>4 GB file) and `noexec` mounts are flagged before you start,
+  free-space is preflighted, the copy streams with truthful progress, can be
+  cancelled, and ends with a byte-for-byte verification pass plus a
+  “what to run on the other machine” card (`bash start-portable.sh` /
+  `start-portable.cmd`).
+- **Privacy-by-default payload:** chats, vault, and cloud keys are never
+  copied unless you explicitly tick them (with a visible why-not). Models,
+  voice, and image engines are shown with their real sizes so you can fit the
+  kit to the stick. A “Skip runtimes” choice leaves the stick to re-download
+  its runtime on first boot — handy for small drives.
+- Server side, everything rides the existing loopback-only `/api/portable/`
+  gate as cancellable job endpoints (`usb-targets`, `usb-plan`,
+  `usb-copy` GET/POST/DELETE) with the same storage/preflight primitives the
+  model installer uses; arbitrary paths are refused — only enumerated
+  removable drives are valid targets.
+
 ## 1.4.0 — Setup checklist on the welcome screen
 
 - A dismissible **Get set up** card now lives on the empty-chat welcome screen:

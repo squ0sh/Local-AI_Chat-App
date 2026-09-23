@@ -55,6 +55,7 @@ const cdpPort = await freePort();
 const routerPort = await freePort();
 const dataDir = mkdtempSync(join(tmpdir(), 'ui-probe-data-'));
 const profileDir = mkdtempSync(join(tmpdir(), 'ui-probe-chrome-'));
+const stickDir = mkdtempSync(join(tmpdir(), 'ui-probe-stick-'));
 
 // A minimal FreeLLMAPI-shaped mock so the router row has something to see.
 const mockRouter = createServer((req, res) => {
@@ -65,7 +66,7 @@ await new Promise((resolve) => mockRouter.listen(routerPort, '127.0.0.1', resolv
 
 const server = spawn(process.execPath, ['server.mjs', '--mode', 'local', '--host', '127.0.0.1', '--port', String(appPort)], {
   cwd: repoRoot,
-  env: { ...process.env, LOCAL_AI_DATA_DIR: dataDir, OLLAMA_URL: 'http://127.0.0.1:1' },
+  env: { ...process.env, LOCAL_AI_DATA_DIR: dataDir, OLLAMA_URL: 'http://127.0.0.1:1', LOCAL_AI_USB_SCAN_ROOTS: stickDir },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 let serverLog = '';
@@ -85,6 +86,7 @@ const cleanup = (code) => {
   try { mockRouter.close(); } catch {}
   rmSync(dataDir, { recursive: true, force: true });
   rmSync(profileDir, { recursive: true, force: true });
+  rmSync(stickDir, { recursive: true, force: true });
   process.exit(code);
 };
 process.on('SIGINT', () => cleanup(130));
@@ -188,6 +190,25 @@ await sleep(900);
 ok('remote idle copy says what Start does', /Start it to get a shareable link/i.test(await ev("document.getElementById('remote-details').textContent")));
 ok('advanced internals folded away while idle', (await ev("!!document.getElementById('remote-advanced')")) && (await ev("document.getElementById('remote-advanced').hidden")));
 await ev("document.querySelector('#remote-close')?.click()");
+
+// ── USB kit builder in the Pack dialog ───────────────────────────────────────
+await ev("document.getElementById('portable-launch').click()");
+await sleep(2000);
+ok('usb block renders in Pack dialog', await ev("!!document.querySelector('.usb-block')"));
+ok('detected drive listed', await ev("[...document.querySelectorAll('.usb-drive')].length === 1"));
+await ev("document.querySelector('.usb-drive input')?.click()");
+await sleep(1500);
+ok('payload options render after selecting a drive', await ev("[...document.querySelectorAll('[data-usb-opt]')].length >= 5"));
+ok('size estimate shown', /Kit size ≈/.test(await ev("document.querySelector('#usb-status')?.textContent || ''")));
+ok('private data is off by default', await ev("[...document.querySelectorAll('[data-usb-opt]')].find(x=>x.dataset.usbOpt==='data')?.checked === false"));
+// Keep the probe fast: app files only (runtimes off → target self-heals them).
+await ev("(() => { for (const k of ['runtimes','models']) { const el=document.querySelector(`[data-usb-opt='${k}']`); if (el && el.checked) { el.checked=false; el.dispatchEvent(new Event('change')); } } })()");
+await ev("document.getElementById('usb-start').click()");
+await sleep(1500);
+let done = false;
+for (let i = 0; i < 60; i++) { const t = await ev("document.querySelector('#usb-status')?.textContent || ''"); if (/Done —/.test(t)) { done = true; break; } if (/failed|error/i.test(t)) break; await sleep(700); }
+ok('usb kit copied + verified', done, await ev("document.querySelector('#usb-status')?.textContent || ''"));
+await ev("document.querySelector('#portable-close')?.click()");
 
 // ── FreeLLMAPI row against the local mock ────────────────────────────────────
 await ev("document.getElementById('cloud-launch').click()");

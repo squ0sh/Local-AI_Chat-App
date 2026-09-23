@@ -23,7 +23,7 @@ import { totalmem, freemem, cpus, loadavg, homedir, networkInterfaces } from 'os
 import { performance } from 'node:perf_hooks';
 import { randomBytes, createHash } from 'crypto';
 import qrcode from './lib/vendor/qrcode-generator.mjs';
-import { portableIntegrityReport, rebuildManifest, repairReleaseFiles } from './lib/capsule-integrity.mjs';
+import { portableIntegrityReport, rebuildManifest, repairReleaseFiles, releaseTrackedPaths } from './lib/capsule-integrity.mjs';
 import { sealVault, openVault } from './lib/capsule-vault.mjs';
 import { ResearchEngine } from './lib/research-engine.mjs';
 import { pullOllamaModel } from './lib/resumable-ollama-pull.mjs';
@@ -1488,7 +1488,242 @@ async function ensureRouterRunning(port, portExplicit = true) {
   return { ok: false, code: 'not_installed', error: 'FreeLLMAPI is not installed yet. ' + ROUTER_INSTALL_HINT };
 }
 
-// ------------------------------------------------------------------ local models folder
+// ── USB stick installer ────────────────────────────────────────────────────
+// Turn-key copy of the running Capsule onto a removable drive. The destination
+// layout matches what start-portable.sh / start-portable.cmd expect, including
+// .portable/ollama/models for the offline payload. Copies stream file-by-file
+// so progress (and cancellation) stays truthful on multi-GB payloads.
+const usbJobs = new Map();
+
+function walkFiles(root, visit) {
+  const stack = [root];
+  while (stack.length) {
+    const dir = stack.pop();
+    let items = [];
+    try { items = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const item of items) {
+      const p = join(dir, item.name);
+      try { if (item.isDirectory()) stack.push(p); else if (item.isFile()) visit(p); } catch {}
+    }
+  }
+}
+
+function usbScanRoots() {
+  if (process.env.LOCAL_AI_USB_SCAN_ROOTS) {
+    return process.env.LOCAL_AI_USB_SCAN_ROOTS.split(process.platform === 'win32' ? ';' : ':').map((s) => s.trim()).filter(Boolean);
+  }
+  const roots = [];
+  if (process.platform === 'linux') {
+    const user = process.env.USER || '';
+    for (const base of [`/run/media/${user}`, `/media/${user}`, '/media']) {
+      try { for (const name of readdirSync(base)) { const p = join(base, name); try { if (statSync(p).isDirectory()) roots.push(p); } catch {} } } catch {}
+    }
+  } else if (process.platform === 'darwin') {
+    try { for (const name of readdirSync('/Volumes')) { if (name === 'Macintosh HD') continue; const p = join('/Volumes', name); try { if (statSync(p).isDirectory()) roots.push(p); } catch {} } } catch {}
+  } else if (process.platform === 'win32') {
+    try {
+      const out = execFileSync('powershell', ['-NoProfile', '-Command', 'Get-CimInstance Win32_LogicalDisk -Filter "DriveType=2" | Select-Object -ExpandProperty DeviceID'], { encoding: 'utf8', timeout: 8000 });
+      roots.push(...out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).map((d) => d + '\\'));
+    } catch {}
+  }
+  return [...new Set(roots)];
+}
+
+function listUsbTargets() {
+  const targets = [];
+  for (const dir of usbScanRoots()) {
+    const profile = storageProfileAt(dir);
+    if (!profile.space_known) continue;
+    const warnings = [];
+    if (!profile.large_files_supported) warnings.push({ code: 'fat32', text: 'FAT32 cannot hold files over 4 GB — choose a smaller payload or reformat the stick as exFAT/NTFS.' });
+    if (process.platform === 'linux') {
+      try {
+        const mounts = readFileSync('/proc/mounts', 'utf8');
+        const line = mounts.split('\n').find((l) => (l.split(' ')[1] || '') === dir);
+        if (line && /\bnoexec\b/.test(line.split(' ')[3] || '')) warnings.push({ code: 'noexec', text: 'Mounted “noexec”: files copy fine, but the app cannot launch from this drive until it is re-mounted with exec.' });
+      } catch {}
+    }
+    if (!writableDirectory(dir)) warnings.push({ code: 'readonly', text: 'This drive is not writable.' });
+    targets.push({ id: dir, label: basename(dir) || dir, path: dir, filesystem: profile.filesystem, free_bytes: profile.free_bytes, total_bytes: profile.total_bytes, warnings });
+  }
+  return targets;
+}
+
+function runtimePlatformTag() {
+  return `${process.platform}-${process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : process.arch}`;
+}
+
+function usbCopyPlan(include = {}) {
+  const sections = [];
+  const appEntries = [];
+  for (const rel of releaseTrackedPaths(__dirname)) {
+    const from = join(__dirname, rel);
+    try { if (statSync(from).isFile()) appEntries.push({ from, to: rel.split(sep).join('/') }); } catch {}
+  }
+  const manifestFile = join(__dirname, 'capsule-integrity.json');
+  try { if (statSync(manifestFile).isFile()) appEntries.push({ from: manifestFile, to: 'capsule-integrity.json' }); } catch {}
+  sections.push({ name: 'app', label: 'App files, launch scripts & integrity manifest', required: true, entries: appEntries });
+
+  const platformRoot = join(__dirname, 'runtime', 'platforms');
+  let wanted = [];
+  if (include.runtimes === 'all') {
+    try { wanted = readdirSync(platformRoot).filter((d) => { try { return statSync(join(platformRoot, d)).isDirectory(); } catch { return false; } }); } catch {}
+  } else if (include.runtimes !== 'none') {
+    wanted = [runtimePlatformTag()];
+  }
+  const rtEntries = [];
+  for (const plat of wanted) {
+    const dir = join(platformRoot, plat);
+    walkFiles(dir, (from) => rtEntries.push({ from, to: join('runtime/platforms', plat, relative(dir, from)).split(sep).join('/') }));
+  }
+  sections.push({
+    name: 'runtime',
+    label: include.runtimes === 'all' ? 'Runtimes for every platform (boots on any PC)' : `Runtime for this platform (${runtimePlatformTag()})`,
+    entries: rtEntries,
+    note: include.runtimes === 'none' ? 'Skipped — the target machine re-downloads its own runtime on first start.' : '',
+  });
+
+  const payload = (flag, name, label, srcDir, destRel, skipNames = new Set()) => {
+    const entries = [];
+    if (flag && existsSync(srcDir)) {
+      walkFiles(srcDir, (from) => {
+        const rel = relative(srcDir, from);
+        if (skipNames.has(rel.split(sep)[0])) return;
+        entries.push({ from, to: join(destRel, rel).split(sep).join('/') });
+      });
+    }
+    sections.push({ name, label, entries, missing: flag && !existsSync(srcDir) });
+  };
+  payload(!!include.models, 'models', 'Offline language models', OLLAMA_MODELS_DIR, '.portable/ollama/models');
+  payload(!!include.voice, 'voice', 'Offline voice engines', join(DATA_DIR, 'speech'), '.portable/data/speech');
+  payload(!!include.image, 'image', 'Offline image engine + model', join(DATA_DIR, 'image'), '.portable/data/image', new Set(['out', '.tmp']));
+  if (include.data) {
+    const entries = [];
+    const skip = new Set(['speech', 'image', 'bin']);
+    walkFiles(DATA_DIR, (from) => {
+      const rel = relative(DATA_DIR, from);
+      if (skip.has(rel.split(sep)[0])) return;
+      entries.push({ from, to: join('.portable/data', rel).split(sep).join('/') });
+    });
+    sections.push({ name: 'data', label: 'Private data: chats, vault, settings (only because you asked)', entries, personal: true });
+  }
+  for (const section of sections) {
+    let bytes = 0;
+    for (const entry of section.entries) { try { entry.bytes = statSync(entry.from).size; bytes += entry.bytes; } catch { entry.bytes = 0; } }
+    section.bytes = bytes;
+  }
+  return sections;
+}
+
+function planSummary(sections) {
+  return sections.map((s) => ({ name: s.name, label: s.label, bytes: s.bytes, files: s.entries.length, ...(s.note ? { note: s.note } : {}), ...(s.personal ? { personal: true } : {}), ...(s.missing ? { missing: true } : {}) }));
+}
+
+function jobPercent(job) {
+  return job.total_bytes ? Math.min(100, Math.round((job.copied_bytes / job.total_bytes) * 100)) : (job.status === 'ready' ? 100 : 0);
+}
+
+function publicUsbJob(job) {
+  return {
+    id: job.id, kind: job.kind, status: job.status, target: job.target,
+    progress_percent: jobPercent(job),
+    copied_bytes: job.copied_bytes, total_bytes: job.total_bytes,
+    files_copied: job.files_copied, files_total: job.files_total,
+    current: job.current || '', error: job.error || '',
+    started_at: job.started_at, finished_at: job.finished_at || '',
+    summary: job.summary || null,
+    active: !job.finished_at,
+  };
+}
+
+function startUsbCopyJob(target, sections) {
+  const plan = planSummary(sections);
+  const totalBytes = sections.reduce((n, s) => n + s.bytes, 0);
+  const totalFiles = sections.reduce((n, s) => n + s.entries.length, 0);
+  const id = `usb-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}`;
+  const job = {
+    id, kind: 'usb-copy', status: 'starting', target,
+    copied_bytes: 0, total_bytes: totalBytes, files_copied: 0, files_total: totalFiles,
+    current: '', error: '', started_at: new Date().toISOString(), finished_at: '', summary: null,
+    cancel: false,
+  };
+  usbJobs.set(id, job);
+  setTimeout(() => { const j = usbJobs.get(id); if (j && j.finished_at) usbJobs.delete(id); }, 30 * 60 * 1000).unref();
+
+  const fail = (message) => { job.status = 'error'; job.error = message; job.finished_at = new Date().toISOString(); };
+  (async () => {
+    const stick = join(target, 'capsule');
+    mkdirSync(stick, { recursive: true });
+    job.status = 'copying';
+    const counter = () => new Transform({ transform(chunk, enc, cb) { job.copied_bytes += chunk.length; job.progress_percent = jobPercent(job); cb(null, chunk); } });
+    try {
+      for (const section of sections) {
+        for (const entry of section.entries) {
+          if (job.cancel) { job.status = 'cancelled'; job.finished_at = new Date().toISOString(); return; }
+          if (job.files_copied > 0 && job.files_copied % 200 === 0) {
+            const free = storageProfileAt(stick).free_bytes;
+            if (free && free < (job.total_bytes - job.copied_bytes)) return fail('The USB drive ran out of space mid-copy. Free up space and start over.');
+          }
+          job.current = entry.to;
+          const dest = join(stick, entry.to);
+          mkdirSync(dirname(dest), { recursive: true });
+          await pipeline(createReadStream(entry.from), counter(), createWriteStream(dest));
+          job.files_copied += 1;
+          job.progress_percent = jobPercent(job);
+        }
+      }
+    } catch (err) {
+      return fail(err && err.code === 'ENOSPC'
+        ? 'The USB drive ran out of space. Free up space (or deselect payloads) and try again.'
+        : `Copy failed: ${String(err && err.message || err)}`);
+    }
+    try {
+      writeFileSync(join(stick, 'README-USB.txt'), [
+        'This Capsule is a self-contained local AI workspace.',
+        '',
+        'To start it:',
+        '  Linux / macOS :  bash start-portable.sh',
+        '  Windows       :  start-portable.cmd',
+        '',
+        'Your chats and settings live under .portable/data on this drive.',
+        'If a runtime is missing for the computer you plug into, the launcher',
+        'offers to download it (see runtime/downloads.txt).',
+        '',
+      ].join('\n'));
+    } catch {}
+    // Verify: stream a sha256 of both sides and compare (never buffers files).
+    job.status = 'verifying';
+    const sha256File = (p) => new Promise((res2, rej2) => {
+      const h = createHash('sha256');
+      createReadStream(p).on('data', (chunk) => h.update(chunk)).on('end', () => res2(h.digest('hex'))).on('error', rej2);
+    });
+    let verified = 0, mismatched = 0;
+    for (const section of sections) {
+      for (const entry of section.entries) {
+        if (job.cancel) { job.status = 'cancelled'; job.finished_at = new Date().toISOString(); return; }
+        try {
+          job.current = entry.to;
+          const [a, b] = await Promise.all([sha256File(join(stick, entry.to)), sha256File(entry.from)]);
+          if (a === b) verified += 1; else mismatched += 1;
+        } catch { mismatched += 1; }
+      }
+    }
+    job.current = '';
+    job.status = mismatched ? 'error' : 'ready';
+    if (mismatched) job.error = `${mismatched} file(s) failed the post-copy verification. Re-run to be safe.`;
+    job.finished_at = new Date().toISOString();
+    job.summary = {
+      sections: plan, files: job.files_copied, bytes: job.copied_bytes, verified, mismatched,
+      next_steps: [
+        'Plug the stick into the other computer.',
+        process.platform === 'win32' ? 'Run start-portable.cmd from the capsule folder.' : 'Run: bash start-portable.sh',
+        'The first start may re-download a runtime if you copied without runtimes.',
+      ],
+    };
+    log(`USB kit to ${stick}: ${job.files_copied} files (${(job.copied_bytes / (1024 ** 3)).toFixed(2)} GB), verified ${verified}${mismatched ? `, ${mismatched} mismatched` : ''}`);
+  })().catch((err) => fail(String(err && err.message || err)));
+  return job;
+}
 // Locate the bundled Ollama binary (used to serve .gguf models from models/).
 function ollamaBin() {
   const candidates = [];
@@ -2944,6 +3179,64 @@ async function handle(req, res) {
         'Run Portable Readiness on the recipient machine before using the Capsule.',
       ],
     });
+  }
+  // ── USB stick installer endpoints (loopback-only via the /api/portable gate) ──
+  if (req.method === 'GET' && p === '/api/portable/usb-targets') {
+    return sendJSON(res, 200, { targets: listUsbTargets() });
+  }
+  if (req.method === 'POST' && p === '/api/portable/usb-plan') {
+    let body = {};
+    try { body = JSON.parse(await readBody(req, 20_000)); } catch {}
+    const include = body && typeof body.include === 'object' && body.include ? body.include : {};
+    const sections = usbCopyPlan(include);
+    const target = String(body.target || '');
+    let free = 0, targetWarnings = [];
+    if (target) {
+      const hit = listUsbTargets().find((t) => resolve(t.path) === resolve(target));
+      if (hit) { free = hit.free_bytes; targetWarnings = hit.warnings; }
+    }
+    let runtimeAllBytes = 0;
+    walkFiles(join(__dirname, 'runtime', 'platforms'), (f) => { try { runtimeAllBytes += statSync(f).size; } catch {} });
+    return sendJSON(res, 200, {
+      sections: planSummary(sections),
+      runtime_all_bytes: runtimeAllBytes,
+      total_bytes: sections.reduce((n, s) => n + s.bytes, 0),
+      total_files: sections.reduce((n, s) => n + s.entries.length, 0),
+      target_free_bytes: free,
+      warnings: targetWarnings,
+    });
+  }
+  if (req.method === 'POST' && p === '/api/portable/usb-copy') {
+    let body = {};
+    try { body = JSON.parse(await readBody(req, 20_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const target = String(body.target || '');
+    const hit = listUsbTargets().find((t) => resolve(t.path) === resolve(target));
+    if (!hit) return sendJSON(res, 400, { error: 'Pick a detected USB drive from the list — arbitrary paths are not allowed.' });
+    if (hit.warnings.some((w) => w.code === 'readonly')) return sendJSON(res, 400, { error: 'That drive is not writable.' });
+    const include = body && typeof body.include === 'object' && body.include ? body.include : {};
+    const sections = usbCopyPlan(include);
+    const totalBytes = sections.reduce((n, s) => n + s.bytes, 0);
+    const issues = [];
+    if (hit.free_bytes && hit.free_bytes < totalBytes + 32 * 1024 * 1024) issues.push(`The drive has ${(hit.free_bytes / (1024 ** 3)).toFixed(1)} GB free, the kit needs ${(totalBytes / (1024 ** 3)).toFixed(1)} GB plus headroom.`);
+    if (hit.warnings.some((w) => w.code === 'fat32') && sections.some((s) => s.entries.some((e) => e.bytes > 4 * 1024 ** 3 - 1))) issues.push('Some files exceed 4 GB, which FAT32 cannot store. Reformat as exFAT/NTFS, or drop the big payloads.');
+    if (issues.length) return sendJSON(res, 507, { error: issues.join(' '), issues });
+    const running = [...usbJobs.values()].find((j) => !j.finished_at);
+    if (running) return sendJSON(res, 409, { error: 'Another USB copy is already running.', id: running.id });
+    const job = startUsbCopyJob(target, sections);
+    return sendJSON(res, 202, { job: publicUsbJob(job) });
+  }
+  if (req.method === 'GET' && p === '/api/portable/usb-copy') {
+    const id = String(url.searchParams.get('id') || '');
+    const job = usbJobs.get(id);
+    if (!job) return sendJSON(res, 404, { error: 'Unknown or expired USB copy job.' });
+    return sendJSON(res, 200, { job: publicUsbJob(job) });
+  }
+  if (req.method === 'DELETE' && p === '/api/portable/usb-copy') {
+    const id = String(url.searchParams.get('id') || '');
+    const job = usbJobs.get(id);
+    if (!job) return sendJSON(res, 404, { error: 'Unknown or expired USB copy job.' });
+    if (!job.finished_at) job.cancel = true;
+    return sendJSON(res, 200, { ok: true, cancelling: !job.finished_at });
   }
   if (req.method === 'GET' && p === '/api/remote/status') {
     if (!isDirectLocalRequest(req)) return sendJSON(res, 403, { error: 'Capsule Remote controls are available only from the local app' });

@@ -63,6 +63,96 @@ const auth=(extra={})=>{let t='';try{t=sessionStorage.getItem('lc.remoteToken')|
   d.querySelector('#portable-close').onclick=()=>d.close();
 })();
 
+/* USB stick installer: guided, verifiable copy of the whole Capsule onto a
+   removable drive — replaces the old "copy this folder by hand" dance. */
+(()=>{
+  const packDialog=[...document.querySelectorAll('dialog')].find(x=>x.querySelector('#portable-status'));
+  if(!packDialog)return;
+  const root=packDialog.querySelector('.settings');if(!root)return;
+  const anchor=packDialog.querySelector('.dialog-actions');if(!anchor)return;
+  const css=document.createElement('style');
+  css.textContent='.usb-block{border:1px solid var(--line);border-radius:10px;padding:12px;margin-top:12px;background:var(--panel2)}.usb-drive{display:flex;align-items:center;gap:9px;border:1px solid var(--line);border-radius:9px;padding:9px 11px;margin:6px 0;cursor:pointer}.usb-drive input{flex:none}.usb-drive.sel{border-color:var(--blue2)}.usb-drive small{color:var(--muted)}.usb-drive .warn{color:#e0a63c;font-size:11px;display:block}.usb-opts label{display:flex;gap:8px;align-items:baseline;font-size:12px;margin:6px 0}.usb-opts small{color:var(--muted)}.usb-warn{color:#e0a63c;font-size:11px;margin:4px 0}.usb-bar{height:8px;border-radius:99px;background:#242d3e;overflow:hidden;margin:8px 0}.usb-bar>div{height:100%;width:0;background:linear-gradient(90deg,#708bff,#8a71ff);transition:width .4s}';
+  document.head.append(css);
+  const block=document.createElement('div');block.className='usb-block';
+  block.innerHTML='<b style="font-size:13px">Copy everything to a USB drive</b><p class="privacy" style="margin-top:6px">Builds a ready-to-run kit at <b>capsule/</b> on the stick — app, launchers, runtimes, plus the payloads you tick below. The copy is byte-verified when it finishes. Chats, vault, and cloud keys stay behind unless you opt in.</p><div id="usb-targets">Looking for USB drives…</div><div id="usb-options" class="usb-opts" hidden></div><div id="usb-progress" hidden><div class="usb-bar"><div id="usb-fill"></div></div><small id="usb-file" style="color:var(--muted)"></small></div><div id="usb-status" class="notice"></div><div style="display:flex;gap:8px;margin-top:10px"><button class="plain-btn" id="usb-refresh" type="button">Refresh drives</button><button class="plain-btn" id="usb-cancel" type="button" hidden>Cancel copy</button><button class="plain-btn" id="usb-start" type="button" disabled style="margin-left:auto;border-color:var(--blue);color:var(--blue2)">Build kit</button></div>';
+  root.insertBefore(block,anchor);
+  const targetsEl=block.querySelector('#usb-targets'),optsEl=block.querySelector('#usb-options'),statusEl=block.querySelector('#usb-status'),progEl=block.querySelector('#usb-progress'),fillEl=block.querySelector('#usb-fill'),fileEl=block.querySelector('#usb-file'),startBtn=block.querySelector('#usb-start'),refreshBtn=block.querySelector('#usb-refresh'),cancelBtn=block.querySelector('#usb-cancel');
+  const gb=n=>(Number(n||0)/1_000_000_000).toFixed(1)+' GB';
+  let targets=[],selected='',jobId='',timer=0,planSections=null,runtimeAllBytes=0;
+  const stopPoll=()=>{if(timer){clearInterval(timer);timer=0}};
+  const humanize=m=>window.humanizeErrorText?window.humanizeErrorText(m):m;
+  const paintOptions=async()=>{
+    if(!selected){optsEl.hidden=true;return}
+    optsEl.hidden=false;optsEl.innerHTML='Measuring payload sizes…';
+    try{
+      const r=await fetch('/api/portable/usb-plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target:selected,include:{models:true,voice:true,image:true,data:true,runtimes:'current'}})}),j=await r.json();
+      if(!r.ok)throw Error(j.error||'Could not measure the kit');
+      planSections=j.sections||[];runtimeAllBytes=j.runtime_all_bytes||0;
+      const sec=name=>planSections.find(s=>s.name===name);
+      const row=(key,label,bytes,checked,warn='')=>`<label><input type="checkbox" data-usb-opt="${key}"${checked?' checked':''}><span>${label} <small>· ${gb(bytes)}</small></span></label>${warn?`<div class="usb-warn" data-usb-warn="${key}" style="display:none">${warn}</div>`:''}`;
+      optsEl.innerHTML=row('runtimes',`Portable runtimes <small>(this computer type)</small>`,sec('runtime')?.bytes||0,true)
+        +`<label style="padding-left:22px"><input type="checkbox" data-usb-opt="runtimes-all"><span>Include all platforms instead <small>· boots on Windows/macOS/Linux sticks too</small></span></label>`
+        +row('models','Offline language models',sec('models')?.bytes||0,true)
+        +row('voice','Offline voice engines',sec('voice')?.bytes||0,false)
+        +row('image','Image engine + model',sec('image')?.bytes||0,false)
+        +row('data','Private data (chats, vault, cloud keys)',sec('data')?.bytes||0,false,'Careful: anyone with the stick can read these. Only tick it for your own backup drive.');
+      optsEl.querySelectorAll('input').forEach(cb=>cb.onchange=()=>{const w=optsEl.querySelector(`[data-usb-warn="${cb.dataset.usbOpt}"]`);if(w)w.style.display=cb.checked?'block':'none';paintSizeSummary()});
+      paintSizeSummary();
+    }catch(e){optsEl.innerHTML='';statusEl.textContent=humanize(e.message)}
+  };
+  const paintSizeSummary=()=>{
+    if(!planSections)return;
+    const on=k=>{const el=optsEl.querySelector(`[data-usb-opt="${k}"]`);return !!(el&&el.checked)};
+    const sz=(n)=>planSections.find(s=>s.name===n)?.bytes||0;
+    const runtimeBytes=on('runtimes-all')?(runtimeAllBytes||sz('runtime')):sz('runtime');
+    const total=sz('app')+runtimeBytes+(on('models')?sz('models'):0)+(on('voice')?sz('voice'):0)+(on('image')?sz('image'):0)+(on('data')?sz('data'):0);
+    statusEl.textContent=`Kit size ≈ ${gb(total)} → ${selected}`;
+  };
+  const paintTargets=async()=>{
+    stopPoll();startBtn.disabled=true;selected='';targetsEl.textContent='Looking for USB drives…';
+    try{
+      const r=await fetch('/api/portable/usb-targets'),j=await r.json();
+      targets=j.targets||[];
+      if(!targets.length){targetsEl.innerHTML='<div class="privacy">No removable drive found. Insert a USB stick, then press <b>Refresh drives</b>.</div>';optsEl.hidden=true;return}
+      targetsEl.innerHTML='';
+      targets.forEach(t=>{
+        const card=document.createElement('label');card.className='usb-drive';
+        card.innerHTML=`<input type="radio" name="usb-target" value="${t.path.replace(/"/g,'')}">`+`<span style="flex:1"><b>${t.label||t.path}</b> <small>· ${gb(t.free_bytes)} free · ${t.filesystem}</small>${(t.warnings||[]).map(w=>`<small class="warn">⚠ ${w.text}</small>`).join('')}</span>`;
+        card.querySelector('input').onclick=()=>{selected=t.path;targetsEl.querySelectorAll('.usb-drive').forEach(x=>x.classList.remove('sel'));card.classList.add('sel');startBtn.disabled=false;paintOptions()};
+        targetsEl.append(card);
+      });
+    }catch(e){targetsEl.innerHTML='';statusEl.textContent=humanize(e.message)}
+  };
+  refreshBtn.onclick=paintTargets;
+  cancelBtn.onclick=async()=>{if(jobId)await fetch('/api/portable/usb-copy?id='+encodeURIComponent(jobId),{method:'DELETE'});cancelBtn.hidden=true};
+  startBtn.onclick=async()=>{
+    if(!selected)return;
+    startBtn.disabled=true;cancelBtn.hidden=false;progEl.hidden=false;fillEl.style.width='0';statusEl.textContent='Starting the copy…';
+    const on=k=>{const el=optsEl.querySelector(`[data-usb-opt="${k}"]`);return !!(el&&el.checked)};
+    const include={models:on('models'),voice:on('voice'),image:on('image'),data:on('data'),runtimes:on('runtimes-all')?'all':(on('runtimes')?'current':'none')};
+    try{
+      const r=await fetch('/api/portable/usb-copy',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target:selected,include})}),j=await r.json();
+      if(!r.ok)throw Error(j.error||'Copy could not start');
+      jobId=j.job.id;
+      timer=setInterval(async()=>{
+        try{
+          const jr=await (await fetch('/api/portable/usb-copy?id='+encodeURIComponent(jobId))).json().then(x=>x.job);
+          fillEl.style.width=(jr.progress_percent||0)+'%';
+          fileEl.textContent=jr.status==='copying'?`${jr.current} (${jr.files_copied}/${jr.files_total})`:jr.status==='verifying'?'verifying the copy…':'';
+          statusEl.textContent=jr.status==='copying'?`Copying… ${jr.progress_percent}% of ${gb(jr.total_bytes)}`:(jr.status==='verifying'?'Verifying every byte…':jr.error?humanize(jr.error):'');
+          if(['ready','error','cancelled'].includes(jr.status)){
+            stopPoll();cancelBtn.hidden=true;startBtn.disabled=false;
+            if(jr.status==='ready'){const s=jr.summary||{};statusEl.textContent=`Done — ${jr.files_copied} files · ${gb(jr.copied_bytes)} · verified ${s.verified??jr.files_copied}/${jr.files_copied}. On the other machine: run ${navigator.platform?.startsWith('Win')?'start-portable.cmd':'bash start-portable.sh'} from the capsule folder.`;fileEl.textContent=''}
+            else if(jr.status==='cancelled')statusEl.textContent='Cancelled — the stick keeps the partial copy; run it again to finish.';
+          }
+        }catch{}
+      },800);
+    }catch(e){statusEl.textContent=humanize(e.message);startBtn.disabled=false;cancelBtn.hidden=true;progEl.hidden=true}
+  };
+  packDialog.addEventListener('close',()=>stopPoll());
+  new MutationObserver(()=>{if(packDialog.open&&!targets.length)paintTargets();if(!packDialog.open)stopPoll()}).observe(packDialog,{attributeFilter:['open']});
+})();
+
 // Terminal-style Agent workspace and supervised slash commands.
 (()=>{
   if(!['localhost','127.0.0.1'].includes(location.hostname))return;
