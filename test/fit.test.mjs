@@ -92,13 +92,16 @@ test('observations correct the static prediction', () => {
 });
 
 test('recommendFit ranks installed-like models by largest interactive fit (used for auto-suggest)', () => {
-  const b = runMicroBenchmark();
+  // Deterministic scores: this test ranks models, not the machine — measuring
+  // real CPU speed here made the outcome load-sensitive in parallel runs
+  // (flaky: picked small:3b whenever the benchmark dipped below the floor).
+  const memScore = 1.2, score = 1.2;
   const installed = [
     { id: 'huge:24b', name: 'huge:24b', model: 'huge:24b', memory_gb: 24 },
     { id: 'mid:4b', name: 'mid:4b', model: 'mid:4b', memory_gb: 4 },
     { id: 'small:3b', name: 'small:3b', model: 'small:3b', memory_gb: 3 },
   ];
-  const rec = recommendFit({ presets: installed, memFreeGb: 20, memScore: b.memScore, score: b.score, cores: 4, state: { level: 'balanced', observed: { tokens_per_sec: [], minutes_per_mpix: [] } } });
+  const rec = recommendFit({ presets: installed, memFreeGb: 20, memScore, score, cores: 4, state: { level: 'balanced', observed: { tokens_per_sec: [], minutes_per_mpix: [] } } });
   assert.equal(rec.model.id, 'mid:4b');
   assert.equal(rec.model_fits_memory, true);
 });
