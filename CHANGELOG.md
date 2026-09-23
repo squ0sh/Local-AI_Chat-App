@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.3.5 — Durable UI probes + loose ends
+
+- New **`npm run ui-probe`**: a repeatable browser-level regression suite
+  (isolated server + headless Chromium over CDP; skips cleanly when no Chrome
+  is present). It guards the guided UX shipped in 1.3.2–1.3.4 — the first-run
+  model nudge, humanized errors, the clickable engine-status dialog, launcher
+  labels, the voice setup view, image-panel states, agent Retry buttons, the
+  Remote fold, and the FreeLLMAPI router row (against a built-in mock). The
+  /tmp-scratch probes from development are now 27 permanent assertions.
+- **Attach-image is capability-aware**: attaching a picture while a text-only
+  model is selected shows a heads-up bar (“<model> is text-only — it will
+  ignore this image”) instead of failing mysteriously after send.
+- Model library's *Installed* tab empty state now offers a **Browse recommended
+  models** button instead of a dead panel; the cockpit's failure card got the
+  humanized copy + a Retry button.
+
 ## 1.3.4 — Guided feature setup everywhere
 
 - **Voice Mode onboards instead of alerting.** Tapping the mic without a model

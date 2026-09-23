@@ -1,6 +1,6 @@
 {
   "name": "local-chat",
-  "version": "1.2.0",
+  "version": "1.3.5",
   "description": "Local AI chat app + OpenAI-compatible API server for Ollama models, exposed locally or via a Cloudflare tunnel.",
   "type": "module",
   "main": "server.mjs",
@@ -10,6 +10,7 @@
     "server": "node server.mjs --mode local",
     "test": "node --test",
     "lint": "node tools/lint.mjs",
+    "ui-probe": "node tools/ui-probes.mjs",
     "lint:fix": "node tools/lint.mjs",
     "tunnel": "node server.mjs --mode tunnel",
     "tunnel:tailscale": "node server.mjs --mode tunnel --tunnel-type tailscale",
