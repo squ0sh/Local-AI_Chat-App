@@ -31,6 +31,14 @@ individual file larger than 4 GB, which many AI models exceed. A drive mounted
 with `noexec` cannot launch binaries in place; copy the Capsule to a local
 folder in that case.
 
+**Or let the app build the stick for you.** The *Pack → Copy everything to a
+USB drive* section detects removable drives (with free-space and filesystem
+warnings), prices every payload in GB — models, voice, image engine, runtimes —
+lets you tick what to carry (private data stays behind unless you opt in), then
+streams a byte-verified, resumable kit to the drive. On the other machine it is
+one command: `bash start-portable.sh` (Linux/macOS) or `start-portable.cmd`
+(Windows).
+
 ### Capsule integrity
 
 `capsule-integrity.json` pins every release file with a sha256 hash, signed with
@@ -237,9 +245,9 @@ answers for more reliable speech output, keeps the screen awake when supported,
 and prefers a local enhanced/neural OS voice when one is available.
 
 The selected Ollama model remains the conversational model, so the spoken
-answer has the same behavior as typed chat. The speech-recognition and speech
-layers come from the current browser/operating system for maximum portability;
-some platforms may use an online speech service. The microphone indicator is
+answer has the same behavior as typed chat. On browsers without speech support
+the app offers a guided one-time **offline voice install** (piper + whisper.cpp,
+progress-bar download, fully on-device afterwards). The microphone indicator is
 red while Voice Mode is listening, blue while waiting for the model, and green
 while speaking. Capsule Remote can use Voice Mode over its HTTPS private link
 when the mobile browser grants microphone access.
@@ -281,6 +289,17 @@ run this app on a small VM/container with Ollama, HTTPS, a persistent Cloudflare
 Tunnel, and real user authentication in front of it. Never put provider API
 keys into a publicly shared browser build.
 
+### Cloud providers (optional) — including FreeLLMAPI
+
+The **Cloud** button connects the app to OpenAI, Anthropic, or Google Gemini
+with your own key (session-only by default), or to **FreeLLMAPI**, a free-LLM
+router that runs on your machine and serves a dashboard at
+`http://localhost:3001`. Cloud mode keeps local chat history, projects,
+documents, and agent tools private — only the message you send goes out — and
+the status row in the dialog tracks the router with guided install steps if it
+isn't running yet. When cloud mode is on through a loopback router, the Cloud
+button turns into a visible warning if the router stops answering.
+
 - Zero dependencies — runs on Node's built-ins (Node 18+).
 - Clean single-file web chat UI.
 - Thin passthrough proxy to Ollama's own `/v1` OpenAI-compatible endpoints,
@@ -291,6 +310,13 @@ keys into a publicly shared browser build.
 ```bash
 # Local only (default)
 npm start
+```
+
+Then open the app — the welcome screen's **Get set up** card checks the engine,
+offers a one-click install of the model that fits this machine, and links the
+optional extras (vault backup, offline voice, image generation, free cloud
+routing). Sending a message with no model installed shows the same guided
+install right in the chat.
 
 # Start with a Cloudflare quick tunnel (public URL)
 npm run tunnel

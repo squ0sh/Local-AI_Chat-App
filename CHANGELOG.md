@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.5.1 — Docs catch-up + small mobile fixes
+
+- README now documents the **Cloud / FreeLLMAPI** connection (privacy boundary,
+  guided router setup), the guided USB-kit builder, the welcome-screen setup
+  checklist, and the offline-voice install path (the voice section still
+  claimed speech came only from the browser/OS).
+- Mobile: the deep-research mode grid collapses to one column on small screens;
+  setup-checklist card margins fixed. (Wider dialog sizing was already handled
+  by the shared dialog rule; voice overlay and the model library had their own
+  phone rules since earlier releases.)
+
 ## 1.5.0 — USB installer: the whole Capsule onto a stick, no copying by hand
 
 - The Pack dialog gains a **“Copy everything to a USB drive”** section: it
