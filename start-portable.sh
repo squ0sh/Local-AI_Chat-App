@@ -153,6 +153,33 @@ mkdir -p "$PORTABLE_DIR/data" "$PORTABLE_DIR/ollama/models" "$PORTABLE_DIR/logs"
 export LOCAL_AI_DATA_DIR="$PORTABLE_DIR/data"
 export LOCAL_AI_NODE_BIN="$NODE_BIN"
 export LOCAL_AI_OLLAMA_BIN="$OLLAMA_BIN"
+
+APP_URL="http://127.0.0.1:$APP_PORT"
+
+app_alive() {
+  "$NODE_BIN" -e "fetch(process.argv[1]).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" "$APP_URL/health" >/dev/null 2>&1
+}
+
+open_browser() {
+  [[ -z "${LOCAL_AI_NO_BROWSER:-}" ]] || return 0
+  if [[ "$KERNEL" == "Darwin" ]]; then
+    ( command -v open >/dev/null 2>&1 && open "$APP_URL" >/dev/null 2>&1 ) &
+  else
+    ( command -v xdg-open >/dev/null 2>&1 && xdg-open "$APP_URL" >/dev/null 2>&1 ) &
+  fi
+}
+
+# Second-launch convenience: if this port already serves the app, surface it
+# in the browser instead of dying on an address-in-use error.
+if app_alive; then
+  if [[ -n "${LOCAL_AI_NO_BROWSER:-}" ]]; then
+    echo "Local AI Chat is already running at $APP_URL"
+  else
+    echo "Local AI Chat is already running at $APP_URL — opening your browser."
+    open_browser
+  fi
+  exit 0
+fi
 export OLLAMA_MODELS="$PORTABLE_DIR/ollama/models"
 if [[ "$KERNEL" == "Darwin" ]]; then
   export DYLD_LIBRARY_PATH="$OLLAMA_LIB_DIR${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
@@ -200,5 +227,22 @@ fi
 cleanup() { [[ -n "$OLLAMA_PID" ]] && kill "$OLLAMA_PID" 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 
+# Bring the user straight to the app: a background waiter watches /health and
+# opens the default browser as soon as the server answers. (LOCAL_AI_NO_BROWSER=1
+# turns this off — servers and SSH sessions.)
+if [[ -z "${LOCAL_AI_NO_BROWSER:-}" ]]; then
+  (
+    for _ in $(seq 1 120); do
+      if app_alive; then
+        echo "Ready — opening your browser at $APP_URL"
+        open_browser
+        break
+      fi
+      sleep 0.5
+    done
+  ) &
+fi
+
 echo "Starting Local AI Chat at http://127.0.0.1:$APP_PORT"
+echo "(set LOCAL_AI_NO_BROWSER=1 to skip the automatic browser window)"
 OLLAMA_URL="http://127.0.0.1:11435" "$NODE_BIN" "$APP_DIR/server.mjs" --mode local --host 127.0.0.1 --port "$APP_PORT"

@@ -316,7 +316,9 @@ button turns into a visible warning if the router stops answering.
 npm start
 ```
 
-Then open the app — the welcome screen's **Get set up** card checks the engine,
+Then open the app — actually, it opens your browser for you once it's ready
+(set `LOCAL_AI_NO_BROWSER=1` to prevent that). If it's already running, the
+launcher simply opens it and exits. The welcome screen's **Get set up** card checks the engine,
 offers a one-click install of the model that fits this machine, and links the
 optional extras (vault backup, offline voice, image generation, free cloud
 routing). Sending a message with no model installed shows the same guided

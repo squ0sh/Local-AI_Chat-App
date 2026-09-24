@@ -73,6 +73,20 @@ if not exist "%USERPROFILE%\.capsule-signing\key.pem" (
 )
 set "PATH=%OLLAMA_LIB_DIR%;%PATH%"
 
+set "APP_URL=http://127.0.0.1:5173"
+rem Second-launch convenience: if the app is already answering on this port,
+rem surface it in the browser instead of failing with an address-in-use error.
+"%NODE_BIN%" -e "fetch(process.argv[1]).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" "%APP_URL%/health" >nul 2>nul
+if not errorlevel 1 (
+  if defined LOCAL_AI_NO_BROWSER (
+    echo Local AI Chat is already running at %APP_URL%
+  ) else (
+    echo Local AI Chat is already running at %APP_URL% - opening your browser.
+    start "" "%APP_URL%"
+  )
+  exit /b 0
+)
+
 set "OLLAMA_URL=http://127.0.0.1:11435"
 "%NODE_BIN%" "%APP_DIR%tools\ollama-health.mjs" >nul 2>nul
 if not errorlevel 1 goto :ollama_ready
@@ -90,6 +104,13 @@ pause
 exit /b 1
 
 :ollama_ready
-echo Starting Local AI Chat at http://127.0.0.1:5173
+rem Open the browser as soon as the app answers /health (background watcher).
+if not defined LOCAL_AI_NO_BROWSER (
+  start "" /b powershell -NoProfile -Command "for($i=0;$i -lt 120;$i++){ try{ $r=Invoke-WebRequest -UseBasicParsing -Uri '%APP_URL%/health' -TimeoutSec 1; if($r.StatusCode -ge 200 -and $r.StatusCode -lt 500){ [void][System.Diagnostics.Process]::Start('%APP_URL%'); break } } catch {}; Start-Sleep -Milliseconds 500 }"
+  echo Ready will open your browser automatically once the app is up.
+) else (
+  echo LOCAL_AI_NO_BROWSER is set - no browser will open.
+)
+echo Starting Local AI Chat at %APP_URL%
 "%NODE_BIN%" "%APP_DIR%server.mjs" --mode local --host 127.0.0.1 --port 5173
 if defined OLLAMA_PID taskkill /PID %OLLAMA_PID% /T /F >nul 2>nul

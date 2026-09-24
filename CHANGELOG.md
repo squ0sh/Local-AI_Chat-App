@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.6.2 — Launchers that open the app for you
+
+- Running `start-portable.sh` (Linux/macOS) or `start-portable.cmd` (Windows)
+  now **opens your browser automatically** the moment the app answers `/health`
+  — no more watching a terminal and typing a URL. Set `LOCAL_AI_NO_BROWSER=1`
+  on servers/SSH to keep it quiet.
+- Launching twice is now friendly instead of scary: when the port already
+  serves the app, the launcher prints “already running”, opens it in the
+  browser, and exits cleanly instead of crashing on address-in-use.
+- One-line progress prints on the way (“engine ready” → “app URL” → browser),
+  so a cold start never looks frozen.
+
 ## 1.6.1 — Teach once: your capsule learns your procedures
 
 - After any successful agent run (or reviewed plan), the completion card gains
