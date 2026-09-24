@@ -260,6 +260,51 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
   }
   // Attaches a real Retry action to a failed agent event card.
   function attachAgentRetry(upd){if(!upd||!upd.elements)return;const b=document.createElement('button');b.className='plain-btn';b.style.cssText='margin-top:8px;padding:5px 10px;font-size:12px;border-color:var(--agent-green);color:var(--agent-green)';b.textContent='Retry';b.onclick=()=>{b.remove();runAgentTask(agentLoop.task||'',agentLoop.autonomy||'selective','',agentLoop.plan)};upd.elements.content.append(b)}
+  // ── "Teach once": save a run's distilled approach as a personal procedure ──
+  const procedureDialog=document.createElement('dialog');procedureDialog.innerHTML='<div class="settings"><h2>Save this approach</h2><p>The agent compressed this run into a reusable procedure. Edit anything — it is stored only on this machine (in your private data folder) and never leaves without your say-so.</p><label>Name</label><input id="proc-name" maxlength="60"><label>One-line summary</label><input id="proc-summary" maxlength="240"><label>Steps</label><textarea id="proc-steps" rows="6" style="font-family:var(--mono)"></textarea><div class="notice" id="proc-status"></div><div class="dialog-actions"><button class="plain-btn danger" id="proc-discard">Discard</button><button class="plain-btn" id="proc-save" style="border-color:var(--agent-green);color:var(--agent-green)">Save procedure</button></div></div>';document.body.append(procedureDialog);
+  const procName=procedureDialog.querySelector('#proc-name'),procSummary=procedureDialog.querySelector('#proc-summary'),procSteps=procedureDialog.querySelector('#proc-steps'),procStatus=procedureDialog.querySelector('#proc-status'),procSave=procedureDialog.querySelector('#proc-save');
+  let procSourceTask='';
+  procedureDialog.querySelector('#proc-discard').onclick=()=>procedureDialog.close();
+  procSave.onclick=async()=>{
+    const name=procName.value.trim(),summary=procSummary.value.trim(),steps=procSteps.value.split('\n').map(s=>s.replace(/^\s*(?:\d+[.)]\s*|[-*•]\s*)/,'').trim()).filter(Boolean);
+    if(!name||!steps.length){procStatus.textContent='Give it a name and at least one step.';return}
+    procSave.disabled=true;procStatus.textContent='Saving…';
+    try{
+      const r=await fetch('/api/agent/procedures',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name,summary,steps,source_task:procSourceTask})}),j=await r.json();
+      if(!r.ok)throw Error(j.error||'save failed');
+      procStatus.textContent='Saved. Future runs will suggest it when it fits.';
+      setTimeout(()=>procedureDialog.close(),800);
+    }catch(x){procStatus.textContent=window.humanizeErrorText?window.humanizeErrorText(x.message):x.message}
+    finally{procSave.disabled=false}
+  };
+  async function openProcedureSaveDialog(context){
+    procSourceTask=context.task||'';
+    procedureDialog.showModal();
+    procStatus.textContent='Distilling the run…';procName.value='';procSummary.value='';procSteps.value='';
+    try{
+      const model=document.getElementById('model-select')?.value||'';
+      const r=await fetch('/api/agent/procedures/distill',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({task:context.task,content:context.content,trail:context.trail,model})}),j=await r.json();
+      if(!r.ok||!j.procedure)throw Error(j.error||'distill failed');
+      const pr=j.procedure;
+      procName.value=pr.name||'';procSummary.value=pr.summary||'';
+      procSteps.value=(pr.steps||[]).map((s,i)=>`${i+1}. ${s}`).join('\n');
+      procStatus.textContent=j.distilled===false?'Offline draft — review and edit the steps, then save.':'Review the distilled procedure, then save.';
+    }catch(x){procStatus.textContent='Could not distill ('+(window.humanizeErrorText?window.humanizeErrorText(x.message):x.message)+')';procedureDialog.close()}
+  }
+  window.openProcedureSaveDialog=openProcedureSaveDialog;
+  function attachProcedureSave(upd,context){
+    if(!upd||!upd.elements)return;
+    const b=document.createElement('button');b.className='plain-btn';b.style.cssText='margin-top:8px;margin-left:6px;padding:5px 10px;font-size:12px';b.textContent='📌 Save approach';b.title='Distill this run into a reusable procedure (stored locally, suggested on future tasks)';
+    b.onclick=()=>openProcedureSaveDialog(context);
+    upd.elements.content.append(b);
+  }
+  // Suggestion chips: when the input text resembles a saved procedure, offer it.
+  let procSuggestTimer=0,pendingProcedure=null;
+  const procChipRow=document.createElement('div');procChipRow.id='agent-procedure-chips';procChipRow.style.cssText='display:none;gap:6px;margin:6px 0;flex-wrap:wrap';guide.append(procChipRow);
+  const paintProcedureChip=()=>{procChipRow.innerHTML='';procChipRow.style.display=pendingProcedure?'flex':'none';if(pendingProcedure){const tip=(pendingProcedure.steps||[]).slice(0,4).map((s,i)=>`${i+1}. ${s}`).join('\n');const b=document.createElement('button');b.type='button';b.style.cssText='border:1px solid var(--agent-green);border-radius:7px;background:#0c1711;color:var(--agent-green);font-size:11px;font-weight:700;padding:4px 9px';b.textContent=`📌 Use your procedure “${pendingProcedure.name}”${pendingProcedure.uses?` (used ${pendingProcedure.uses}×)`:''}`;b.title=tip;b.onclick=()=>{procStatusNote(`procedure “${pendingProcedure.name}” will guide this run`);const steps=(pendingProcedure.steps||[]).map((s,i)=>`${i+1}. ${s}`).join('\n');window.__pendingProcedurePrompt=`## Saved procedure: ${pendingProcedure.name}\n${pendingProcedure.summary||''}\nFollow it when it applies to the task:\n${steps}`;procChipRow.style.display='none';fetch('/api/agent/procedures/use',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:pendingProcedure.id})}).catch(()=>{});pendingProcedure=null};const x=document.createElement('button');x.type='button';x.style.cssText='border:1px solid var(--agent-line);border-radius:7px;background:transparent;color:var(--agent-dim);font-size:11px;padding:4px 8px';x.textContent='✕';x.title='Not now';x.onclick=()=>{pendingProcedure=null;paintProcedureChip()};procChipRow.append(b,x)}};
+  const procStatusNote=m=>{const n=document.createElement('div');n.style.cssText='font-size:11px;color:var(--agent-green);margin:2px 0';n.textContent='📌 '+m;guide.append(n);setTimeout(()=>n.remove(),6000);};
+  const agentModeOn=()=>{try{return !!(JSON.parse(localStorage.getItem('local-ai-agent-preview'))||{}).enabled}catch{return false}};
+  input.addEventListener('input',()=>{clearTimeout(procSuggestTimer);const text=input.value.trim();if(!agentModeOn()||text.length<20){pendingProcedure=null;paintProcedureChip();return}procSuggestTimer=setTimeout(async()=>{try{const r=await fetch('/api/agent/procedures/suggest?task='+encodeURIComponent(text.slice(0,2000))),j=await r.json();const top=(j.suggestions||[])[0];pendingProcedure=top||null;paintProcedureChip()}catch{}},450)});
   async function json(path,options={}){const response=await fetch(path,options),result=await response.json().catch(()=>({}));if(!response.ok)throw Error(result.error||`Request failed (${response.status})`);return result}
   const trimContext=value=>String(value||'').slice(0,60000);
   const researchDialog=document.createElement('dialog');researchDialog.id='agent-research-dialog';researchDialog.innerHTML='<div class="settings"><h2>Deep Research <span class="agent-badge">local model</span></h2><p>Searches the web, reads public pages, follows linked sources, cross-checks claims, and writes a cited report with a cross-domain synthesis. Your question, source extracts, and report stay in this Capsule; internet access is required to retrieve sources.</p><label for="research-question">Research question</label><textarea id="research-question" rows="3" placeholder="What should I investigate?"></textarea><div class="research-mode-row"><label class="research-mode"><input type="radio" name="research-mode" value="quick" checked><div><b>Quick</b><span>1 round · up to 4 sources</span></div></label><label class="research-mode"><input type="radio" name="research-mode" value="deep"><div><b>Deep</b><span>3 rounds · 10 sources · follow links · fact-check</span></div></label><label class="research-mode"><input type="radio" name="research-mode" value="exhaustive"><div><b>Exhaustive</b><span>4 rounds · 20 sources · link hops · re-review</span></div></label></div><p class="research-offline-note">Research always uses the selected local Ollama model. Fast & light 1B models may struggle; an 8B-or-larger Agent-capable model is recommended for Deep and Exhaustive. A running study saves checkpoints so an interrupted run can be resumed.</p><pre id="research-status" class="notice research-status">Ready.</pre><div id="research-report" class="research-report" hidden></div><div id="research-sources" class="research-sources"></div><details id="research-saved"><summary>Saved reports</summary><div id="research-recent" class="research-recent">Loading…</div></details><div class="dialog-actions"><button type="button" class="plain-btn danger" id="research-cancel" hidden>Cancel</button><button type="button" class="plain-btn" id="research-export" hidden>Export Markdown</button><button type="button" class="plain-btn" id="research-continue" hidden>Continue in chat</button><button type="button" class="plain-btn" id="research-start">Start research</button><button type="button" class="plain-btn" id="research-close">Done</button></div></div>';document.body.append(researchDialog);
@@ -371,12 +416,13 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
       if(agentLoop.plan){
         finalizer('success',data.verdict==='revised'?'plan ready · reviewed':'plan ready','Review the plan, then Approve & implement it — or toggle Plan/Build in the status bar.');
         pendingPlan={task:agentLoop.task,autonomy:agentLoop.autonomy,content:data.content||''};
+        attachProcedureSave(finalizer,{task:agentLoop.task,content:data.content||'',trail:agentLoop.toolTrail||[]});
         renderPlanHandoff(pendingPlan);
-      }else{finalizer('success',data.verdict==='revised'?'agent · reviewed answer':'agent complete',data.content||'');if(typeof window.appendAgentResponse==='function'){try{window.appendAgentResponse(data.content||'',data.toolTrail||[])}catch{}}}agentLoop.running=false;agentLoop.plan=false;paintMode();return}
+      }else{finalizer('success',data.verdict==='revised'?'agent · reviewed answer':'agent complete',data.content||'');attachProcedureSave(finalizer,{task:agentLoop.task,content:data.content||'',trail:agentLoop.toolTrail||[]});if(typeof window.appendAgentResponse==='function'){try{window.appendAgentResponse(data.content||'',data.toolTrail||[])}catch{}}}agentLoop.running=false;agentLoop.plan=false;paintMode();return}
     agentStream.update=null;agentReasoning.update=null;
     if(data.type==='started'){finalizer('pending','agent started','');return}
     if(data.type==='thinking'){appendEvent('pending',data.message||`step ${data.iteration} · thinking`);return}
-    if(data.type==='tool_call'){const t=appendEvent('pending',`proposing ${toolLabel[data.name]||data.name}`,JSON.stringify(data.arguments));return}
+    if(data.type==='tool_call'){try{agentLoop.toolTrail?.push(String(data.name||''))}catch{}const t=appendEvent('pending',`proposing ${toolLabel[data.name]||data.name}`,JSON.stringify(data.arguments));return}
     if(data.type==='executing'){appendEvent('pending',data.message||`running ${toolLabel[data.name]||data.name}`);return}
     if(data.type==='tool_result'){const ok=data.result&&!data.result.error&&!data.result.blocked;appendEvent(ok?'success':'error',`${toolLabel[data.name]||data.name} ${ok?'complete':'returned an issue'}`,JSON.stringify(data.result,null,2).slice(0,4000));return}
     if(data.type==='approval_needed'){approveDialog(data.approval_id,data.name,data.arguments,data.kind,data.rule);return}
@@ -407,7 +453,7 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
         history=c.messages.slice(-14).map(m=>({role:m.role==='assistant'?'assistant':'user',content:String(m.content||'').slice(0,8000)}));
       }
     }catch{}
-    agentLoop.running=true;agentLoop.plan=isPlan;agentLoop.task=task;agentLoop.autonomy=autonomy;paintMode();const finalizer=appendEvent('pending',isPlan?'plan · starting':'agent · starting',task);
+    agentLoop.running=true;agentLoop.plan=isPlan;agentLoop.task=task;agentLoop.autonomy=autonomy;agentLoop.toolTrail=[];paintMode();const finalizer=appendEvent('pending',isPlan?'plan · starting':'agent · starting',task);
     const controller=new AbortController();let lastFrame=Date.now(),warned=false,timedOut=false;
     const watchdog=setInterval(()=>{
       if(!agentLoop.running){clearInterval(watchdog);return}
@@ -421,7 +467,8 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
       }
     },5000);
     try{
-      const res=await fetch('/api/agent/loop',{method:'POST',headers:{'Content-Type':'application/json'},signal:controller.signal,body:JSON.stringify({task,model:model.value,autonomy,skill_prompt:skillPrompt,mode:agentMode(),chat_id:chatId,history,critic:criticOn()})});
+      const procedurePrompt=window.__pendingProcedurePrompt||'';window.__pendingProcedurePrompt='';
+      const res=await fetch('/api/agent/loop',{method:'POST',headers:{'Content-Type':'application/json'},signal:controller.signal,body:JSON.stringify({task,model:model.value,autonomy,skill_prompt:[skillPrompt,procedurePrompt].filter(Boolean).join('\n\n'),mode:agentMode(),chat_id:chatId,history,critic:criticOn()})});
       if(!res.ok){const err=await res.json().catch(()=>({}));throw Error(err.error||`HTTP ${res.status}`)}
       const reader=res.body.getReader(),decoder=new TextDecoder();let buffer='';
       while(true){
@@ -769,7 +816,28 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
 
 
 
-(()=>{const s=document.createElement('style');s.textContent='.skill-card{width:100%;text-align:left;border:1px solid var(--line);border-radius:8px;background:var(--panel2);color:var(--text);padding:10px;margin:5px 0}.skill-card:hover{border-color:var(--blue)}.skill-card span{display:block;color:var(--muted);font-size:11px}';document.head.append(s);const d=document.createElement('dialog');d.id='agent-skills-dialog';d.innerHTML='<div class="settings"><h2>Agent Skills <span class="agent-badge">offline</span></h2><p>Choose a local behavior pack for this chat. It becomes the chat’s system prompt and can be changed anytime with /skills.</p><div id="skill-list">Loading…</div><div class="dialog-actions"><button class="plain-btn" id="skills-close">Done</button></div></div>';document.body.append(d);window.openCapsuleSkills=async()=>{d.showModal();const list=d.querySelector('#skill-list');list.textContent='Loading…';try{const r=await fetch('/api/skills'),j=await r.json();if(!r.ok)throw Error(j.error||'Could not load offline skills');list.innerHTML='';j.skills.forEach(skill=>{const x=document.createElement('button');x.className='skill-card';const title=document.createElement('b'),description=document.createElement('span');title.textContent=`${skill.icon} ${skill.name}`;description.textContent=skill.description;x.append(title,description);x.onclick=()=>{const prompt=document.getElementById('system-prompt');prompt.value=skill.prompt;prompt.dispatchEvent(new Event('input',{bubbles:true}));window.dispatchEvent(new CustomEvent('capsule-skill-selected',{detail:{id:skill.id,name:skill.name,description:skill.description}}));d.close()};list.append(x)})}catch(error){list.textContent='Could not load offline skills: '+error.message}};d.querySelector('#skills-close').onclick=()=>d.close()})();
+(()=>{const s=document.createElement('style');s.textContent='.skill-card{width:100%;text-align:left;border:1px solid var(--line);border-radius:8px;background:var(--panel2);color:var(--text);padding:10px;margin:5px 0}.skill-card:hover{border-color:var(--blue)}.skill-card span{display:block;color:var(--muted);font-size:11px}';document.head.append(s);const d=document.createElement('dialog');d.id='agent-skills-dialog';d.innerHTML='<div class="settings"><h2>Agent Skills <span class="agent-badge">offline</span></h2><p>Choose a local behavior pack for this chat. It becomes the chat’s system prompt and can be changed anytime with /skills.</p><div id="skill-list">Loading…</div><div class="dialog-actions"><button class="plain-btn" id="skills-close">Done</button></div></div>';document.body.append(d);window.openCapsuleSkills=async()=>{d.showModal();const list=d.querySelector('#skill-list');list.textContent='Loading…';try{const r=await fetch('/api/skills'),j=await r.json();if(!r.ok)throw Error(j.error||'Could not load offline skills');list.innerHTML='';j.skills.forEach(skill=>{const x=document.createElement('button');x.className='skill-card';const title=document.createElement('b'),description=document.createElement('span');title.textContent=`${skill.icon} ${skill.name}`;description.textContent=skill.description;x.append(title,description);x.onclick=()=>{const prompt=document.getElementById('system-prompt');prompt.value=skill.prompt;prompt.dispatchEvent(new Event('input',{bubbles:true}));window.dispatchEvent(new CustomEvent('capsule-skill-selected',{detail:{id:skill.id,name:skill.name,description:skill.description}}));d.close()};list.append(x)});
+      // Your procedures: distilled from your own successful agent runs.
+      try{
+        const pr=await fetch('/api/agent/procedures'),pj=await pr.json();
+        const procs=pj.procedures||[];
+        const hdr=document.createElement('div');hdr.style.cssText='margin:14px 0 4px;font-size:10px;letter-spacing:.09em;color:var(--muted)';hdr.textContent='YOUR PROCEDURES';list.append(hdr);
+        if(!procs.length){const none=document.createElement('div');none.style.cssText='color:var(--muted);font-size:12px;padding:6px 2px';none.textContent='Nothing saved yet — after a good agent run, use “📌 Save approach” on its card.';list.append(none)}
+        procs.forEach(p=>{
+          const x=document.createElement('div');x.className='skill-card';x.style.cursor='default';
+          const title=document.createElement('b'),description=document.createElement('span'),meta=document.createElement('span');
+          title.textContent=`📌 ${p.name}`;description.textContent=p.summary||'';meta.textContent=`${(p.steps||[]).length} steps${p.uses?` · used ${p.uses}×`:''}`;meta.style.marginTop='3px';
+          const row=document.createElement('div');row.style.cssText='display:flex;gap:6px;margin-top:8px';
+          const use=document.createElement('button'),del=document.createElement('button');
+          use.className='plain-btn';use.style.cssText='padding:4px 10px;font-size:11px;border-color:var(--agent-green);color:var(--agent-green)';use.textContent='Use in next agent run';
+          use.onclick=()=>{const steps=(p.steps||[]).map((s,i)=>`${i+1}. ${s}`).join('\n');window.__pendingProcedurePrompt=`## Saved procedure: ${p.name}\n${p.summary||''}\nFollow it when it applies to the task:\n${steps}`;fetch('/api/agent/procedures/use',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:p.id})}).catch(()=>{});d.close()};
+          del.className='plain-btn danger';del.style.cssText='padding:4px 10px;font-size:11px';del.textContent='Delete';
+          del.onclick=async()=>{if(!confirm(`Delete procedure "${p.name}"?`))return;await fetch('/api/agent/procedures?id='+encodeURIComponent(p.id),{method:'DELETE'});x.remove()};
+          row.append(use,del);
+          x.append(title,description,meta,row);
+          list.append(x);
+        });
+      }catch{}}catch(error){list.textContent='Could not load offline skills: '+error.message}};d.querySelector('#skills-close').onclick=()=>d.close()})();
 
 
 

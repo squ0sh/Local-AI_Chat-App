@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.6.1 — Teach once: your capsule learns your procedures
+
+- After any successful agent run (or reviewed plan), the completion card gains
+  **📌 Save approach**: the run is distilled — task, tool trail, and what got
+  done — into a small procedure card (name, summary, concrete steps) that you
+  review and edit before saving. Offline or model-down, the dialog still opens
+  with a template built from the actual tool trail, so the flow never blocks.
+- **Procedures apply themselves politely.** When a new task resembles a saved
+  procedure, a chip appears as you type (“You've done this before — use
+  'Dependency update ritual'?”), one click attaches it to that run; an honest
+  counter shows how often each procedure has actually been used.
+- The Skills dialog gains a **Your procedures** section (name, summary, steps,
+  use-count, Use/Delete), clearly separated from the verified built-in skills.
+- Procedures live in `data/procedures.json` — your private data dir, atomic
+  writes, size-capped, loopback-only API, never written into the integrity-
+  sealed `skills.json`. On USB kits they ride along only with the explicit
+  “Private data” payload.
+
 ## 1.6.0 — Critic Mode: the agent checks its own work
 
 - New **🧐 Critic** chip in the agent bar. When enabled, the agent's draft

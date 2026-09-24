@@ -142,6 +142,124 @@ function appendNormsLog(line) {
     appendFileSync(NORMS_LOG_FILE, `${new Date().toISOString()} ${line}\n`, 'utf8');
   } catch {}
 }
+
+// ── "Teach once": user-owned procedures distilled from successful agent runs ──
+// Stored in DATA_DIR (never the sealed skills.json): procedures are personal,
+// editable, and travel with kits only when the private-data payload is chosen.
+const PROCEDURES_FILE = join(DATA_DIR, 'procedures.json');
+const PROC_CAP = { name: 60, summary: 240, steps: 12, stepChars: 220, count: 64 };
+
+function readProcedures() {
+  try {
+    const j = JSON.parse(readFileSync(PROCEDURES_FILE, 'utf8'));
+    return Array.isArray(j.procedures) ? j.procedures : [];
+  } catch { return []; }
+}
+
+function writeProcedures(list) {
+  mkdirSync(DATA_DIR, { recursive: true });
+  const tmp = PROCEDURES_FILE + '.tmp';
+  writeFileSync(tmp, JSON.stringify({ schema: 1, procedures: list }, null, 2) + '\n', 'utf8');
+  renameSync(tmp, PROCEDURES_FILE);
+  try { chmodSync(PROCEDURES_FILE, 0o600); } catch {}
+}
+
+function cleanProcedure(input) {
+  const name = String(input.name || '').trim().slice(0, PROC_CAP.name);
+  const summary = String(input.summary || '').trim().slice(0, PROC_CAP.summary);
+  const steps = (Array.isArray(input.steps) ? input.steps : [])
+    .map((s) => String(s).trim().slice(0, PROC_CAP.stepChars))
+    .filter(Boolean)
+    .slice(0, PROC_CAP.steps);
+  return { name, summary, steps };
+}
+
+// Keyword matcher with prefix stemming ("dependencies" ~ "dependency") —
+// zero deps; embedding-grade matching arrives with the memory work.
+const PROC_STOP = new Set(['what', 'when', 'where', 'which', 'this', 'that', 'with', 'from', 'have', 'then', 'than', 'please', 'make', 'your', 'into', 'them', 'they', 'want', 'need', 'some', 'also']);
+function procTokens(text) {
+  return String(text || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/)
+    .filter((t) => t.length >= 4 && !PROC_STOP.has(t));
+}
+function tokensMatch(a, b) {
+  if (a === b) return true;
+  const n = Math.min(a.length, b.length, 5);
+  return n >= 4 && (a.slice(0, n) === b.slice(0, n) || (a.length >= 5 && b.length >= 5 && (a.startsWith(b.slice(0, 5)) || b.startsWith(a.slice(0, 5)))));
+}
+function procedureScore(procedure, taskTokens) {
+  const hayTokens = procTokens(`${procedure.name} ${procedure.summary} ${(procedure.steps || []).join(' ')}`);
+  let matched = 0;
+  for (const tok of taskTokens) if (hayTokens.some((h) => tokensMatch(tok, h))) matched += 1;
+  return matched;
+}
+
+function suggestProceduresFor(task) {
+  const tokens = procTokens(task);
+  if (!tokens.length) return [];
+  return readProcedures()
+    .map((p) => ({ p, score: procedureScore(p, tokens) }))
+    .filter((x) => x.score >= 2)
+    .sort((a, b) => b.score - a.score || (b.p.uses || 0) - (a.p.uses || 0))
+    .slice(0, 2)
+    .map(({ p, score }) => ({ id: p.id, name: p.name, summary: p.summary, score, uses: p.uses || 0 }));
+}
+
+const DISTILL_SYSTEM = `You compress a completed agent run into a small reusable procedure card. From the task, the tool trail, and the final answer, produce JSON ONLY:
+{"name":"short title, <=60 chars","summary":"one sentence, <=200 chars","steps":["step 1","step 2","step 3"]}
+Rules: 2-6 steps, each a concrete action sentence <=200 chars; include any cautions worth repeating next time; no commentary outside the JSON; dash bullets instead of numbers are never allowed.`;
+
+function extractJsonObject(text) {
+  const s = String(text || '');
+  const start = s.indexOf('{');
+  if (start < 0) return null;
+  let depth = 0, inString = false, esc = false;
+  for (let i = start; i < s.length; i += 1) {
+    const ch = s[i];
+    if (esc) { esc = false; continue; }
+    if (ch === '\\') { esc = true; continue; }
+    if (ch === '"') inString = !inString;
+    if (inString) continue;
+    if (ch === '{') depth += 1;
+    else if (ch === '}') { depth -= 1; if (!depth) { try { return JSON.parse(s.slice(start, i + 1)); } catch { return null; } } }
+  }
+  return null;
+}
+
+async function distillProcedure(model, { task, content, trail }) {
+  const user = [
+    `Task:\n${String(task || '').slice(0, 4000)}`,
+    trail && trail.length ? `Tools used (in order): ${trail.join(' → ')}` : 'Tools used: none',
+    `Final answer:\n${String(content || '').slice(0, 6000)}`,
+  ].join('\n\n');
+  const raw = await ollamaSummarizeChat(model, [
+    { role: 'system', content: DISTILL_SYSTEM },
+    { role: 'user', content: user },
+  ]);
+  const parsed = extractJsonObject(raw);
+  if (parsed && parsed.name && Array.isArray(parsed.steps) && parsed.steps.length) {
+    const { name, summary, steps } = cleanProcedure(parsed);
+    if (name && steps.length) return { name, summary, steps, distilled: true };
+  }
+  return null;
+}
+
+function procedureTemplate({ task, trail }) {
+  const steps = [];
+  if (trail && trail.length) {
+    steps.push('Follow this tool sequence from the run that worked:');
+    trail.slice(0, 6).forEach((t, i) => steps.push(`${i + 1}. ${t}`));
+    steps.push('Verify the result before reporting back.');
+  } else {
+    steps.push('Repeat the approach from the saved run.');
+  }
+  return {
+    name: 'Procedure: ' + String(task || '').replace(/\s+/g, ' ').trim().split(' ').slice(0, 5).join(' '),
+    summary: 'Saved from a successful run (offline — edit the steps to fit).',
+    steps,
+    distilled: false,
+  };
+}
+
 // Per-chat conversational memory: the agent's message buffer is persisted so
 // follow-up turns and page reloads keep context. Files are written atomically.
 function agentThreadKey(id) {
@@ -3589,6 +3707,91 @@ async function handle(req, res) {
       }
       appendNormsLog('Norms saved (adopted) by the human.');
       return sendJSON(res, 200, { ok: true, exists: true, file: 'norms.md' });
+    }
+
+    // ── "Teach once": procedures learned from successful runs ──────────────
+    if (req.method === 'GET' && p === '/api/agent/procedures') {
+      return sendJSON(res, 200, { procedures: readProcedures() });
+    }
+    if (req.method === 'GET' && p === '/api/agent/procedures/suggest') {
+      const task = String(url.searchParams.get('task') || '').slice(0, 2000);
+      return sendJSON(res, 200, { suggestions: suggestProceduresFor(task) });
+    }
+    if (req.method === 'POST' && p === '/api/agent/procedures/distill') {
+      let body;
+      try { body = JSON.parse(await readBody(req, 30_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      const model = String(body.model || cfg.model || '').trim();
+      const inputPack = { task: body.task, content: body.content, trail: Array.isArray(body.trail) ? body.trail.map((t) => String(t).slice(0, 40)).slice(0, 12) : [] };
+      if (model) {
+        try {
+          const distilled = await distillProcedure(model, inputPack);
+          if (distilled) return sendJSON(res, 200, { procedure: distilled });
+        } catch {}
+      }
+      // Offline / model failure: still open the dialog with a template built
+      // from the actual trail — the user edits and saves what matters.
+      return sendJSON(res, 200, { procedure: procedureTemplate(inputPack), distilled: false });
+    }
+    if (req.method === 'POST' && p === '/api/agent/procedures') {
+      let body;
+      try { body = JSON.parse(await readBody(req, 20_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      const cleaned = cleanProcedure(body || {});
+      if (!cleaned.name || !cleaned.steps.length) return sendJSON(res, 400, { error: 'A procedure needs a name and at least one step.' });
+      const list = readProcedures();
+      const id = /^proc-[a-z0-9-]+$/.test(String(body.id || '')) ? String(body.id) : '';
+      if (id) {
+        const i = list.findIndex((p) => p.id === id);
+        if (i < 0) return sendJSON(res, 404, { error: 'Unknown procedure.' });
+        list[i] = { ...list[i], ...cleaned, id: list[i].id, uses: list[i].uses || 0 };
+        writeProcedures(list);
+        return sendJSON(res, 200, { ok: true, procedure: list[i] });
+      }
+      const procedure = { id: `proc-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}`, ...cleaned, source_task: String(body.source_task || '').slice(0, 300), created: new Date().toISOString(), uses: 0 };
+      list.push(procedure);
+      while (list.length > PROC_CAP.count) list.shift();
+      writeProcedures(list);
+      return sendJSON(res, 200, { ok: true, procedure });
+    }
+    if (req.method === 'DELETE' && p === '/api/agent/procedures') {
+      const id = String(url.searchParams.get('id') || '');
+      if (!/^proc-[a-z0-9-]+$/.test(id)) return sendJSON(res, 400, { error: 'invalid id' });
+      const list = readProcedures();
+      const next = list.filter((p) => p.id !== id);
+      if (next.length === list.length) return sendJSON(res, 404, { error: 'Unknown procedure.' });
+      writeProcedures(next);
+      return sendJSON(res, 200, { ok: true });
+    }
+    if (req.method === 'POST' && p === '/api/agent/procedures/use') {
+      let body;
+      try { body = JSON.parse(await readBody(req, 5_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      const id = String(body.id || '');
+      if (!/^proc-[a-z0-9-]+$/.test(id)) return sendJSON(res, 400, { error: 'invalid id' });
+      const list = readProcedures();
+      const p2 = list.find((x) => x.id === id);
+      if (!p2) return sendJSON(res, 404, { error: 'Unknown procedure.' });
+      p2.uses = (p2.uses || 0) + 1;
+      writeProcedures(list);
+      return sendJSON(res, 200, { ok: true, uses: p2.uses });
+    }
+    if (req.method === 'GET' && p === '/api/agent/procedures/suggest') {
+      const task = String(url.searchParams.get('task') || '');
+      return sendJSON(res, 200, { suggestions: suggestProceduresFor(task) });
+    }
+    if (req.method === 'POST' && p === '/api/agent/procedures/distill') {
+      let body;
+      try { body = JSON.parse(await readBody(req, 50_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      const task = String(body.task || '').trim();
+      const content = String(body.content || '');
+      if (!task || !content) return sendJSON(res, 400, { error: 'task and content are required' });
+      const trail = Array.isArray(body.trail) ? body.trail.map((t) => String(t).slice(0, 60)).slice(0, 25) : [];
+      const model = String(body.model || cfg.model || '').trim();
+      if (model) {
+        try {
+          const distilled = await distillProcedure(model, { task, content, trail });
+          if (distilled) return sendJSON(res, 200, { ...distilled, offline: false });
+        } catch {}
+      }
+      return sendJSON(res, 200, { ...procedureTemplate({ task, trail }), offline: true });
     }
 
     // ── Agent loop: autonomous observe→think→act cycle ────────────────────

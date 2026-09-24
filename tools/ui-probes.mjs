@@ -195,6 +195,25 @@ await ev("window.runAgentTask('critic probe run')");
 await sleep(2500);
 ok('agent loop request carries the critic flag', await ev("window.__agentBodies.length > 0"));
 
+// ── Teach once: save-approach flow + suggestion chip ────────────────────────
+await ev("window.agentSetEnabled && window.agentSetEnabled(true)");
+await sleep(400);
+await ev("window.openProcedureSaveDialog({task:'probe: resize screenshots',content:'done by resizing to 1024px',trail:['list_dir','run_command']})");
+await sleep(1600);
+ok('save-approach dialog opens with offline template', await ev("!!document.querySelector('dialog[open]')") && /run_command/.test(await ev("document.querySelector('#proc-steps')?.value || ''")));
+await ev("document.querySelector('#proc-name').value='Screenshot resize ritual'");
+await ev("document.querySelector('#proc-save').click()");
+await sleep(1000);
+ok('procedure saved server-side', (await ev("(async()=>(await fetch('/api/agent/procedures')).json())()")).procedures?.length >= 1);
+await ev("[...document.querySelectorAll('dialog[open]')].forEach(d=>d.close())");
+await ev("(() => { const i=document.getElementById('input'); i.value='please resize my screenshots into smaller images'; i.dispatchEvent(new Event('input')); })()");
+await sleep(1500);
+ok('suggestion chip appears for a matching task', /Use your procedure/.test(await ev("[...document.querySelectorAll('#agent-procedure-chips button')].map(b=>b.textContent).join(' ')")));
+await ev("[...document.querySelectorAll('#agent-procedure-chips button')].find(b=>/Use/.test(b.textContent))?.click()");
+await sleep(400);
+ok('using the chip stages the procedure for the next run', /resize/i.test(await ev("window.__pendingProcedurePrompt||''")));
+ok('use counted server-side', (await (await fetch(`http://127.0.0.1:${appPort}/api/agent/procedures`)).json()).procedures?.[0]?.uses >= 1);
+
 // ── Remote dialog ────────────────────────────────────────────────────────────
 await ev("document.getElementById('remote-launch').click()");
 await sleep(900);
