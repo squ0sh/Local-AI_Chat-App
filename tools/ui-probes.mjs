@@ -80,16 +80,23 @@ const browser = spawn(chrome, [
   'about:blank',
 ], { stdio: ['ignore', 'ignore', 'ignore'] });
 
-const cleanup = (code) => {
-  try { browser.kill(); } catch {}
+const cleanup = async (code) => {
+  try { browser.kill('SIGKILL'); } catch {}
   try { server.kill(); } catch {}
   try { mockRouter.close(); } catch {}
-  rmSync(dataDir, { recursive: true, force: true });
-  rmSync(profileDir, { recursive: true, force: true });
-  rmSync(stickDir, { recursive: true, force: true });
+  // Chromium can still be writing its profile for a beat after SIGKILL; retry.
+  for (let i = 0; i < 8; i += 1) {
+    await new Promise((r) => setTimeout(r, 200));
+    try {
+      rmSync(dataDir, { recursive: true, force: true });
+      rmSync(profileDir, { recursive: true, force: true });
+      rmSync(stickDir, { recursive: true, force: true });
+      break;
+    } catch {}
+  }
   process.exit(code);
 };
-process.on('SIGINT', () => cleanup(130));
+process.on('SIGINT', () => { cleanup(130); });
 
 // CDP plumbing
 const waitFor = async (fn, tries = 60, gap = 250) => { for (let i = 0; i < tries; i++) { try { const v = await fn(); if (v) return v; } catch {} await new Promise((r) => setTimeout(r, gap)); } return null; };
