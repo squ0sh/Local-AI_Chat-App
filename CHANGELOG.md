@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.6.3 — App-menu entries (Linux + macOS)
+
+- `bash tools/register-menu-entry.sh` installs a real Linux app-menu icon
+  ("Local AI Chat"), validated against desktop-entry rules; `--remove` undoes
+  it. Writes only to the user's applications dir, never system paths. The
+  launcher mentions it once until registered.
+- macOS gains `Local AI Chat.command` — double-click from Finder/Spotlight
+  launches the app (which now opens the browser by itself).
+- Both entry points, the launcher, and the icon ship in the signed integrity
+  manifest, so a stick copy carries them too.
+
 ## 1.6.2 — Launchers that open the app for you
 
 - Running `start-portable.sh` (Linux/macOS) or `start-portable.cmd` (Windows)

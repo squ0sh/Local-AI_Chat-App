@@ -245,4 +245,10 @@ fi
 
 echo "Starting Local AI Chat at http://127.0.0.1:$APP_PORT"
 echo "(set LOCAL_AI_NO_BROWSER=1 to skip the automatic browser window)"
+if [[ "$KERNEL" == "Linux" ]]; then
+  _DESKTOP_ENTRY="${XDG_DATA_HOME:-$HOME/.local/share}/applications/local-ai-capsule.desktop"
+  if [[ ! -f "$_DESKTOP_ENTRY" && -f "$APP_DIR/tools/register-menu-entry.sh" ]]; then
+    echo "Tip: add an app-menu icon with: bash tools/register-menu-entry.sh"
+  fi
+fi
 OLLAMA_URL="http://127.0.0.1:11435" "$NODE_BIN" "$APP_DIR/server.mjs" --mode local --host 127.0.0.1 --port "$APP_PORT"

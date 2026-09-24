@@ -12,6 +12,11 @@ Use `start-portable.sh` on Linux/macOS or double-click `start-portable.cmd` on
 Windows. The launcher selects a matching bundled Node and Ollama runtime; it
 never silently falls back to host-installed software.
 
+Launchers open your browser automatically once the app answers
+(`LOCAL_AI_NO_BROWSER=1` disables that). On Linux, `bash tools/register-menu-entry.sh`
+adds a real app-menu icon (with `--remove` to undo); on macOS, double-clicking
+`Local AI Chat.command` launches it straight from Finder.
+
 Models, settings, logs, and tunnel tooling stay under `.portable/`, so the app
 does not touch the host's Ollama library or require a system Node installation.
 
