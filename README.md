@@ -157,7 +157,11 @@ screen offers a few one-click starters: **Start a task** (describe anything),
 **Ask my files** (answers that cite your project), **Text tools** (draft,
 summarize, polish, or translate in one card), and **Organize my files** (sort a
 folder by year or type — preview the plan, approve, and **Undo** any move
-afterwards). Deep Research, Skills, a model-readiness check, and **Our Norms**
+afterwards). The **🧐 Critic** chip adds a second-opinion pass: a fresh-context
+review of the draft (or plan — plans are reviewed before you approve them),
+and a revision when the review finds real issues; it is on by default for small
+models (≤ ~4 GB), where it matters most, and always one click to toggle. Deep
+Research, Skills, a model-readiness check, and **Our Norms**
 stay one click away, and the research panel remains available through
 `/research`. A **Changes** card opens the change ledger: every write, folder
 organization, image generation, and saved research report is listed with its own

@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.6.0 — Critic Mode: the agent checks its own work
+
+- New **🧐 Critic** chip in the agent bar. When enabled, the agent's draft
+  answer (or its plan — plans are reviewed before you approve them) goes through
+  a fresh-context second opinion with a strict rubric; a `PASS` ships the draft,
+  real issues trigger a full revision streamed as its own card. The flow is
+  **fail-open**: a critic that errors never blocks a good draft.
+- On by default for small models (≤ ~4 GB — where single-pass mistakes hurt
+  most), one click to override and the choice sticks. Roughly 2–3× slower per
+  run when on; the chip says so in the tooltip.
+- Terminal cards name what happened: “critic · draft looks solid” /
+  “critic · found issues — revising” / “revision · applied”, and the final card
+  reads “reviewed answer” when a revision landed. The chat transcript and agent
+  memory keep the revised text.
+- Everything rides one request flag end-to-end (`critic: true` → the loop's
+  injected `llmCall` runs the extra passes as plain completions), verified by
+  stubbed library tests (revise/pass/fail-open/event order) and browser probes.
+
 ## 1.5.1 — Docs catch-up + small mobile fixes
 
 - README now documents the **Cloud / FreeLLMAPI** connection (privacy boundary,

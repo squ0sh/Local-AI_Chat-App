@@ -184,6 +184,17 @@ await ev("window.runAgentTask('ui-probe task — expected to fail')");
 await sleep(8000);
 ok('agent failure cards carry a Retry button', await ev("[...document.querySelectorAll('.agent-terminal-event.error .plain-btn')].some(b=>b.textContent==='Retry')"), await ev("[...document.querySelectorAll('.agent-terminal-event')].map(x=>x.querySelector('.agent-event-title')?.textContent).join(';')"));
 
+// ── Critic chip ──────────────────────────────────────────────────────────────
+ok('critic chip exists', await ev("!!document.getElementById('agent-critic-toggle')"));
+await ev("window.__agentBodies=[];const _f=window.fetch;window.fetch=(u,i={})=>{if(String(u).includes('/api/agent/loop')&&i.body){try{window.__agentBodies.push(!!JSON.parse(i.body).critic)}catch{}}return _f(u,i)}",);
+await ev("document.getElementById('agent-critic-toggle').click()"); // default → explicit choice
+await sleep(400);
+ok('critic chip toggle persists choice', await ev("localStorage.getItem('local-ai-agent-critic')") === '1' || await ev("localStorage.getItem('local-ai-agent-critic')") === '0');
+await ev("(() => { const s=document.getElementById('model-select'); if (![...s.options].some(o=>o.value==='stub')) s.innerHTML='<option value=\"stub\">stub-model</option>'; s.value='stub'; })()");
+await ev("window.runAgentTask('critic probe run')");
+await sleep(2500);
+ok('agent loop request carries the critic flag', await ev("window.__agentBodies.length > 0"));
+
 // ── Remote dialog ────────────────────────────────────────────────────────────
 await ev("document.getElementById('remote-launch').click()");
 await sleep(900);

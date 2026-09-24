@@ -192,3 +192,80 @@ test('agent loop proceeds after a deliberate norm override', async () => {
   assert.equal(override.result.overridden, true);
   assert.equal(events.filter((e) => e.type === 'executing').length, 0, 'only the defer tool, nothing risky');
 });
+
+// ── Critic mode ───────────────────────────────────────────────────────────────
+
+test('critic: REVISE verdict replaces the final answer with the revision', async () => {
+  const events = [];
+  let step = 0;
+  const llmCall = async (_messages, tools, onToken) => {
+    step += 1;
+    if (step === 1) return { content: 'The draft answer.', tool_calls: [], tokens: 1 };
+    if (step === 2) {
+      assert.deepEqual(tools, [], 'critic pass is a plain completion without tools');
+      onToken?.('VERDICT: REVISE\nISSUES:\n1. Missing the actual restart step.');
+      return { content: '', tool_calls: [], tokens: 1 };
+    }
+    return { content: 'The draft answer, now with the restart step spelled out properly and fully.', tool_calls: [], tokens: 1 };
+  };
+  const result = await runAgentLoop({
+    task: 'fix the service', model: 'test-model', workspaceRoot: '/tmp', autonomy: 'auto',
+    llmCall, signal: new AbortController().signal, critic: true,
+    onEvent: (e) => events.push(e),
+  });
+  assert.equal(result.status, 'complete');
+  assert.ok(result.content.includes('restart step'), 'final content is the revision');
+  assert.equal(result.draft, 'The draft answer.');
+  assert.ok(result.critique.includes('VERDICT: REVISE'));
+  const types = events.map((e) => e.type);
+  assert.ok(types.includes('critic_started') && types.includes('critic_complete') && types.includes('revision_started') && types.includes('revision_complete'));
+  assert.ok(types.indexOf('critic_started') < types.indexOf('critic_complete') && types.indexOf('critic_complete') < types.indexOf('revision_started') && types.indexOf('revision_complete') < types.indexOf('completed'), 'critic cycle precedes completion');
+  assert.equal(events.find((e) => e.type === 'completed').verdict, 'revised');
+});
+
+test('critic: PASS verdict ships the draft unchanged', async () => {
+  const events = [];
+  let step = 0;
+  const llmCall = async () => {
+    step += 1;
+    if (step === 1) return { content: 'A solid draft.', tool_calls: [], tokens: 1 };
+    return { content: 'VERDICT: PASS\nISSUES:', tool_calls: [], tokens: 1 };
+  };
+  const result = await runAgentLoop({
+    task: 'answer', model: 'test-model', workspaceRoot: '/tmp', autonomy: 'auto',
+    llmCall, signal: new AbortController().signal, critic: true,
+    onEvent: (e) => events.push(e),
+  });
+  assert.equal(result.content, 'A solid draft.');
+  assert.equal(events.find((e) => e.type === 'completed').verdict, 'pass');
+  assert.ok(!events.some((e) => e.type === 'revision_started'), 'no revision pass when the critic passes the draft');
+});
+
+test('critic: a broken critic never blocks the draft (fail-open)', async () => {
+  const events = [];
+  let step = 0;
+  const llmCall = async () => {
+    step += 1;
+    if (step === 1) return { content: 'Draft that must ship.', tool_calls: [], tokens: 1 };
+    throw new Error('model gone');
+  };
+  const result = await runAgentLoop({
+    task: 'answer', model: 'test-model', workspaceRoot: '/tmp', autonomy: 'auto',
+    llmCall, signal: new AbortController().signal, critic: true,
+    onEvent: (e) => events.push(e),
+  });
+  assert.equal(result.status, 'complete');
+  assert.equal(result.content, 'Draft that must ship.');
+  assert.equal(events.find((e) => e.type === 'critic_complete').verdict, 'skipped');
+});
+
+test('critic: off by default — no critic events unless requested', async () => {
+  const events = [];
+  const llmCall = async () => ({ content: 'plain answer', tool_calls: [], tokens: 1 });
+  await runAgentLoop({
+    task: 'answer', model: 'test-model', workspaceRoot: '/tmp', autonomy: 'auto',
+    llmCall, signal: new AbortController().signal,
+    onEvent: (e) => events.push(e),
+  });
+  assert.ok(!events.some((e) => e.type.startsWith('critic') || e.type.startsWith('revision')));
+});

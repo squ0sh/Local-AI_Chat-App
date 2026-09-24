@@ -205,6 +205,7 @@ const auth=(extra={})=>{let t='';try{t=sessionStorage.getItem('lc.remoteToken')|
     body.agent-terminal-mode .agent-terminal-event{display:grid;grid-template-columns:18px minmax(0,1fr);gap:9px;margin:0 0 16px;color:#d8e5dc;font:12px/1.55 var(--mono)}
     .agent-terminal-event .agent-event-mark{color:var(--agent-green);font-weight:800}.agent-terminal-event.error .agent-event-mark{color:#ff8d98}.agent-terminal-event.pending .agent-event-mark{animation:agentPulse .9s infinite alternate}
     .agent-mode-row{display:flex;gap:6px;margin:4px 0}.agent-mode-row .agent-mode-seg{flex:1;border-color:var(--agent-line);color:var(--agent-dim);font-weight:700}.agent-mode-row .agent-mode-seg.active{border-color:var(--agent-green);color:var(--agent-green);background:#0c1711}.agent-mode-row .agent-mode-seg.active[data-mode="plan"]{border-color:#ffd27d;color:#ffd27d}.agent-mode-row .agent-mode-seg.active[data-mode="code"]{border-color:#b78be8;color:#d7baff}
+    #agent-critic-toggle{border:1px solid var(--agent-line);border-radius:7px;background:transparent;color:var(--agent-dim);font-size:11px;font-weight:700;padding:4px 9px;cursor:pointer}#agent-critic-toggle.on{border-color:var(--agent-green);color:var(--agent-green);background:#0c1711}
     .agent-terminal-event .agent-event-title{color:#dcece2;font-weight:700}.agent-terminal-event .agent-event-body{margin-top:4px;color:#9fb0a6;white-space:pre-wrap;overflow-wrap:anywhere;max-height:290px;overflow:auto}
     .agent-processing{display:flex;align-items:center;gap:8px;color:var(--agent-dim)}.agent-processing .agent-spinner{color:var(--agent-green);animation:agentSpin .85s steps(8) infinite}.agent-processing small{display:block;margin-top:2px;color:#708078}
     #agent-research-dialog{width:min(820px,calc(100vw - 24px))}.research-mode-row{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:10px 0}.research-mode{display:flex!important;align-items:flex-start;gap:8px;border:1px solid var(--line);border-radius:8px;padding:9px;background:var(--panel2)}.research-mode input{width:auto!important;margin-top:2px}.research-mode span{display:block;color:var(--muted);font-size:11px;margin-top:2px}.research-status{max-height:110px;overflow:auto;white-space:pre-wrap}.research-report{max-height:42vh;overflow:auto;border:1px solid var(--line);border-radius:8px;background:var(--panel2);padding:13px;white-space:pre-wrap;font:12px/1.6 var(--mono);color:var(--text)}.research-sources{display:grid;gap:5px;margin-top:10px}.research-sources a{color:var(--blue2);font-size:12px;overflow-wrap:anywhere}.research-recent{display:grid;gap:5px;max-height:135px;overflow:auto}.research-recent button{width:100%;text-align:left}.research-offline-note{color:var(--muted);font-size:11px}
@@ -217,7 +218,7 @@ const auth=(extra={})=>{let t='';try{t=sessionStorage.getItem('lc.remoteToken')|
   const shell=document.createElement('div');shell.id='agent-shell-status';shell.innerHTML='<span class="agent-live-dot"></span><strong>agent</strong><span class="agent-shell-mode"></span><span class="agent-shell-model"></span>';topbar.insertBefore(shell,model);
   const prefix=document.createElement('span');prefix.id='agent-prompt-prefix';prefix.textContent='›';composer.insertBefore(prefix,input);
   const menu=document.createElement('div');menu.id='agent-slash-menu';menu.setAttribute('role','listbox');menu.setAttribute('aria-label','Agent commands');composer.append(menu);
-  const guide=document.createElement('div');guide.id='agent-simple-guide';guide.innerHTML='<span>Describe the result you want. Agent will pause before commands or file changes.</span><span class="agent-mode-chip" id="agent-mode-chip"><button type="button" data-mode="plan" title="Plan mode: read, search, and plan — no changes">⚑ Plan</button><button type="button" data-mode="code" title="Code mode: supervised planning, coding, and review">◈ Code</button><button type="button" data-mode="build" title="Build mode: plan, edit, and run commands">⚒ Build</button></span><button type="button" id="agent-tools-button">Tools</button>';foot.after(guide);const toolsButton=guide.querySelector('#agent-tools-button');
+  const guide=document.createElement('div');guide.id='agent-simple-guide';guide.innerHTML='<span>Describe the result you want. Agent will pause before commands or file changes.</span><span class="agent-mode-chip" id="agent-mode-chip"><button type="button" data-mode="plan" title="Plan mode: read, search, and plan — no changes">⚑ Plan</button><button type="button" data-mode="code" title="Code mode: supervised planning, coding, and review">◈ Code</button><button type="button" data-mode="build" title="Build mode: plan, edit, and run commands">⚒ Build</button></span><button type="button" id="agent-tools-button">Tools</button><button type="button" id="agent-critic-toggle" title="Critic: a fresh-context second opinion reviews the draft (or plan) and the agent revises it. Slower — about 2–3× per run — but steadier, especially for small models.">🧐 Critic</button>';foot.after(guide);const toolsButton=guide.querySelector('#agent-tools-button'),criticChip=guide.querySelector('#agent-critic-toggle');
   guide.querySelectorAll('#agent-mode-chip button[data-mode]').forEach(btn=>{btn.onclick=()=>{if(!agentLoop||agentLoop.running){return}setAgentMode(btn.dataset.mode)}});
   const originalPlaceholder=input.placeholder;
   const emptyHint=document.createElement('div');emptyHint.id='agent-empty-hint';emptyHint.textContent='Describe what you want Agent to accomplish…';messages.prepend(emptyHint);
@@ -296,6 +297,16 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
     paintMode();
     try{fetch('/api/agent/mode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode:next})}).catch(()=>{})}catch{}
   }
+  // Critic toggle: opt-in chip; until the user chooses once, small models get
+  // it ON (single-pass errors hurt most there), larger models get it OFF.
+  const criticKey='local-ai-agent-critic';
+  let criticPref=null;try{const v=localStorage.getItem(criticKey);criticPref=(v==='1'||v==='0')?v:null}catch{}
+  const criticModelIsSmall=()=>{try{const sel=document.getElementById('model-select');const info=(typeof modelInfo!=='undefined'&&Array.isArray(modelInfo)?modelInfo:[]).find(m=>m.name===(sel?.value||''));const sz=info?.size||0;return !!sz&&sz<=4.5*1024*1024*1024}catch{return false}};
+  const criticOn=()=>criticPref===null?criticModelIsSmall():criticPref==='1';
+  const paintCritic=()=>{if(!criticChip)return;criticChip.classList.toggle('on',criticOn());criticChip.setAttribute('aria-pressed',String(criticOn()));criticChip.textContent=(criticOn()?'🧐 Critic on':'🧐 Critic')};
+  if(criticChip)criticChip.onclick=()=>{criticPref=criticOn()?'0':'1';try{localStorage.setItem(criticKey,criticPref)}catch{}paintCritic()};
+  document.getElementById('model-select')?.addEventListener('change',paintCritic);
+  paintCritic();
   const toolLabel={read_file:'read file',write_file:'write file',list_dir:'list directory',run_command:'run command',run_tests:'run tests',search_files:'search files',grep_search:'grep search',git:'git',web_search:'web search',web_fetch:'fetch page'};
   let agentStream={update:null,count:0};
   function streamAgentTokens(delta){
@@ -312,6 +323,9 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
     if(scroll)scroll.scrollTop=scroll.scrollHeight;
   }
   let agentReasoning={update:null,count:0};
+  let criticStream={update:null,count:0},revisionStream={update:null,count:0};
+  function streamCriticDelta(delta){if(!delta)return;if(!criticStream.update){criticStream.update=appendEvent('pending','critic · reviewing the draft…');criticStream.count=0}criticStream.update.detail.textContent+=delta;criticStream.update.detail.hidden=false;criticStream.count++;if(scroll)scroll.scrollTop=scroll.scrollHeight}
+  function streamRevisionDelta(delta){if(!delta)return;if(!revisionStream.update){revisionStream.update=appendEvent('pending','revision · rewriting with the notes…');revisionStream.count=0}revisionStream.update.detail.textContent+=delta;revisionStream.update.detail.hidden=false;revisionStream.count++;if(scroll)scroll.scrollTop=scroll.scrollHeight}
   function streamAgentReasoning(delta){
     if(!delta)return;
     if(!agentReasoning.update){
@@ -345,14 +359,20 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
     if(data.type==='token'){return streamAgentTokens(data.delta)}
     if(data.type==='reasoning'){return streamAgentReasoning(data.delta)}
     if(data.type==='stream_end'||data.type==='streaming'){return}
+    if(data.type==='critic_token'){return streamCriticDelta(data.delta)}
+    if(data.type==='revision_token'){return streamRevisionDelta(data.delta)}
+    if(data.type==='critic_started'){criticStream={update:appendEvent('pending','critic · reviewing the draft…'),count:0};return}
+    if(data.type==='critic_complete'){if(criticStream.update){criticStream.update(data.verdict==='pass'?'success':'pending',data.verdict==='pass'?'critic · draft looks solid':data.verdict==='revise'?'critic · found issues — revising':data.verdict==='skipped'?'critic · skipped (draft kept as-is)':'critic · done',data.content||criticStream.update.detail.textContent||'');criticStream.update=null}criticStream.count=0;return}
+    if(data.type==='revision_started'){revisionStream={update:appendEvent('pending','revision · rewriting with the notes…'),count:0};return}
+    if(data.type==='revision_complete'){if(revisionStream.update){revisionStream.update(data.skipped?'info':'success',data.skipped?'revision · skipped (draft kept)':'revision · applied',data.content||revisionStream.update.detail.textContent||'');revisionStream.update=null}revisionStream.count=0;return}
     if(data.type==='completed'){
-      if(agentStream.update){const streamed=agentStream.update.detail?.textContent||'';agentStream.update('success','agent response · complete',streamed);agentStream.update=null}
+      if(agentStream.update){const streamed=agentStream.update.detail?.textContent||'';agentStream.update(data.draft?'info':'success',data.draft?'agent response · draft (superseded by revision)':'agent response · complete',streamed);agentStream.update=null}
       if(agentReasoning.update){const thought=agentReasoning.update.detail?.textContent||'';agentReasoning.update('info','reasoning · complete',thought);agentReasoning.update=null}
       if(agentLoop.plan){
-        finalizer('success','plan ready','Review the plan, then Approve & implement it — or toggle Plan/Build in the status bar.');
+        finalizer('success',data.verdict==='revised'?'plan ready · reviewed':'plan ready','Review the plan, then Approve & implement it — or toggle Plan/Build in the status bar.');
         pendingPlan={task:agentLoop.task,autonomy:agentLoop.autonomy,content:data.content||''};
         renderPlanHandoff(pendingPlan);
-      }else{finalizer('success','agent complete',data.content||'');if(typeof window.appendAgentResponse==='function'){try{window.appendAgentResponse(data.content||'',data.toolTrail||[])}catch{}}}agentLoop.running=false;agentLoop.plan=false;paintMode();return}
+      }else{finalizer('success',data.verdict==='revised'?'agent · reviewed answer':'agent complete',data.content||'');if(typeof window.appendAgentResponse==='function'){try{window.appendAgentResponse(data.content||'',data.toolTrail||[])}catch{}}}agentLoop.running=false;agentLoop.plan=false;paintMode();return}
     agentStream.update=null;agentReasoning.update=null;
     if(data.type==='started'){finalizer('pending','agent started','');return}
     if(data.type==='thinking'){appendEvent('pending',data.message||`step ${data.iteration} · thinking`);return}
@@ -401,7 +421,7 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
       }
     },5000);
     try{
-      const res=await fetch('/api/agent/loop',{method:'POST',headers:{'Content-Type':'application/json'},signal:controller.signal,body:JSON.stringify({task,model:model.value,autonomy,skill_prompt:skillPrompt,mode:agentMode(),chat_id:chatId,history})});
+      const res=await fetch('/api/agent/loop',{method:'POST',headers:{'Content-Type':'application/json'},signal:controller.signal,body:JSON.stringify({task,model:model.value,autonomy,skill_prompt:skillPrompt,mode:agentMode(),chat_id:chatId,history,critic:criticOn()})});
       if(!res.ok){const err=await res.json().catch(()=>({}));throw Error(err.error||`HTTP ${res.status}`)}
       const reader=res.body.getReader(),decoder=new TextDecoder();let buffer='';
       while(true){

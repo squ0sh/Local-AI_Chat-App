@@ -3605,6 +3605,7 @@ async function handle(req, res) {
       const norms = readNorms();
       const mode = payload.mode === 'plan' || payload.mode === 'build' || payload.mode === 'code' ? payload.mode : (payload.plan ? 'plan' : 'build');
       const readonly = mode === 'plan';
+      const critic = payload.critic === true;
       if (mode === 'plan') currentAgentMode = 'plan';
       const supportsTools = await modelSupportsTools(model);
 
@@ -3701,7 +3702,7 @@ async function handle(req, res) {
         const result = await runAgentLoop({
           task, model, workspaceRoot: __dirname, autonomy, skillPrompt, readonly,
           initialMessages: savedThread, onEvent, llmCall, signal: controller.signal,
-          supportsTools, norms,
+          supportsTools, norms, critic,
         });
         loopResult = result;
         if (chatId && Array.isArray(loopResult.thread)) saveAgentThread(chatId, loopResult.thread);
