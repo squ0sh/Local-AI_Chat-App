@@ -13,9 +13,12 @@ Windows. The launcher selects a matching bundled Node and Ollama runtime; it
 never silently falls back to host-installed software.
 
 Launchers open your browser automatically once the app answers
-(`LOCAL_AI_NO_BROWSER=1` disables that). On Linux, `bash tools/register-menu-entry.sh`
-adds a real app-menu icon (with `--remove` to undo); on macOS, double-clicking
-`Local AI Chat.command` launches it straight from Finder.
+(`LOCAL_AI_NO_BROWSER=1` disables that). Every desktop gets a double-click
+path: Linux runs `Local AI Chat.desktop` straight from the folder (GNOME may
+ask once to "Trust and Launch"; it works even off a USB stick), macOS runs
+`Local AI Chat.command` from Finder/Spotlight, and Windows runs
+`start-portable.cmd`. `bash tools/register-menu-entry.sh` additionally adds a
+Linux app-menu icon (`--remove` to undo).
 
 Models, settings, logs, and tunnel tooling stay under `.portable/`, so the app
 does not touch the host's Ollama library or require a system Node installation.
