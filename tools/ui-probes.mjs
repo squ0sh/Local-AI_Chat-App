@@ -182,6 +182,30 @@ ok('dead model fails closed with a friendly state', /snag|snag|busy|error/i.test
 ok('no proposals leaked into the queue on failure', /No proposals waiting/.test(await ev("document.querySelector('#sleep-queue')?.textContent || ''")));
 await ev("document.querySelector('#sleep-close')?.click()");
 
+// ── Peers dialog lifecycle ───────────────────────────────────────────────────
+ok('peers launcher exists', await ev("!!document.getElementById('peers-launch')"));
+await ev("document.getElementById('peers-launch').click()");
+await sleep(1200);
+ok('my card words render', (await ev("document.querySelector('#peers-words')?.textContent || ''")).split('·')[0].split(/\s+/).filter(Boolean).length === 6, (await ev("document.querySelector('#peers-words')?.textContent || ''")).slice(0, 90));
+ok('trusted list explains empty state', /No peers yet/.test(await ev("document.querySelector('#peers-trusted')?.textContent || ''")));
+ok('inbox explains empty state', /Inbox is empty/.test(await ev("document.querySelector('#peers-inbox')?.textContent || ''")));
+// make a note postcard and read it back through the paste loop
+await ev("(() => { document.querySelector('#peers-item-title').value='probe note'; document.querySelector('#peers-note').value='cycle-proof cargo'; })()");
+await ev("document.querySelector('#peers-make').click()");
+await sleep(800);
+const frames = await ev("document.querySelector('#peers-postcard')?.textContent || ''");
+ok('postcard frames produced', frames.includes('CAPX1 note'));
+await ev(`window.__capxFrames = ${JSON.stringify(frames)}`);
+await ev("(() => { const t=document.querySelector('#peers-inbox-text'); t.value=window.__capxFrames; t.dispatchEvent(new Event('input')); })()");
+await ev("document.querySelector('#peers-inbox-btn').click()");
+await sleep(1000);
+ok('received postcard queues in the inbox', /cycle-proof cargo|probe note/i.test(await ev("document.querySelector('#peers-inbox')?.textContent || ''")));
+await ev("[...document.querySelectorAll('#peers-inbox [data-accept]')].pop()?.click()");
+await sleep(700);
+ok('accepting drains the inbox', /Inbox is empty/.test(await ev("document.querySelector('#peers-inbox')?.textContent || ''")), (await ev("document.querySelector('#peers-inbox')?.textContent || ''")).slice(0, 90));
+await ev("document.querySelector('#peers-close')?.click()");
+await ev("delete window.__capxFrames");
+
 // ── Setup checklist on the welcome screen ────────────────────────────────────
 await sleep(1200);
 ok('setup checklist appears on empty chat', await ev("!!document.querySelector('.welcome .setup-card')"));

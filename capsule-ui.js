@@ -845,7 +845,7 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
 
 
 
-(()=>{const sidebar=document.querySelector('aside');if(!sidebar)return;const style=document.createElement('style');style.textContent='#capsule-nav{border-top:1px solid var(--line);padding:10px 8px}#capsule-nav h3{margin:0 10px 6px;color:var(--muted);font-size:10px;letter-spacing:.09em}#capsule-nav button{position:static!important;display:block!important;width:100%!important;height:auto!important;min-height:32px!important;margin:2px 0!important;padding:7px 10px!important;text-align:left!important;border:0!important;border-radius:7px!important;background:transparent!important;color:var(--muted)!important;font-size:12px!important;box-shadow:none!important}#capsule-nav button:hover{background:var(--panel3)!important;color:var(--text)!important}#capsule-nav button.on{color:var(--blue2)!important}';document.head.append(style);const nav=document.createElement('section');nav.id='capsule-nav';nav.innerHTML='<h3>CAPSULE</h3>';const labels={"portable-launch":"Portable readiness","vault-launch":"Vault","memory-launch":"Memory","sleep-launch":"Sleep cycle","cloud-launch":"Cloud connection","agent-launch":"Agent mode","remote-launch":"Capsule Remote"};Object.entries(labels).forEach(([id,label])=>{const el=document.getElementById(id);if(el){el.textContent=label;el.title=label;nav.append(el)}});sidebar.insertBefore(nav,sidebar.querySelector('.sidebar-bottom'))})();
+(()=>{const sidebar=document.querySelector('aside');if(!sidebar)return;const style=document.createElement('style');style.textContent='#capsule-nav{border-top:1px solid var(--line);padding:10px 8px}#capsule-nav h3{margin:0 10px 6px;color:var(--muted);font-size:10px;letter-spacing:.09em}#capsule-nav button{position:static!important;display:block!important;width:100%!important;height:auto!important;min-height:32px!important;margin:2px 0!important;padding:7px 10px!important;text-align:left!important;border:0!important;border-radius:7px!important;background:transparent!important;color:var(--muted)!important;font-size:12px!important;box-shadow:none!important}#capsule-nav button:hover{background:var(--panel3)!important;color:var(--text)!important}#capsule-nav button.on{color:var(--blue2)!important}';document.head.append(style);const nav=document.createElement('section');nav.id='capsule-nav';nav.innerHTML='<h3>CAPSULE</h3>';const labels={"portable-launch":"Portable readiness","vault-launch":"Vault","memory-launch":"Memory","sleep-launch":"Sleep cycle","peers-launch":"Peers","cloud-launch":"Cloud connection","agent-launch":"Agent mode","remote-launch":"Capsule Remote"};Object.entries(labels).forEach(([id,label])=>{const el=document.getElementById(id);if(el){el.textContent=label;el.title=label;nav.append(el)}});sidebar.insertBefore(nav,sidebar.querySelector('.sidebar-bottom'))})();
 
 
 
@@ -1861,4 +1861,71 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
   d.querySelector('#sleep-close').onclick=()=>{d.close()};
   d.addEventListener('close',stopPoll);
   fetch('/api/consolidation/status').then(r=>r.json()).then(paintSidebar).catch(()=>{});
+})();
+
+/* ── Peers: capsule-to-capsule handshakes (LAN, postcards, sneakernet) ────── */
+(()=>{
+  if(!['localhost','127.0.0.1'].includes(location.hostname))return;
+  const css=document.createElement('style');
+  css.textContent='.peer-card{border:1px solid var(--line);border-radius:10px;background:var(--panel2);padding:10px;margin:8px 0}.peer-card small{color:var(--muted)}.peer-words{font:12px var(--mono);background:var(--panel3);border:1px solid var(--line);border-radius:8px;padding:8px 10px;letter-spacing:.06em}.peer-frame{max-height:130px;overflow:auto;font:10.5px var(--mono);background:#0b1018;border:1px solid var(--line);border-radius:8px;padding:8px;white-space:pre-wrap;word-break:break-all}.peer-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.peer-pill{font:10px var(--mono);border:1px solid var(--line);border-radius:99px;padding:2px 8px;color:var(--muted)}';
+  document.head.append(css);
+  const b=document.createElement('button');b.id='peers-launch';b.textContent='Peers';document.body.append(b);
+  const d=document.createElement('dialog');
+  d.innerHTML='<div class="settings"><h2>Peers & handshakes <span class="agent-badge">sovereign</span></h2><p>Trade memories, procedures, and notes between two capsules — no server required. Cards pair people; postcards travel by LAN, USB, chat paste, or radio text. Nothing is accepted without your explicit approval.</p><label>My capsule card</label><div class="peer-words" id="peers-words">…</div><div class="peer-row"><button class="plain-btn" id="peers-copy-card">Copy my card</button><button class="plain-btn" id="peers-dl-card">Download card file</button></div><label>Pair with someone</label><textarea id="peers-import-text" rows="3" placeholder="Paste their card text (CAPX1 frames) here…"></textarea><div class="peer-row"><button class="plain-btn" id="peers-import-btn">Import & trust card</button></div><div id="peers-trusted"></div><label>Slow-channel exchange (USB / chat paste / radio text)</label><div class="peer-row"><select id="peers-kind"><option value="note">Note</option><option value="procedure">Procedure</option></select><select id="peers-target"></select></div><div id="peers-proc-pick" hidden></div><textarea id="peers-note" rows="2" placeholder="Note text (when sending a note)"></textarea><div class="peer-row"><input id="peers-item-title" placeholder="Title"><button class="plain-btn" id="peers-make">Make postcard</button></div><div id="peers-postcard" class="peer-frame" hidden></div><div class="peer-row" id="peers-postcard-actions" hidden><button class="plain-btn" id="peers-copy-postcard">Copy frames</button></div><label>Receive a postcard</label><textarea id="peers-inbox-text" rows="3" placeholder="Paste received CAPX1 frames here…"></textarea><div class="peer-row"><button class="plain-btn" id="peers-inbox-btn">Read postcard</button></div><label>Inbox (approve before anything lands)</label><div id="peers-inbox"></div><label>Live LAN</label><div class="peer-row"><button class="plain-btn" id="peers-listen">Become discoverable on LAN</button><span id="peers-listen-state" class="peer-pill">off</span></div><div id="peers-seen"></div><div id="peers-sync-box" hidden><div class="peer-row"><span id="peers-sync-with" style="font-weight:700"></span><button class="plain-btn" id="peers-sync-now">Push selected procedures</button></div><div id="peers-sync-picks"></div><div class="sleep-verbs">Confirm the six words match on both screens: <span class="peer-words" id="peers-sync-words"></span></div></div><div class="notice" id="peers-notice"></div><div class="dialog-actions"><button class="plain-btn" id="peers-close">Done</button></div></div>';
+  document.body.append(d);
+  const $=(id)=>d.querySelector('#'+id);
+  const norm=m=>window.humanizeErrorText?window.humanizeErrorText(m):m;
+  const paint=async()=>{
+    try{
+      const j=await (await fetch('/api/peers')).json();
+      $('peers-words').textContent=j.words+'  ·  '+j.fp.slice(0,12);
+      $('peers-copy-card').onclick=async()=>{await navigator.clipboard.writeText(j.cardText);$('peers-notice').textContent='Card copied — send it through any channel.'};
+      $('peers-dl-card').onclick=()=>{const blob=new Blob([j.cardText],{type:'text/plain'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='capsule-card.capx.txt';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)};
+      const target=$('peers-target');target.innerHTML='<option value="">(open — anyone with the frames)</option>'+(j.peers||[]).map(p=>`<option value="${p.fp}">${p.name} · ${p.fp.slice(0,8)}</option>`).join('');
+      const picks=$('peers-sync-picks');picks.innerHTML='';
+      $('peers-trusted').innerHTML=(j.peers||[]).map(p=>`<div class="peer-card"><b>${p.name}</b> <span class="peer-pill">${p.fp.slice(0,12)}</span><br><small>${p.words||''} · since ${String(p.trustedAt||'').slice(0,10)}</small> <button class="plain-btn danger" style="padding:2px 8px;font-size:11px" data-revoke="${p.fp}">Revoke</button></div>`).join('')||'<div class="privacy">No peers yet — exchange cards first.</div>';
+      $('peers-trusted').querySelectorAll('[data-revoke]').forEach(btn=>btn.onclick=async()=>{if(confirm('Revoke this peer? Future postcards from them stop reading.')){await fetch('/api/peers/revoke',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({fp:btn.dataset.revoke})});await paint()}});
+      $('peers-listen').textContent=j.listening?'Stop being discoverable':'Become discoverable on LAN';
+      $('peers-listen-state').textContent=j.listening?'listening':'off';
+      $('peers-seen').innerHTML=(j.seen||[]).map(p=>`<div class="peer-card"><b>${p.name||'capsule'}</b> <span class="peer-pill">${p.address}:${p.port}</span> <button class="plain-btn" style="padding:2px 8px;font-size:11px" data-connect="${p.address}" data-port="${p.port}">Sync items</button></div>`).join('');
+      $('peers-seen').querySelectorAll('[data-connect]').forEach(btn=>btn.onclick=()=>{const box=$('peers-sync-box');box.hidden=false;$('peers-sync-with').textContent='with '+(btn.parentElement.querySelector('b')?.textContent||'peer');box.dataset.address=btn.dataset.connect;box.dataset.port=btn.dataset.port;renderSyncPicks()});
+      $('peers-inbox').innerHTML=(j.inbox||[]).map(i=>`<div class="peer-card"><b>${i.kind==='procedure'?'🧱':'🧠'} ${i.item?.title||i.item?.name||i.kind}</b><br><small>from ${i.fromName} ${i.sealed?'(sealed)':'(open)'} · ${String(i.at).slice(0,16).replace('T',' ')}</small><div style="font-size:12.5px;margin:4px 0;white-space:pre-wrap">${(i.item?.text||i.item?.summary||(i.item?.steps||[]).join('  → ')||'').slice(0,400)}</div><div class="peer-row"><button class="plain-btn" style="padding:4px 10px;font-size:11px;border-color:var(--green);color:var(--green)" data-accept="${i.id}">Accept</button><button class="plain-btn danger" style="padding:4px 10px;font-size:11px" data-dismiss="${i.id}">Dismiss</button></div></div>`).join('')||'<div class="privacy">Inbox is empty.</div>';
+      $('peers-inbox').querySelectorAll('[data-accept]').forEach(btn=>btn.onclick=async()=>{await fetch('/api/peers/inbox/decide',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:btn.dataset.accept,action:'accept'})});await paint()});
+      $('peers-inbox').querySelectorAll('[data-dismiss]').forEach(btn=>btn.onclick=async()=>{await fetch('/api/peers/inbox/decide',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:btn.dataset.dismiss,action:'dismiss'})});await paint()});
+    }catch(e){$('peers-notice').textContent=norm(e.message)}
+  };
+  const renderSyncPicks=async()=>{
+    try{
+      const procs=(await (await fetch('/api/agent/procedures')).json()).procedures||[];
+      $('peers-sync-picks').innerHTML=procs.length?procs.map(p=>`<label style="display:flex;gap:7px;font-size:12px;margin:4px 0"><input type="checkbox" data-proc="${p.id}"> <span>${p.name} <small style="color:var(--muted)">(${(p.steps||[]).length} steps)</small></span></label>`).join(''):'<div class="privacy">No procedures saved yet — notes also shareable from the postcard section.</div>';
+    }catch{}
+  };
+  $('peers-import-btn').onclick=async()=>{try{const r=await fetch('/api/peers/import-card',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:$('peers-import-text').value})}),j=await r.json();if(!r.ok)throw Error(j.error);$('peers-notice').textContent=`Trusted ${j.peer.name} — compare the words with them out loud if you can: ${j.peer.words}`;$('peers-import-text').value='';await paint()}catch(e){$('peers-notice').textContent=norm(e.message)}};
+  $('peers-make').onclick=async()=>{
+    try{
+      const kind=$('peers-kind').value,fp=$('peers-target').value||'';
+      const payload={kind,fp,title:$('peers-item-title').value||undefined};
+      if(kind==='note')payload.text=$('peers-note').value;
+      if(kind==='procedure'){const id=$('peers-proc-pick').querySelector('input[type=radio]:checked')?.value;if(!id){$('peers-notice').textContent='Pick which of your procedures to wrap.';return}payload.item=undefined;payload.procedureId=id}
+      const r=await fetch('/api/peers/postcard',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),j=await r.json();
+      if(!r.ok)throw Error(j.error);
+      $('peers-postcard').hidden=false;$('peers-postcard').textContent=j.text;$('peers-postcard-actions').hidden=false;
+      $('peers-copy-postcard').onclick=async()=>{await navigator.clipboard.writeText(j.text);$('peers-notice').textContent='Frames copied — paste them anywhere text travels.'};
+      $('peers-notice').textContent=`Postcard ready (${j.mode} mode${j.target?`, for ${j.target}`:''}).`;
+    }catch(e){$('peers-notice').textContent=norm(e.message)}
+  };
+  $('peers-kind').onchange=async()=>{const box=$('peers-proc-pick');if($('peers-kind').value==='procedure'){box.hidden=false;const procs=(await (await fetch('/api/agent/procedures')).json()).procedures||[];box.innerHTML=procs.map(p=>`<label style="display:flex;gap:7px;font-size:12px;margin:3px 0"><input type="radio" name="proc-pick" value="${p.id}"><span>${p.name}</span></label>`).join('')||'<div class="privacy">No saved procedures yet.</div>'}else box.hidden=true};
+  $('peers-inbox-btn').onclick=async()=>{try{const r=await fetch('/api/peers/import',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:$('peers-inbox-text').value})}),j=await r.json();if(!r.ok)throw Error(j.error);$('peers-inbox-text').value='';$('peers-notice').textContent=j.card?`Paired with ${j.peer.name} ✓`:'Postcard read — review it in the inbox below.';await paint()}catch(e){$('peers-notice').textContent=norm(e.message)}};
+  $('peers-listen').onclick=async()=>{try{const st=$('peers-listen-state').textContent==='listening';const r=await fetch('/api/peers/listen',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({on:!st})}),j=await r.json();if(!r.ok)throw Error(j.error);await paint()}catch(e){$('peers-notice').textContent=norm(e.message)}};
+  $('peers-sync-now').onclick=async()=>{
+    try{
+      const box=$('peers-sync-box');const ids=[...d.querySelectorAll('[data-proc]:checked')].map(x=>x.dataset.proc);
+      const items=ids.map(id=>({kind:'procedure',id}));
+      const r=await fetch('/api/peers/sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({address:box.dataset.address,port:box.dataset.port,items})}),j=await r.json();
+      if(!r.ok)throw Error(j.error);
+      $('peers-notice').textContent=`Pushed ${j.pushed} — confirm the words on both screens: ${j.words}`;$('peers-sync-words').textContent=j.words;
+    }catch(e){$('peers-notice').textContent=norm(e.message)}
+  };
+  b.onclick=async()=>{d.showModal();$('peers-notice').textContent='';await paint()};
+  $('peers-close').onclick=()=>d.close();
 })();

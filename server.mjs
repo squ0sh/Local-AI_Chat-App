@@ -26,6 +26,8 @@ import qrcode from './lib/vendor/qrcode-generator.mjs';
 import { portableIntegrityReport, rebuildManifest, repairReleaseFiles, releaseTrackedPaths } from './lib/capsule-integrity.mjs';
 import { MemoryStore, makeOllamaEmbedder, makeStubEmbedder } from './lib/capsule-memory.mjs';
 import { ConsolidationEngine } from './lib/consolidation.mjs';
+import { newDeviceIdentity, makeCard, readCard, packPostcard, unpackPostcard, envToText, textToEnv, fingerprint as peerFp, wordsPhrase } from './lib/capsule-handshake.mjs';
+import { LanLink } from './lib/capsule-net.mjs';
 import { sealVault, openVault } from './lib/capsule-vault.mjs';
 import { ResearchEngine } from './lib/research-engine.mjs';
 import { pullOllamaModel } from './lib/resumable-ollama-pull.mjs';
@@ -2204,6 +2206,102 @@ function scheduleMemoryReindex() {
   memoryReindexTimer = setTimeout(() => { memoryReindexNow().catch(() => {}); }, 4000);
 }
 
+// ── Peer handshakes: identity store, outbox/ledger, LAN sessions ───────────
+const PEERS_DIR = join(DATA_DIR, 'peers');
+const PEERS_FILE = join(PEERS_DIR, 'trusted.json');
+const PEER_IDENTITY_FILE = join(PEERS_DIR, 'identity.json');
+const PEERS_INBOX_FILE = join(PEERS_DIR, 'inbox.json');
+const PEERS_LOG_FILE = join(PEERS_DIR, 'handshakes.log');
+let lanLink = null;
+
+function peersIdentity() {
+  try { return JSON.parse(readFileSync(PEER_IDENTITY_FILE, 'utf8')); } catch {}
+  const identity = newDeviceIdentity();
+  mkdirSync(PEERS_DIR, { recursive: true });
+  const tmp = PEER_IDENTITY_FILE + '.tmp';
+  writeFileSync(tmp, JSON.stringify(identity));
+  renameSync(tmp, PEER_IDENTITY_FILE);
+  try { chmodSync(PEER_IDENTITY_FILE, 0o600); } catch {}
+  return identity;
+}
+function peersList() { try { const j = JSON.parse(readFileSync(PEERS_FILE, 'utf8')); return Array.isArray(j.peers) ? j.peers : []; } catch { return []; } }
+function writePeers(list) { mkdirSync(PEERS_DIR, { recursive: true }); writeFileSync(PEERS_FILE + '.tmp', JSON.stringify({ schema: 1, peers: list }, null, 2)); renameSync(PEERS_FILE + '.tmp', PEERS_FILE); try { chmodSync(PEERS_FILE, 0o600); } catch {} }
+function peersInbox() { try { const j = JSON.parse(readFileSync(PEERS_INBOX_FILE, 'utf8')); return Array.isArray(j.items) ? j.items : []; } catch { return []; } }
+function writePeersInbox(list) { mkdirSync(PEERS_DIR, { recursive: true }); writeFileSync(PEERS_INBOX_FILE + '.tmp', JSON.stringify({ schema: 1, items: list }, null, 2)); renameSync(PEERS_INBOX_FILE + '.tmp', PEERS_INBOX_FILE); }
+function peersLog(line) { try { mkdirSync(PEERS_DIR, { recursive: true }); appendFileSync(PEERS_LOG_FILE, `${new Date().toISOString()} ${line}\n`, 'utf8'); } catch {} }
+function peersStatus() {
+  const identity = peersIdentity();
+  const card = makeCard(identity, { name: deviceName() });
+  return {
+    card, fp: peerFp(identity.pub), words: wordsPhrase(identity.pub),
+    cardText: envToText(packPostcard(peersIdentity(), { kind: 'cardref', mode: 'open', item: card, to: '*' })),
+    peers: peersList(), inbox: peersInbox().filter((i) => i.status === 'pending'),
+    listening: !!lanLink, seen: lanLink ? lanLink.seenPeers() : [],
+    port: lanLink ? lanLink.port : 0,
+  };
+}
+function deviceName() {
+  try { return (homedir().split(/[\\/]/).pop() || 'my capsule') + ' · ' + process.platform; } catch { return 'my capsule'; }
+}
+
+async function lanLinkStart() {
+  if (lanLink) return lanLink;
+  lanLink = new LanLink(peersIdentity(), deviceName(), { port: Number(process.env.LOCAL_AI_PEER_PORT) || undefined });
+  // Any inbound LAN session: every received item becomes a PENDING inbox entry
+  // routed through the same approve/dismiss consent flow as every other
+  // channel. Nothing ever lands without the user's click.
+  const acceptInbound = (api) => {
+    api.onMessage((m) => {
+      try {
+        if (m.t === 'item' && m.env) {
+          const known = peersList().find((p) => p.fp === m.env.src);
+          const read = unpackPostcard(m.env, { identity: peersIdentity(), trustedPubs: peersList() });
+          const inbox = peersInbox();
+          inbox.push({
+            id: `inbox-${Date.now().toString(36)}-${randomBytes(2).toString('hex')}`,
+            kind: read.kind, from: read.src, fromName: known?.name || api.peer.name || 'LAN peer',
+            item: read.item, at: read.at || new Date().toISOString(), sealed: !!read.sealed,
+            status: 'pending', via: 'lan', sessionWords: api.words,
+          });
+          writePeersInbox(inbox);
+          peersLog(`LAN: received ${read.kind} from ${known?.name || api.peer.name || 'peer'}`);
+          api.send({ t: 'ack', ok: true });
+        } else if (m.t === 'item-ack-request') {
+          api.send({ t: 'ack', ok: true });
+        }
+      } catch (e) {
+        try { api.send({ t: 'ack', ok: false, error: String(e.message || e) }); } catch {}
+      }
+    });
+    peersLog(`LAN: session with ${api.peer.name || api.peer.fp.slice(0, 12)} (${api.words})`);
+  };
+  lanLink.on('session', acceptInbound);
+  await lanLink.listen();
+  return lanLink;
+}
+async function lanLinkStop() { if (lanLink) { lanLink.stop(); lanLink = null; } }
+
+async function lanPushItems(address, port, items) {
+  const link = await lanLinkStart();
+  const peer = link.seenPeers().find((p) => p.address === address) || null;
+  const session = await link.connect(address, port || (peer ? peer.port : undefined) || undefined);
+  try {
+    const ack = new Promise((resolve) => {
+      const to = setTimeout(() => resolve({ ok: false, error: 'no acknowledgement' }), 15000);
+      session.onMessage((m) => { if (m.t === 'ack') { clearTimeout(to); resolve(m); } });
+    });
+    session.send({ t: 'offer', items: items.map((i) => ({ kind: i.kind, title: i.title })) });
+    for (const it of items) session.send({ t: 'item', env: it.env });
+    session.send({ t: 'bye' });
+    const a = await ack;
+    peersLog(`LAN push to ${address}: ${items.length} item(s), ack=${a && a.ok}`);
+    return { ok: a.ok !== false, words: session.words, peer: session.peer.name || '' };
+  } finally {
+    session.close();
+  }
+}
+
+
 // ── Consolidation cycle ("sleep on it") ────────────────────────────────────
 // Manual trigger; every memory fact and procedure it produces waits in an
 // approval queue — nothing lands until the user says so.
@@ -3216,6 +3314,148 @@ async function handle(req, res) {
     const result = action === 'approve' ? await consolidation.approve(id) : await consolidation.dismiss(id, String(body.reason || ''));
     if (!result.ok) return sendJSON(res, 404, { error: result.error });
     return sendJSON(res, 200, { ok: true, remaining: result.remaining });
+  }
+
+  // ── Capsule-to-capsule handshakes (peers: LAN + postcards + sneakernet) ──
+  if (p.startsWith('/api/peers') && !isDirectLocalRequest(req)) {
+    return sendJSON(res, 403, { error: 'Peering is available only in the local app' });
+  }
+  if (req.method === 'GET' && p === '/api/peers') {
+    return sendJSON(res, 200, peersStatus());
+  }
+  if (req.method === 'POST' && p === '/api/peers/import-card') {
+    let body; try { body = JSON.parse(await readBody(req, 50_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    try {
+      const text = String(body.text || '');
+      let card;
+      if (text.includes('CAPX1 ')) {
+        const env = textToEnv(text);
+        if (env.kind !== 'cardref') return sendJSON(res, 400, { error: 'That block is not a contact card.' });
+        card = unpackPostcard(env, { trustedPubs: peersList() }).item;
+      } else {
+        card = JSON.parse(text);
+      }
+      const read = readCard(card);
+      const peers = peersList();
+      if (!peers.some((p) => p.fp === read.fp)) {
+        peers.push({ fp: read.fp, name: read.name, pub: read.pub, dhPub: read.dhPub, caps: read.caps, trustedAt: new Date().toISOString(), words: read.words });
+        writePeers(peers);
+        peersLog(`trusted ${read.name} (${read.fp.slice(0, 12)})`);
+      }
+      return sendJSON(res, 200, { ok: true, peer: read });
+    } catch (e) { return sendJSON(res, 400, { error: 'That card could not be read: ' + e.message }); }
+  }
+  if (req.method === 'POST' && p === '/api/peers/revoke') {
+    let body; try { body = JSON.parse(await readBody(req, 5_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const fp = String(body.fp || '');
+    const before = peersList().length;
+    writePeers(peersList().filter((p) => p.fp !== fp));
+    peersLog(`revoked ${fp.slice(0, 12)}`);
+    return sendJSON(res, 200, { ok: true, removed: before - peersList().length });
+  }
+  if (req.method === 'POST' && p === '/api/peers/postcard') {
+    let body; try { body = JSON.parse(await readBody(req, 100_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    try {
+      const kind = ['note', 'memory', 'procedure'].includes(body.kind) ? body.kind : 'note';
+      const item = body.item && typeof body.item === 'object' ? body.item : { title: String(body.title || '').slice(0, 120), text: String(body.text || '').slice(0, 4000) };
+      const peers = peersList();
+      const peer = body.fp ? peers.find((p) => p.fp === body.fp) : null;
+      const mode = peer ? 'sealed' : 'open';
+      const env = packPostcard(peersIdentity(), { kind, to: peer ? peer.fp : '*', toDhPub: peer?.dhPub || '', item, mode });
+      const text = envToText(env);
+      peersLog(`sent ${kind} postcard${peer ? ' to ' + peer.name : ' (open mode)'} — ${item.title || kind}`);
+      return sendJSON(res, 200, { ok: true, text, mode, target: peer?.name || 'anyone' });
+    } catch (e) { return sendJSON(res, 400, { error: e.message }); }
+  }
+  if (req.method === 'POST' && p === '/api/peers/import') {
+    let body; try { body = JSON.parse(await readBody(req, 100_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    try {
+      const env = textToEnv(String(body.text || ''));
+      if (env.kind === 'cardref') {
+        const card = readCard(unpackPostcard(env, { trustedPubs: peersList() }).item);
+        const peers = peersList();
+        if (!peers.some((p) => p.fp === card.fp)) {
+          peers.push({ fp: card.fp, name: card.name, pub: card.pub, dhPub: card.dhPub, caps: card.caps, trustedAt: new Date().toISOString(), words: card.words });
+          writePeers(peers);
+          peersLog(`trusted ${card.name} (${card.fp.slice(0, 12)}) via postcard`);
+        }
+        return sendJSON(res, 200, { ok: true, card: true, peer: card });
+      }
+      const known = peersList().find((p) => p.fp === env.src);
+      const read = unpackPostcard(env, { identity: peersIdentity(), trustedPubs: peersList() });
+      const inbox = peersInbox();
+      const entry = {
+        id: `inbox-${Date.now().toString(36)}-${randomBytes(2).toString('hex')}`,
+        kind: read.kind, from: read.src, fromName: known?.name || 'unknown sender',
+        item: read.item, at: read.at || new Date().toISOString(), sealed: !!read.sealed, status: 'pending',
+      };
+      inbox.push(entry);
+      writePeersInbox(inbox);
+      peersLog(`received ${read.kind} postcard from ${entry.fromName}${read.sealed ? ' (sealed)' : ''}`);
+      return sendJSON(res, 200, { ok: true, inbox: entry });
+    } catch (e) { return sendJSON(res, 400, { error: 'That postcard could not be read: ' + e.message }); }
+  }
+  if (req.method === 'POST' && p === '/api/peers/inbox/decide') {
+    let body; try { body = JSON.parse(await readBody(req, 10_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const inbox = peersInbox();
+    const it = inbox.find((x) => x.id === String(body.id || '') && x.status === 'pending');
+    if (!it) return sendJSON(res, 404, { error: 'Unknown or already-resolved inbox item.' });
+    if (body.action === 'dismiss') {
+      it.status = 'dismissed';
+      writePeersInbox(inbox);
+      peersLog(`dismissed inbound ${it.kind} from ${it.fromName}`);
+      return sendJSON(res, 200, { ok: true });
+    }
+    if (body.action === 'accept') {
+      try {
+        if (it.kind === 'memory') {
+          await memoryStore.syncSource({ type: 'memory', id: it.id, title: `From ${it.fromName}: ${it.item?.title || 'note'}` }, String(it.item?.text || it.item?.body || ''), memoryEmbedder());
+          memoryStore.save();
+        } else if (it.kind === 'procedure') {
+          const list = readProcedures();
+          list.push({ id: `proc-${Date.now().toString(36)}-${randomBytes(2).toString('hex')}`, name: String(it.item?.name || 'shared procedure'), summary: String(it.item?.summary || ''), steps: (it.item?.steps || []).filter(Boolean).slice(0, 12), source_task: `peer:${it.fromName}`, created: new Date().toISOString(), uses: 0 });
+          writeProcedures(list);
+        }
+      } catch (e) { return sendJSON(res, 500, { error: 'Accepted but storing failed: ' + e.message }); }
+      it.status = 'accepted';
+      writePeersInbox(inbox);
+      peersLog(`accepted inbound ${it.kind} from ${it.fromName}`);
+      return sendJSON(res, 200, { ok: true });
+    }
+    return sendJSON(res, 400, { error: "action must be 'accept' or 'dismiss'" });
+  }
+  if (req.method === 'POST' && p === '/api/peers/listen') {
+    let body; try { body = JSON.parse(await readBody(req, 5_000)); } catch { body = {}; }
+    try {
+      if (body.on === false) { await lanLinkStop(); }
+      else {
+        await lanLinkStart(String(body.label || deviceName()));
+      }
+      return sendJSON(res, 200, { ok: true, listening: !!lanLink });
+    } catch (e) { return sendJSON(res, 500, { error: 'Could not listen on the LAN: ' + e.message }); }
+  }
+  if (req.method === 'POST' && p === '/api/peers/sync') {
+    let body; try { body = await readBody(req, 50_000).then(JSON.parse).catch(() => null); } catch { body = null; }
+    if (!body) return sendJSON(res, 400, { error: 'Invalid JSON' });
+    try {
+      const address = String(body.address || '').trim();
+      if (!/^[\w.:\-]+$/.test(address)) return sendJSON(res, 400, { error: 'bad address' });
+      const items = [];
+      const procs = readProcedures();
+      for (const it of Array.isArray(body.items) ? body.items.slice(0, 12) : []) {
+        if (it.kind === 'procedure') {
+          const proc = procs.find((p) => p.id === String(it.id || ''));
+          if (!proc) continue;
+          items.push({ kind: 'procedure', title: proc.name, env: packPostcard(peersIdentity(), { kind: 'procedure', mode: 'open', item: { name: proc.name, summary: proc.summary, steps: proc.steps } }) });
+        } else if (it.kind === 'note') {
+          items.push({ kind: 'note', title: String(it.title || 'note').slice(0, 120), env: packPostcard(peersIdentity(), { kind: 'note', mode: 'open', item: { title: String(it.title || '').slice(0, 120), text: String(it.text || '').slice(0, 4000) } }) });
+        }
+      }
+      if (!items.length) return sendJSON(res, 400, { error: 'nothing selected to share — tick at least one item' });
+      const result = await lanPushItems(address, Number(body.port) || 0, items);
+      if (!result.ok) return sendJSON(res, 409, { error: 'The peer did not accept the delivery (pair cards first, then try again).', code: 'ACK_REFUSED' });
+      return sendJSON(res, 200, { ok: true, words: result.words, pushed: items.length, peer: result.peer || '' });
+    } catch (e) { return sendJSON(res, 400, { error: 'Could not sync: ' + e.message }); }
   }
 
   // ── Offline speech: whisper.cpp (STT) and piper (TTS), local-only ─────────

@@ -251,6 +251,13 @@ digests what changed into proposals — memory facts, reusable procedures — an
 presents them next morning in an approval queue with citations. You accept or
 dismiss each; nothing writes until you click.
 
+The **Peers** entry opens capsule-to-capsule handshakes: pair two capsules by
+exchanging signed cards (QR-able, typeable 6-word safety phrase, or pasted
+frames), then trade memory facts and procedures as **postcards** over any
+medium — a live encrypted LAN sync, a USB stick, a pasted Meshtastic message,
+or a sign-only frame for ham radio (it refuses to encrypt there on purpose).
+Received items always wait in an approval inbox; nothing lands silently.
+
 The **Memory** entry in the Capsule sidebar turns on private long-term recall:
 your chats and research reports index into an encrypted store on this machine,
 so the agent can answer "what did we decide about X?" with links back to the

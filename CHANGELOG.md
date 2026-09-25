@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.8.1 — Capsule↔Capsule handshakes (postcards over anything)
+
+- **A peer protocol that doesn't care how it travels.** Every exchangeable
+  thing (a contact card, a memory fact, a procedure, a note) ships as a signed
+  CAPX1 envelope that fragments into copy-pasteable frames — the same text
+  fits a LAN session, a USB stick, a QR sheet, a Meshtastic chat, or a
+  ham-radio packet (sign-only mode there, because ham rules ban obscured
+  content). Postcards addressed to a known peer are sealed with X25519 +
+  AES-256-GCM; nobody else reads them.
+- **Trust by meeting, not by server.** Devices pair by exchanging self-signed
+  cards (six-word safety phrase included for out-of-band confirmation) and
+  trusting on first sight; the trusted list and every handshake (sent,
+  received, accepted, refused) journal to `data/peers/handshakes.log`.
+- **LAN live sync that asks first.** "Become discoverable" announces the
+  capsule over UDP; a direct session runs an authenticated X25519 handshake
+  (badged by Ed25519 signatures with MITM-broken words check) and pushed items
+  land in the receiver's **inbox as pending proposals** — the same
+  approve/dismiss grammar as the sleep cycle. Untrusted senders are refused
+  before any content is stored.
+- New **Peers** dialog: my card (copy/download), paste-to-pair, one-click
+  postcard composer + raw frame viewer, receive-paste with approval cards,
+  LAN discovery + push flow with the six-word confirmation line.
+- Verified by a real two-process live handshake on loopback (encrypted
+  channel + consent gate proven), fragment reordering/mangling attacks
+  rejected, sealed-vs-ham modes pinned, and temp files cleaned—the zombie
+  smell from the old probe cleanup is gone.
+
 ## 1.8.0 — The Consolidation Cycle: the capsule sleeps on it
 
 - **A "sleep on it" engine.** One click lets the capsule quietly digest what
