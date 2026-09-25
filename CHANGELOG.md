@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.8.0 — The Consolidation Cycle: the capsule sleeps on it
+
+- **A "sleep on it" engine.** One click lets the capsule quietly digest what
+  changed since the last cycle: durable memory facts and reusable procedure
+  candidates are mined from recent chats and research, then staged as
+  proposals in a **review queue** — nothing is ever written without your
+  approval. Approving a memory feeds the encrypted local index; approving a
+  procedure lands in your personal procedure library; dismissing is recorded
+  with your reason. Cancellable mid-cycle, failure-safe (a dead model mid-run
+  queues nothing), and every verdict is journaled to `consolidations.log`.
+- The **Sleep cycle** panel (sidebar) shows the live phase, the queue with
+  per-proposal source citations, and a calm written briefing when a cycle
+  finishes. The sidebar entry itself badges while proposals await review.
+- Model-busy guard: the cycle politely declines while a chat/agent run holds
+  the local model, and the cycle takes the currently selected chat model (not
+  an unrelated default) — fixed in the same pass.
+
 ## 1.7.0 — Capsule Memory: your capsule remembers, and can prove it
 
 - **Local long-term recall with citations.** Chats and research reports index

@@ -168,6 +168,20 @@ ok('sidebar shows memory state after enable', /on/i.test(await ev("document.getE
 // restore isolation for later sections
 await ev("fetch('/api/memory/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:'{\"enabled\":false}'}).catch(()=>{})");
 
+// ── Sleep cycle dialog ───────────────────────────────────────────────────────
+ok('sleep launcher exists', await ev("!!document.getElementById('sleep-launch')"));
+await ev("document.getElementById('sleep-launch').click()");
+await sleep(1000);
+ok('sleep dialog opens in idle state', /Idle/i.test(await ev("document.querySelector('#sleep-state')?.textContent || ''")));
+await ev("(() => { const s=document.getElementById('model-select'); if (![...s.options].some(o=>o.value==='stub')) s.innerHTML='<option value=\"stub\">stub-model</option>'; s.value='stub'; })()");
+await ev("fetch('/api/chatstate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({workspace:{chats:[{id:'chat-sleep-probe',title:'Probe lane',createdAt:1,updatedAt:2,model:'',systemPrompt:'',projectId:'',privacy:'local',messages:[{role:'user',content:'Consolidation needs something to chew on for this probe, otherwise the cycle correctly stays quiet.'},{role:'assistant',content:'Indeed — the probe plants a real source so the digest phase runs and the dead-model failure path proves itself.'}]}],projects:[],activeId:'chat-sleep-probe'}})})");
+await sleep(600);
+await ev("document.querySelector('#sleep-start')?.click()");
+await sleep(4000);
+ok('dead model fails closed with a friendly state', /snag|snag|busy|error/i.test(await ev("document.querySelector('#sleep-state')?.textContent || ''")) || /could not|hit a snag/i.test(await ev("document.querySelector('#sleep-status, #sleep-notice')?.textContent || ''")), await ev("document.querySelector('#sleep-state')?.textContent || ''"));
+ok('no proposals leaked into the queue on failure', /No proposals waiting/.test(await ev("document.querySelector('#sleep-queue')?.textContent || ''")));
+await ev("document.querySelector('#sleep-close')?.click()");
+
 // ── Setup checklist on the welcome screen ────────────────────────────────────
 await sleep(1200);
 ok('setup checklist appears on empty chat', await ev("!!document.querySelector('.welcome .setup-card')"));

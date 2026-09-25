@@ -25,6 +25,7 @@ import { randomBytes, createHash } from 'crypto';
 import qrcode from './lib/vendor/qrcode-generator.mjs';
 import { portableIntegrityReport, rebuildManifest, repairReleaseFiles, releaseTrackedPaths } from './lib/capsule-integrity.mjs';
 import { MemoryStore, makeOllamaEmbedder, makeStubEmbedder } from './lib/capsule-memory.mjs';
+import { ConsolidationEngine } from './lib/consolidation.mjs';
 import { sealVault, openVault } from './lib/capsule-vault.mjs';
 import { ResearchEngine } from './lib/research-engine.mjs';
 import { pullOllamaModel } from './lib/resumable-ollama-pull.mjs';
@@ -2202,6 +2203,54 @@ function scheduleMemoryReindex() {
   clearTimeout(memoryReindexTimer);
   memoryReindexTimer = setTimeout(() => { memoryReindexNow().catch(() => {}); }, 4000);
 }
+
+// ── Consolidation cycle ("sleep on it") ────────────────────────────────────
+// Manual trigger; every memory fact and procedure it produces waits in an
+// approval queue — nothing lands until the user says so.
+const consolidation = new ConsolidationEngine({
+  dataDir: DATA_DIR,
+  complete: (system, user) => ollamaSummarizeChat(consolidation.activeModel || cfg.model, [
+    { role: 'system', content: system }, { role: 'user', content: user },
+  ]),
+  collectSources: async (since) => {
+    const sinceMs = since ? Date.parse(since) : 0;
+    const out = [];
+    const workspace = chatStoreFor('').get();
+    for (const chat of workspace?.chats || []) {
+      if (!chat?.id || !Array.isArray(chat.messages)) continue;
+      if (sinceMs && Number(chat.updatedAt || 0) <= sinceMs) continue;
+      const text = chat.messages.map((m) => (m && typeof m.content === 'string' ? `${m.role}: ${m.content}` : '')).filter(Boolean).join('\n\n');
+      if (text.length >= 80) out.push({ src: { type: 'chat', id: chat.id, title: chat.title || chat.id, changedAt: chat.updatedAt || 0 }, text });
+    }
+    try {
+      for (const name of readdirSync(RESEARCH_DIR)) {
+        if (!name.endsWith('.json')) continue;
+        try {
+          const st = statSync(join(RESEARCH_DIR, name));
+          if (sinceMs && st.mtimeMs <= sinceMs) continue;
+          const j = JSON.parse(readFileSync(join(RESEARCH_DIR, name), 'utf8'));
+          const text = [j.query, j.report].filter(Boolean).join('\n\n');
+          if (text.length >= 80) out.push({ src: { type: 'research', id: j.id || name.replace(/\.json$/, ''), title: j.query || name, changedAt: st.mtimeMs }, text });
+        } catch {}
+      }
+    } catch {}
+    return out;
+  },
+  apply: {
+    memory: async (text, citations) => {
+      const title = citations?.[0]?.title ? `Consolidated: ${citations[0].title}` : 'Consolidated memory';
+      await memoryStore.syncSource({ type: 'memory', id: `fact-${Date.now().toString(36)}-${randomBytes(2).toString('hex')}`, title }, text, memoryEmbedder());
+      memoryStore.save();
+    },
+    procedure: async (card) => {
+      const list = readProcedures();
+      const cleaned = cleanProcedure(card);
+      list.push({ id: `proc-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}`, ...cleaned, source_task: 'consolidation-cycle', created: new Date().toISOString(), uses: 0 });
+      while (list.length > 64) list.shift();
+      writeProcedures(list);
+    },
+  },
+});
 const mcpClients = new Map();
 const usersFile = process.env.CAPSULE_USERS_FILE || join(DATA_DIR, 'users.json');
 const userStore = new UserStore(usersFile);
@@ -3127,6 +3176,46 @@ async function handle(req, res) {
     memoryStore.purge();
     saveMemoryState({ enabled: false });
     return sendJSON(res, 200, { ok: true, purged: true });
+  }
+
+  // ── Consolidation cycle endpoints (local-only) ───────────────────────────
+  if (p.startsWith('/api/consolidation/') && !isDirectLocalRequest(req)) {
+    return sendJSON(res, 403, { error: 'The sleep cycle is available only in the local app' });
+  }
+  if (req.method === 'GET' && p === '/api/consolidation/status') {
+    return sendJSON(res, 200, consolidation.status());
+  }
+  if (req.method === 'GET' && p === '/api/consolidation/queue') {
+    return sendJSON(res, 200, { proposals: consolidation.listQueue() });
+  }
+  if (req.method === 'POST' && p === '/api/consolidation/start') {
+    let body = {};
+    try { body = JSON.parse(await readBody(req, 5_000)); } catch {}
+    const startModel = String(body.model || cfg.model || '').trim();
+    if (modelUnloadActive || activeAgentThreads.size) {
+      return sendJSON(res, 409, { error: 'The local model is busy right now — try the sleep cycle once the current run finishes.' });
+    }
+    if (!startModel) {
+      return sendJSON(res, 400, { error: 'Pick a local model first — the cycle thinks with it.' });
+    }
+    consolidation.activeModel = startModel;
+    const started = consolidation.start();
+    started.catch(() => {});
+    return sendJSON(res, 202, { ok: true });
+  }
+  if (req.method === 'POST' && p === '/api/consolidation/cancel') {
+    consolidation.cancel();
+    return sendJSON(res, 200, { ok: true });
+  }
+  if (req.method === 'POST' && p === '/api/consolidation/decide') {
+    let body;
+    try { body = JSON.parse(await readBody(req, 5_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const id = String(body.id || '');
+    const action = body.action === 'dismiss' ? 'dismiss' : body.action === 'approve' ? 'approve' : '';
+    if (!action) return sendJSON(res, 400, { error: "action must be 'approve' or 'dismiss'" });
+    const result = action === 'approve' ? await consolidation.approve(id) : await consolidation.dismiss(id, String(body.reason || ''));
+    if (!result.ok) return sendJSON(res, 404, { error: result.error });
+    return sendJSON(res, 200, { ok: true, remaining: result.remaining });
   }
 
   // ── Offline speech: whisper.cpp (STT) and piper (TTS), local-only ─────────

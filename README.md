@@ -246,6 +246,11 @@ saved reports are unavailable through Capsule Remote.
 
 ### Capsule Memory
 
+The **Sleep cycle** entry runs an overnight-style consolidation: the capsule
+digests what changed into proposals — memory facts, reusable procedures — and
+presents them next morning in an approval queue with citations. You accept or
+dismiss each; nothing writes until you click.
+
 The **Memory** entry in the Capsule sidebar turns on private long-term recall:
 your chats and research reports index into an encrypted store on this machine,
 so the agent can answer "what did we decide about X?" with links back to the

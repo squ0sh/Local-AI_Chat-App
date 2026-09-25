@@ -845,7 +845,7 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
 
 
 
-(()=>{const sidebar=document.querySelector('aside');if(!sidebar)return;const style=document.createElement('style');style.textContent='#capsule-nav{border-top:1px solid var(--line);padding:10px 8px}#capsule-nav h3{margin:0 10px 6px;color:var(--muted);font-size:10px;letter-spacing:.09em}#capsule-nav button{position:static!important;display:block!important;width:100%!important;height:auto!important;min-height:32px!important;margin:2px 0!important;padding:7px 10px!important;text-align:left!important;border:0!important;border-radius:7px!important;background:transparent!important;color:var(--muted)!important;font-size:12px!important;box-shadow:none!important}#capsule-nav button:hover{background:var(--panel3)!important;color:var(--text)!important}#capsule-nav button.on{color:var(--blue2)!important}';document.head.append(style);const nav=document.createElement('section');nav.id='capsule-nav';nav.innerHTML='<h3>CAPSULE</h3>';const labels={"portable-launch":"Portable readiness","vault-launch":"Vault","memory-launch":"Memory","cloud-launch":"Cloud connection","agent-launch":"Agent mode","remote-launch":"Capsule Remote"};Object.entries(labels).forEach(([id,label])=>{const el=document.getElementById(id);if(el){el.textContent=label;el.title=label;nav.append(el)}});sidebar.insertBefore(nav,sidebar.querySelector('.sidebar-bottom'))})();
+(()=>{const sidebar=document.querySelector('aside');if(!sidebar)return;const style=document.createElement('style');style.textContent='#capsule-nav{border-top:1px solid var(--line);padding:10px 8px}#capsule-nav h3{margin:0 10px 6px;color:var(--muted);font-size:10px;letter-spacing:.09em}#capsule-nav button{position:static!important;display:block!important;width:100%!important;height:auto!important;min-height:32px!important;margin:2px 0!important;padding:7px 10px!important;text-align:left!important;border:0!important;border-radius:7px!important;background:transparent!important;color:var(--muted)!important;font-size:12px!important;box-shadow:none!important}#capsule-nav button:hover{background:var(--panel3)!important;color:var(--text)!important}#capsule-nav button.on{color:var(--blue2)!important}';document.head.append(style);const nav=document.createElement('section');nav.id='capsule-nav';nav.innerHTML='<h3>CAPSULE</h3>';const labels={"portable-launch":"Portable readiness","vault-launch":"Vault","memory-launch":"Memory","sleep-launch":"Sleep cycle","cloud-launch":"Cloud connection","agent-launch":"Agent mode","remote-launch":"Capsule Remote"};Object.entries(labels).forEach(([id,label])=>{const el=document.getElementById(id);if(el){el.textContent=label;el.title=label;nav.append(el)}});sidebar.insertBefore(nav,sidebar.querySelector('.sidebar-bottom'))})();
 
 
 
@@ -1788,4 +1788,77 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
   d.querySelector('#memory-close').onclick=()=>d.close();
   d.addEventListener('close',()=>stopInstall());
   fetch('/api/memory/status').then(r=>r.json()).then(j=>{b.textContent=j.enabled?'Memory · on':'Memory'}).catch(()=>{});
+})();
+
+/* ── Sleep cycle: the capsule consolidates overnight into proposals ──────── */
+(()=>{
+  if(!['localhost','127.0.0.1'].includes(location.hostname))return;
+  const css=document.createElement('style');
+  css.textContent='.sleep-hero{display:grid;grid-template-columns:auto 1fr;gap:12px;align-items:center;border:1px solid var(--line);border-radius:12px;background:linear-gradient(135deg,#131a2b,#0d1522);padding:16px 14px;margin:8px 0}.sleep-moon{font-size:30px}.sleep-queue-card{border:1px solid var(--line);border-radius:10px;background:var(--panel2);padding:10px;margin:8px 0}.sleep-queue-card .cite{color:var(--muted);font-size:11px;margin-top:4px}.sleep-verbs{color:var(--muted);font-size:12px;margin-top:6px}.sleep-brief{white-space:pre-wrap;border-left:3px solid var(--blue);padding:6px 10px;color:var(--text);font-size:12.5px;background:var(--panel2);border-radius:0 8px 8px 0}';
+  document.head.append(css);
+  const b=document.createElement('button');b.id='sleep-launch';b.textContent='Sleep cycle';document.body.append(b);
+  const d=document.createElement('dialog');
+  d.innerHTML='<div class="settings"><h2>Sleep cycle <span class="agent-badge">local</span></h2><p>While you rest, the capsule digests what changed, drafts durable memory facts and reusable procedures, and hands you a review queue. <b>Nothing is written without your approval.</b></p><div class="sleep-hero"><div class="sleep-moon">🌙</div><div><div id="sleep-state"><b>Idle.</b> Run it when you step away; it only reads what is already local.</div><div class="sleep-verbs" id="sleep-progress"></div></div></div><div id="sleep-brief-box" hidden><label>While you were away</label><div class="sleep-brief" id="sleep-brief"></div></div><div id="sleep-queue"></div><div class="notice" id="sleep-notice"></div><div class="dialog-actions"><button class="plain-btn danger" id="sleep-cancel" hidden>Stop the cycle</button><button class="plain-btn" id="sleep-start">🌙 Sleep on it</button><button class="plain-btn" id="sleep-close">Done</button></div></div>';
+  document.body.append(d);
+  const stateEl=d.querySelector('#sleep-state'),progEl=d.querySelector('#sleep-progress'),briefBox=d.querySelector('#sleep-brief-box'),briefEl=d.querySelector('#sleep-brief'),queueEl=d.querySelector('#sleep-queue'),noticeEl=d.querySelector('#sleep-notice'),startBtn=d.querySelector('#sleep-start'),cancelBtn=d.querySelector('#sleep-cancel');
+  const humanize=m=>window.humanizeErrorText?window.humanizeErrorText(m):m;
+  let poll=0;
+  const stopPoll=()=>{if(poll){clearInterval(poll);poll=0}};
+  const paintSidebar=j=>{b.textContent=j.queuedCount?`Sleep cycle · ${j.queuedCount}`:(j.unread?'Sleep cycle · note':'Sleep cycle')};
+  const paint=async()=>{
+    let j;
+    try{j=await(await fetch('/api/consolidation/status')).json()}catch(e){stateEl.innerHTML='<b>Unavailable.</b> '+humanize(e.message);return}
+    paintSidebar(j);
+    const running=['collecting','digesting','mining','briefing'].includes(j.state);
+    startBtn.hidden=running;
+    cancelBtn.hidden=!running;
+    if(running){
+      stateEl.innerHTML=`<b>Working…</b> ${j.state}`;
+      progEl.textContent=j.progress?.total?`${j.progress.done}/${j.progress.total} — ${j.progress.current}`:(j.progress?.current||'');
+    }else if(j.state==='error'){
+      stateEl.innerHTML='<b>It hit a snag.</b> Try again in a moment.';progEl.textContent=j.error||'';
+    }else if(j.state==='ready'||j.unread){
+      stateEl.innerHTML='<b>Cycle complete.</b> Review what it found below.';progEl.textContent='';
+    }else if(j.state==='cancelled'){
+      stateEl.innerHTML='<b>Stopped mid-cycle.</b> Nothing half-written — the queue only holds complete proposals.';progEl.textContent='';
+    }else{
+      stateEl.innerHTML='<b>Idle.</b> Run it when you step away; it only reads what is already local.';
+      progEl.textContent=j.lastRunAt?`Last ran ${new Date(j.lastRunAt).toLocaleString()} · digested ${j.lastRun?.digested||0}, proposed ${j.lastRun?.proposed||0}`:'Never run yet.';
+    }
+    briefBox.hidden=!j.briefing||!j.unread;if(j.briefing&&j.unread)briefEl.textContent=j.briefing;
+    await paintQueue();
+  };
+  const paintQueue=async()=>{
+    let list=[];
+    try{list=(await(await fetch('/api/consolidation/queue')).json()).proposals||[]}catch{}
+    queueEl.innerHTML='';
+    if(!list.length){queueEl.innerHTML='<div class="sleep-queue-card" style="border-style:dashed;color:var(--muted)">No proposals waiting for review.</div>';return}
+    list.forEach(p=>{
+      const card=document.createElement('div');card.className='sleep-queue-card';
+      const cite=(p.citations||[]).map(c=>c.title).filter(Boolean).join(' · ');
+      const body=p.kind==='procedure'?`Steps: ${(p.steps||[]).map((s,i)=>`${i+1}. ${s}`).join('  ')}`:p.body;
+      card.innerHTML=`<b>${p.kind==='procedure'?'🧱 procedure':'🧠 memory'} — ${p.title||'untitled'}</b><div style="font-size:12.5px;margin-top:4px;white-space:pre-wrap">${(p.kind==='procedure'?(p.summary?p.summary+'\n':''):'')+String(body||'').slice(0,600)}</div>${cite?`<div class="cite">from: ${cite}</div>`:''}`;
+      const row=document.createElement('div');row.style.cssText='display:flex;gap:6px;margin-top:8px';
+      const ok=document.createElement('button'),no=document.createElement('button');
+      ok.className='plain-btn';ok.style.cssText='padding:4px 10px;font-size:11px;border-color:var(--green);color:var(--green)';ok.textContent=p.kind==='procedure'?'Save as procedure':'Remember this';
+      no.className='plain-btn danger';no.style.cssText='padding:4px 10px;font-size:11px';no.textContent='Dismiss';
+      ok.onclick=async()=>{ok.disabled=true;await fetch('/api/consolidation/decide',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:p.id,action:'approve'})});await paint()};
+      no.onclick=async()=>{no.disabled=true;await fetch('/api/consolidation/decide',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:p.id,action:'dismiss'})});await paint()};
+      row.append(ok,no);card.append(row);queueEl.append(card);
+    });
+  };
+  b.onclick=async()=>{d.showModal();noticeEl.textContent='';await paint()};
+  startBtn.onclick=async()=>{
+    noticeEl.textContent='Waking the cycle…';
+    try{
+      const r=await fetch('/api/consolidation/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:document.getElementById('model-select')?.value||''})}),j=await r.json();
+      if(!r.ok){noticeEl.textContent=humanize(j.error||'could not start');return}
+      noticeEl.textContent='';
+      stopPoll();poll=setInterval(paint,1200);await paint();
+    }catch(e){noticeEl.textContent=humanize(e.message)}
+  };
+  cancelBtn.onclick=async()=>{await fetch('/api/consolidation/cancel',{method:'POST'});await paint()};
+  d.querySelector('#sleep-close').onclick=()=>{d.close()};
+  d.addEventListener('close',stopPoll);
+  fetch('/api/consolidation/status').then(r=>r.json()).then(paintSidebar).catch(()=>{});
 })();
