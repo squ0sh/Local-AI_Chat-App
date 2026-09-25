@@ -241,6 +241,16 @@ and private-network destinations, caps page sizes and timeouts, and converts
 only collected source IDs into clickable citations. Research controls and
 saved reports are unavailable through Capsule Remote.
 
+### Capsule Memory
+
+The **Memory** entry in the Capsule sidebar turns on private long-term recall:
+your chats and research reports index into an encrypted store on this machine,
+so the agent can answer "what did we decide about X?" with links back to the
+exact conversation. A small local reader model enables meaning-based search
+(one guided download); without it, keyword recall still works. Memory is
+local-only by construction — it is structurally impossible for it to ride a
+cloud chat payload — and "Forget everything" destroys the index and its key.
+
 ### Live Voice
 
 Press the microphone icon to open the full Voice Mode screen. It shows the

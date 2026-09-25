@@ -153,6 +153,21 @@ await sleep(900);
 ok('status dialog offers a plain verdict', /not reachable|Everything is running|Cloud mode|Cannot reach/i.test(await ev("document.querySelector('#engine-kind')?.textContent || ''")));
 await ev("document.querySelector('#engine-close')?.click()");
 
+// ── Capsule Memory dialog ────────────────────────────────────────────────────
+ok('memory launcher exists', await ev("!!document.getElementById('memory-launch')"));
+await ev("document.getElementById('memory-launch').click()");
+await sleep(1200);
+ok('memory dialog opens with honest off state', /off/i.test(await ev("document.querySelector('#memory-status')?.textContent || ''")));
+await ev("document.querySelector('#memory-toggle')?.click()");
+await sleep(1500);
+ok('memory turn-on works and reports indexing', /on|semantic|keyword/i.test(await ev("document.querySelector('#memory-status')?.textContent || ''")));
+ok('install-reader offer row appears without embedder', await ev("(async()=>{const b=[...document.querySelectorAll('#memory-install .plain-btn')][0];return !!b && /reader/i.test(b.textContent)})()"));
+ok('search box exists', await ev("!!document.querySelector('#memory-query')"));
+await ev("document.querySelector('#memory-close')?.click()");
+ok('sidebar shows memory state after enable', /on/i.test(await ev("document.getElementById('memory-launch').textContent")));
+// restore isolation for later sections
+await ev("fetch('/api/memory/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:'{\"enabled\":false}'}).catch(()=>{})");
+
 // ── Setup checklist on the welcome screen ────────────────────────────────────
 await sleep(1200);
 ok('setup checklist appears on empty chat', await ev("!!document.querySelector('.welcome .setup-card')"));

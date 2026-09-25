@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.7.0 — Capsule Memory: your capsule remembers, and can prove it
+
+- **Local long-term recall with citations.** Chats and research reports index
+  into an encrypted, on-device memory store; agent runs carry a `recall` tool
+  and auto-context from it, and the critic now checks drafts against your
+  precedent. Every recall lists its source (click a chat citation to jump back
+  to the exact conversation).
+- **Honest modes.** With the small reader model installed (~274 MB, one click
+  from the Memory dialog) recall is meaning-based; without it, a transparent
+  keyword fallback keeps working and says so. Purge = crypto-shred (index and
+  key destroyed), and everything rides the USB kit only inside the explicit
+  "Private data" payload.
+- **Privacy contract, now with teeth and a test:** memory can *never* ride a
+  cloud-bound payload — the injection lives strictly inside the local branch
+  that already discards history for cloud mode, and the suite pins that
+  statically.
+- New Memory dialog in the sidebar: on/off, source stats, live Search preview
+  with clickable citations, Reindex, and Forget everything. The setup
+  checklist offers it as an optional extra.
+
 ## 1.6.3 — App-menu entries (Linux + macOS)
 
 - `bash tools/register-menu-entry.sh` installs a real Linux app-menu icon

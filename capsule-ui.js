@@ -845,7 +845,7 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
 
 
 
-(()=>{const sidebar=document.querySelector('aside');if(!sidebar)return;const style=document.createElement('style');style.textContent='#capsule-nav{border-top:1px solid var(--line);padding:10px 8px}#capsule-nav h3{margin:0 10px 6px;color:var(--muted);font-size:10px;letter-spacing:.09em}#capsule-nav button{position:static!important;display:block!important;width:100%!important;height:auto!important;min-height:32px!important;margin:2px 0!important;padding:7px 10px!important;text-align:left!important;border:0!important;border-radius:7px!important;background:transparent!important;color:var(--muted)!important;font-size:12px!important;box-shadow:none!important}#capsule-nav button:hover{background:var(--panel3)!important;color:var(--text)!important}#capsule-nav button.on{color:var(--blue2)!important}';document.head.append(style);const nav=document.createElement('section');nav.id='capsule-nav';nav.innerHTML='<h3>CAPSULE</h3>';const labels={"portable-launch":"Portable readiness","vault-launch":"Vault","cloud-launch":"Cloud connection","agent-launch":"Agent mode","remote-launch":"Capsule Remote"};Object.entries(labels).forEach(([id,label])=>{const el=document.getElementById(id);if(el){el.textContent=label;el.title=label;nav.append(el)}});sidebar.insertBefore(nav,sidebar.querySelector('.sidebar-bottom'))})();
+(()=>{const sidebar=document.querySelector('aside');if(!sidebar)return;const style=document.createElement('style');style.textContent='#capsule-nav{border-top:1px solid var(--line);padding:10px 8px}#capsule-nav h3{margin:0 10px 6px;color:var(--muted);font-size:10px;letter-spacing:.09em}#capsule-nav button{position:static!important;display:block!important;width:100%!important;height:auto!important;min-height:32px!important;margin:2px 0!important;padding:7px 10px!important;text-align:left!important;border:0!important;border-radius:7px!important;background:transparent!important;color:var(--muted)!important;font-size:12px!important;box-shadow:none!important}#capsule-nav button:hover{background:var(--panel3)!important;color:var(--text)!important}#capsule-nav button.on{color:var(--blue2)!important}';document.head.append(style);const nav=document.createElement('section');nav.id='capsule-nav';nav.innerHTML='<h3>CAPSULE</h3>';const labels={"portable-launch":"Portable readiness","vault-launch":"Vault","memory-launch":"Memory","cloud-launch":"Cloud connection","agent-launch":"Agent mode","remote-launch":"Capsule Remote"};Object.entries(labels).forEach(([id,label])=>{const el=document.getElementById(id);if(el){el.textContent=label;el.title=label;nav.append(el)}});sidebar.insertBefore(nav,sidebar.querySelector('.sidebar-bottom'))})();
 
 
 
@@ -1743,3 +1743,49 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
 /* Live sidebar label for the model launcher: count of installed models, and
    live progress while a pull is running. Cheap 45 s probes against local APIs. */
 (()=>{if(!['localhost','127.0.0.1'].includes(location.hostname))return;const paint=async()=>{const bts=[...document.querySelectorAll('#model-installer-launch')];if(!bts.length)return;let label='Model library';try{const r=await fetch('/api/models'),j=await r.json();const n=(j.models||[]).length;if(n)label=`Model library · ${n}`}catch{}try{const r=await fetch('/api/models/downloads'),j=await r.json();const job=(j.downloads||[]).find(x=>x&&!['ready','error','cancelled'].includes(x.status));if(job)label=Number.isFinite(job.progress_percent)?`Downloading model · ${Math.round(job.progress_percent)}%`:'Downloading model…'}catch{}bts.forEach(b=>{b.textContent=label;b.title=label})};setInterval(paint,45000);setTimeout(paint,1500)})();
+
+/* ── Capsule Memory dialog: private long-term recall, cited and purgeable ── */
+(()=>{
+  if(!['localhost','127.0.0.1'].includes(location.hostname))return;
+  const css=document.createElement('style');
+  css.textContent='.memory-source{display:grid;grid-template-columns:20px 1fr;gap:7px;padding:8px;border:1px solid var(--line);border-radius:8px;background:var(--panel2);margin:6px 0;text-align:left;font-size:12px}.memory-source:hover{border-color:var(--blue)}.memory-source small{color:var(--muted);display:block;margin-top:3px;line-height:1.45}#memory-bar{height:6px;border-radius:99px;background:#242d3e;overflow:hidden;margin:8px 0}#memory-bar>div{height:100%;width:0;background:linear-gradient(90deg,#708bff,#8a71ff);transition:width .3s}';
+  document.head.append(css);
+  const b=document.createElement('button');b.id='memory-launch';b.textContent='Memory';document.body.append(b);
+  const d=document.createElement('dialog');
+  d.innerHTML='<div class="settings"><h2>Capsule Memory</h2><p>Long-term recall across your chats and research — indexed and searched entirely on this machine. The index is encrypted at rest, and nothing in it is ever sent to a cloud provider.</p><div id="memory-status" class="privacy">Checking…</div><div id="memory-install" hidden><div id="memory-bar" hidden><div></div></div><div id="memory-install-note" class="usb-warn" style="display:none;color:var(--muted)"></div></div><label>Search your memory</label><input id="memory-query" placeholder="e.g. how did we set up the backup…" autocomplete="off"><div id="memory-results"></div><div class="notice" id="memory-notice"></div><div class="dialog-actions"><button class="plain-btn danger" id="memory-purge">Forget everything</button><button class="plain-btn" id="memory-reindex">Reindex now</button><button class="plain-btn" id="memory-toggle"></button><button class="plain-btn" id="memory-close">Done</button></div></div>';
+  document.body.append(d);
+  const statusEl=d.querySelector('#memory-status'),toggleBtn=d.querySelector('#memory-toggle'),queryEl=d.querySelector('#memory-query'),resultsEl=d.querySelector('#memory-results'),noticeEl=d.querySelector('#memory-notice'),barBox=d.querySelector('#memory-install'),bar=d.querySelector('#memory-bar'),barFill=d.querySelector('#memory-bar>div'),installNote=d.querySelector('#memory-install-note');
+  const humanize=m=>window.humanizeErrorText?window.humanizeErrorText(m):m;
+  let enabled=false,installTimer=0;
+  const stopInstall=()=>{if(installTimer){clearInterval(installTimer);installTimer=0}};
+  const paint=(j)=>{
+    enabled=!!j.enabled;
+    toggleBtn.textContent=enabled?'Turn memory off':'Turn memory on';
+    const rows=[];
+    rows.push(enabled?(j.mode==='semantic'?'🧠 Semantic recall is on (meaning-based search).':'🔤 Keyword recall is on.'):'Memory is off.');
+    if(enabled)rows.push(`Index: ${j.chunks} memories (${Object.entries(j.byType||{}).map(([k,v])=>`${k}: ${v}`).join(', ')||'empty yet'}).`);
+    if(enabled&&!j.embedder_ready)rows.push('Tip: install the reader model for meaning-based recall instead of words-only.');
+    statusEl.innerHTML=rows.map(r=>`<div>${r}</div>`).join('');
+    if(enabled&&!j.embedder_ready){
+      barBox.hidden=false;
+      if(!barBox.querySelector('.plain-btn')){
+        const btn=document.createElement('button');btn.className='plain-btn';btn.style.borderColor='var(--blue)';btn.textContent='Install the memory reader (~274 MB, one download)';
+        btn.onclick=async()=>{btn.disabled=true;statusEl.insertAdjacentHTML('beforeend','<div>Starting the download…</div>');try{const r=await fetch('/api/models/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({model:'nomic-embed-text:latest'})}),j=await r.json();if(!r.ok||!j.id)throw Error(j.error||'install could not start');const jobId=j.id;bar.hidden=false;installNote.style.display='block';installNote.textContent='Installing the reader model…';installTimer=setInterval(async()=>{try{const st=(await (await fetch('/api/models/install?id='+encodeURIComponent(jobId))).json());const pct=st.total?Math.round(st.downloaded/st.total*100):(st.progress_percent||0);barFill.style.width=pct+'%';installNote.textContent=`Installing the reader model… ${pct}%`;if(['ready','error','cancelled'].includes(st.status)){stopInstall();installNote.textContent=st.status==='ready'?'Reader installed — semantic recall is on.':humanize(st.error||'install failed');if(st.status==='ready'){paint(await(await fetch('/api/memory/status')).json())}}}catch{}},1200)}catch(e){installNote.style.display='block';installNote.textContent=humanize(e.message);btn.disabled=false}};
+        barBox.append(btn);
+      }
+    } else barBox.hidden=true;
+    d.querySelector('#memory-results').innerHTML='';
+    b.textContent=enabled?'Memory · on':'Memory';
+    b.title=b.textContent;
+  };
+  const load=async()=>{try{const r=await fetch('/api/memory/status'),j=await r.json();if(!r.ok)throw Error(j.error||'status failed');paint(j)}catch(e){statusEl.textContent=humanize(e.message)}};
+  b.onclick=async()=>{d.showModal();noticeEl.textContent='';await load()};
+  toggleBtn.onclick=async()=>{try{const r=await fetch('/api/memory/toggle',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:!enabled})}),j=await r.json();noticeEl.textContent=j.enabled?'Memory is on — it will index as you chat and research.':'Memory is off — nothing new is remembered.';await load();if(j.enabled)fetch('/api/memory/reindex',{method:'POST'}).catch(()=>{})}catch(e){noticeEl.textContent=humanize(e.message)}};
+  d.querySelector('#memory-reindex').onclick=async()=>{noticeEl.textContent='Reindexing…';try{const r=await fetch('/api/memory/reindex',{method:'POST'}),j=await r.json();noticeEl.textContent=`Reindexed ${j.sources||0} sources (${j.reindexed||0} new memories) — mode: ${j.mode||'off'}`;await load()}catch(e){noticeEl.textContent=humanize(e.message)}};
+  d.querySelector('#memory-purge').onclick=async()=>{if(!confirm('Forget everything the Capsule remembers?\n\nThe index and its encryption key are destroyed. Your chats themselves stay untouched.'))return;await fetch('/api/memory/purge',{method:'POST'});noticeEl.textContent='Forgotten — the index and its key are gone.';await load()};
+  let searchTimer=0;
+  queryEl.addEventListener('input',()=>{clearTimeout(searchTimer);const q=queryEl.value.trim();if(q.length<3){resultsEl.innerHTML='';return}searchTimer=setTimeout(async()=>{try{const r=await fetch('/api/memory/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:q})}),j=await r.json();const hits=j.results||[];resultsEl.innerHTML=hits.length?'':'<div class="memory-source"><div>·</div><div>Nothing matches yet — memory grows as you chat.</div></div>';hits.forEach(h=>{const el=document.createElement('button');el.className='memory-source';el.innerHTML=`<div>[${h.n}]</div><div><b>${h.title}</b><small>${h.snippet}</small><small>${h.type}</small></div>`;if(h.chat_id&&typeof window.select==='function')el.onclick=()=>{d.close();window.select(h.chat_id)};resultsEl.append(el)})}catch(e){resultsEl.innerHTML=`<div class="memory-source"><div>·</div><div>${humanize(e.message)}</div></div>`}},450)});
+  d.querySelector('#memory-close').onclick=()=>d.close();
+  d.addEventListener('close',()=>stopInstall());
+  fetch('/api/memory/status').then(r=>r.json()).then(j=>{b.textContent=j.enabled?'Memory · on':'Memory'}).catch(()=>{});
+})();

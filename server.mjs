@@ -24,6 +24,7 @@ import { performance } from 'node:perf_hooks';
 import { randomBytes, createHash } from 'crypto';
 import qrcode from './lib/vendor/qrcode-generator.mjs';
 import { portableIntegrityReport, rebuildManifest, repairReleaseFiles, releaseTrackedPaths } from './lib/capsule-integrity.mjs';
+import { MemoryStore, makeOllamaEmbedder, makeStubEmbedder } from './lib/capsule-memory.mjs';
 import { sealVault, openVault } from './lib/capsule-vault.mjs';
 import { ResearchEngine } from './lib/research-engine.mjs';
 import { pullOllamaModel } from './lib/resumable-ollama-pull.mjs';
@@ -2091,6 +2092,116 @@ const researchEngine = new ResearchEngine({
   },
 });
 const chatStore = new ChatStore(CHATS_DIR);
+
+// ── Capsule Memory store + recall plumbing ─────────────────────────────────
+// The index is encrypted at rest and never leaves this machine; injection into
+// chat/agent prompts only ever happens in local mode.
+const MEMORY_STATE_FILE = join(DATA_DIR, 'memory-state.json');
+const memoryStore = new MemoryStore(DATA_DIR);
+memoryStore.load();
+let memoryReindexTimer = 0;
+
+function memoryState() {
+  try { return { enabled: false, embedder_model: '', ...JSON.parse(readFileSync(MEMORY_STATE_FILE, 'utf8')) }; }
+  catch { return { enabled: false, embedder_model: '' }; }
+}
+function memoryEnabled() { return memoryState().enabled === true; }
+function saveMemoryState(patch) {
+  const next = { ...memoryState(), ...patch };
+  const tmp = MEMORY_STATE_FILE + '.tmp';
+  writeFileSync(tmp, JSON.stringify(next), 'utf8');
+  renameSync(tmp, MEMORY_STATE_FILE);
+  try { chmodSync(MEMORY_STATE_FILE, 0o600); } catch {}
+  return next;
+}
+
+function memoryEmbedder() {
+  if (process.env.LOCAL_AI_EMBED_STUB === '1') return makeStubEmbedder();
+  return makeOllamaEmbedder(cfg.ollamaUrl, memoryState().embedder_model || undefined);
+}
+
+async function memorySearch(query, { k = 6 } = {}) {
+  if (!memoryEnabled()) return { mode: 'off', results: [] };
+  const embedder = memoryEmbedder();
+  let vec = null, semantic = false;
+  try {
+    if (await embedder.available()) { vec = (await embedder.embed([String(query)]))[0] || null; semantic = !!vec; }
+  } catch {}
+  const results = memoryStore.search(String(query), vec, k);
+  return { mode: semantic ? 'semantic' : 'keyword', results };
+}
+
+function memoryCitationPayload(results) {
+  return results.map((r, i) => ({
+    n: i + 1, type: r.chunk.type, chat_id: r.chunk.type === 'chat' ? r.chunk.srcId : '',
+    title: r.chunk.title, snippet: r.chunk.text.slice(0, 420), score: Number(r.score.toFixed(3)),
+  }));
+}
+
+// Assemble the recall block injected into local chat/agent context. Never
+// called in cloud mode (see the streamChat branch) and agent-local by design.
+async function memoryContextBlock(text, { k = 4, header = 'Recalled memory' } = {}) {
+  if (!memoryEnabled()) return { block: '', sources: [] };
+  const q = String(text || '').trim();
+  if (q.length < 8) return { block: '', sources: [] };
+  const { results } = await memorySearch(q, { k });
+  if (!results.length) return { block: '', sources: [] };
+  const sources = memoryCitationPayload(results);
+  const lines = sources.map((s) => `[${s.n}] (${s.title}) ${s.snippet}`).join('\n');
+  return {
+    block: `## ${header} (your private local index — never shared)\nThese earlier notes may answer or inform this request. Cite them as (memory N) when you use them.\n\n${lines}`,
+    sources,
+  };
+}
+
+function memorySourcesSync(workspace) {
+  const syncs = [];
+  const chats = Array.isArray(workspace?.chats) ? workspace.chats : [];
+  for (const chat of chats) {
+    if (!chat.id || !Array.isArray(chat.messages)) continue;
+    const text = chat.messages
+      .map((m) => (m && typeof m.content === 'string' ? `${m.role}: ${m.content}` : ''))
+      .filter(Boolean)
+      .join('\n\n');
+    syncs.push({ src: { type: 'chat', id: chat.id, title: chat.title || chat.id }, text });
+  }
+  try {
+    for (const name of readdirSync(join(DATA_DIR, 'research'))) {
+      if (!name.endsWith('.json')) continue;
+      try {
+        const j = JSON.parse(readFileSync(join(DATA_DIR, 'research', name), 'utf8'));
+        const text = [j.query, j.report].filter(Boolean).join('\n\n');
+        if (text.length > 40) syncs.push({ src: { type: 'research', id: j.id || name.replace(/\.json$/, ''), title: j.query || name }, text });
+      } catch {}
+    }
+  } catch {}
+  // Drop chunks whose chat no longer exists.
+  const liveIds = new Set(chats.filter((c) => c && c.id).map((c) => c.id));
+  for (const c of [...memoryStore.chunks.values()]) {
+    if (c.type === 'chat' && !liveIds.has(c.srcId)) memoryStore.deleteSource('chat', c.srcId);
+  }
+  return syncs;
+}
+
+async function memoryReindexNow() {
+  if (!memoryEnabled()) return { reindexed: 0, mode: 'off' };
+  const workspace = chatStoreFor('').get() || {};
+  const embedder = memoryEmbedder();
+  const live = await embedder.available().catch(() => false);
+  const syncs = memorySourcesSync(workspace);
+  let added = 0;
+  for (const s of syncs) {
+    try { const r = await memoryStore.syncSource(s.src, s.text, live ? embedder : null); added += r.added || 0; } catch {}
+  }
+  memoryStore.save();
+  return { reindexed: added, sources: syncs.length, mode: live ? 'semantic' : 'keyword', chunks: memoryStore.stats().chunks };
+}
+
+function scheduleMemoryReindex() {
+  if (!memoryEnabled()) return;
+  clearTimeout(memoryReindexTimer);
+  memoryReindexTimer = setTimeout(() => { memoryReindexNow().catch(() => {}); }, 4000);
+}
 const mcpClients = new Map();
 const usersFile = process.env.CAPSULE_USERS_FILE || join(DATA_DIR, 'users.json');
 const userStore = new UserStore(usersFile);
@@ -2967,10 +3078,55 @@ async function handle(req, res) {
     catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
     try {
       chatStoreFor(req.username).save(payload.workspace);
+      scheduleMemoryReindex();
       return sendJSON(res, 200, { ok: true });
     } catch (e) {
       return sendJSON(res, 400, { error: e.message });
     }
+  }
+
+  // ── Capsule Memory endpoints (local-only; never through a tunnel) ────────
+  if (p.startsWith('/api/memory/') && !isDirectLocalRequest(req)) {
+    return sendJSON(res, 403, { error: 'Memory is available only in the local app' });
+  }
+  if (req.method === 'GET' && p === '/api/memory/status') {
+    const st = memoryState();
+    const stats = memoryStore.stats();
+    const embedder = memoryEmbedder();
+    const semantic = st.enabled ? await embedder.available().catch(() => false) : false;
+    return sendJSON(res, 200, {
+      enabled: !!st.enabled,
+      embedder_model: embedder.model,
+      embedder_ready: !!semantic,
+      mode: st.enabled ? (semantic ? 'semantic' : 'keyword') : 'off',
+      chunks: stats.chunks,
+      byType: stats.byType,
+    });
+  }
+  if (req.method === 'POST' && p === '/api/memory/search') {
+    let body;
+    try { body = JSON.parse(await readBody(req, 20_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const query = String(body.query || '').trim();
+    if (!query) return sendJSON(res, 400, { error: 'query is required' });
+    const { mode, results } = await memorySearch(query, { k: Math.min(12, Math.max(1, Number(body.k) || 6)) });
+    return sendJSON(res, 200, { mode, results: memoryCitationPayload(results) });
+  }
+  if (req.method === 'POST' && p === '/api/memory/reindex') {
+    const out = await memoryReindexNow();
+    return sendJSON(res, 200, { ok: true, ...out });
+  }
+  if (req.method === 'POST' && p === '/api/memory/toggle') {
+    let body = {};
+    try { body = JSON.parse(await readBody(req, 5_000)); } catch {}
+    const enabled = body.enabled !== false;
+    const state = saveMemoryState({ enabled });
+    if (enabled) scheduleMemoryReindex();
+    return sendJSON(res, 200, { ok: true, enabled: state.enabled });
+  }
+  if (req.method === 'POST' && p === '/api/memory/purge') {
+    memoryStore.purge();
+    saveMemoryState({ enabled: false });
+    return sendJSON(res, 200, { ok: true, purged: true });
   }
 
   // ── Offline speech: whisper.cpp (STT) and piper (TTS), local-only ─────────
@@ -3811,6 +3967,12 @@ async function handle(req, res) {
       const critic = payload.critic === true;
       if (mode === 'plan') currentAgentMode = 'plan';
       const supportsTools = await modelSupportsTools(model);
+      // Capsule Memory: auto-context from the local index + the read-only
+      // recall tool. Local-only (this endpoint never runs through tunnels).
+      const memoryNote = (await memoryContextBlock(task, { k: 3, header: 'Recalled memory for this run' })).block;
+      const agentHooks = {
+        memorySearch: async (query, opts) => (await memorySearch(query, opts)).results,
+      };
 
       // Per-chat conversational memory: continue the saved thread, or seed from
       // recent chat history when this chat has no saved agent context yet.
@@ -3905,7 +4067,7 @@ async function handle(req, res) {
         const result = await runAgentLoop({
           task, model, workspaceRoot: __dirname, autonomy, skillPrompt, readonly,
           initialMessages: savedThread, onEvent, llmCall, signal: controller.signal,
-          supportsTools, norms, critic,
+          supportsTools, norms, critic, hooks: agentHooks, memoryNote,
         });
         loopResult = result;
         if (chatId && Array.isArray(loopResult.thread)) saveAgentThread(chatId, loopResult.thread);
@@ -4870,6 +5032,16 @@ async function streamChat(payload, res) {
   // the local provider and never touches cloud-bound messages (those were
   // already trimmed to the last user turn above).
   if (provider === 'ollama' && payload.mode !== 'cloud') {
+    try {
+      // Capsule Memory: local-only recall. The cloud branch above already
+      // reduced the payload to the bare last user turn, so nothing here can
+      // leak beyond this machine.
+      const { block } = await memoryContextBlock(
+        (() => { const m = [...messages].reverse().find((x) => x && x.role === 'user'); if (!m) return ''; return Array.isArray(m.content) ? m.content.filter((p) => p && p.type === 'text').map((p) => p.text).join(' ') : String(m.content || ''); })(),
+        { k: 4 },
+      );
+      if (block) messages = [{ role: 'system', content: block }, ...messages];
+    } catch {}
     try {
       const condensed = await maybeCompactChatMessages(messages, String(payload.model || cfg.model || '').trim());
       if (condensed) messages = condensed;
