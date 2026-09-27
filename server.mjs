@@ -34,7 +34,7 @@ import { pullOllamaModel } from './lib/resumable-ollama-pull.mjs';
 import { hardwareInfo, hardwareSummary } from './lib/hardware.mjs';
 import { RateLimiter, rateLimitResponse } from './lib/rate-limit.mjs';
 import { ChatStore } from './lib/chat-store.mjs';
-import { McpClient } from './lib/mcp-client.mjs';
+import { McpClient, looksSensitiveEnvKey } from './lib/mcp-client.mjs';
 import { UserStore } from './lib/user-store.mjs';
 import { runAgentLoop, globSearch, agentWriteFile, undoChange, listLedger, recordChange, buildOrganizePlan, applyOrganizePlan, webSearch } from './lib/agent-loop.mjs';
 import { shouldFreeMemory, otherModelNames } from './lib/memory.mjs';
@@ -2463,13 +2463,27 @@ function installedWhisperModel() {
   }
   return '';
 }
+const KOKORO_VOICES = ['af_heart', 'af_bella', 'af_nicole', 'af_sarah', 'af_sky', 'am_adam', 'am_michael', 'bf_emma', 'bf_isabella', 'bm_george', 'bm_lewis'];
+function piperVoicesInstalled() {
+  const dir = join(SPEECH_DIR, 'piper-voices');
+  const found = [];
+  try {
+    for (const name of readdirSync(dir)) {
+      if (/^[a-z0-9][a-z0-9._-]*\.onnx$/i.test(name) && existsSync(join(dir, name + '.json'))) found.push({ name, path: join(dir, name) });
+    }
+  } catch {}
+  return found.sort((a, b) => a.name.localeCompare(b.name));
+}
 function speechSupport() {
   if (speechInfo) return speechInfo;
   const speechDir = join(SPEECH_DIR, 'piper');
   const whisper = process.env.WHISPER_CLI || findOnPath('whisper-cli') || findOnPath('whisper-cpp') || findOnPath('whisper') || installedWhisperCli();
   const piper = process.env.PIPER_CLI || findOnPath('piper') || (existsSync(join(speechDir, 'piper')) ? join(speechDir, 'piper') : '');
   const whisperModel = process.env.WHISPER_MODEL || installedWhisperModel() || join(__dirname, 'models', 'whisper', 'ggml-base.bin');
+  const piperVoices = piperVoicesInstalled();
   const piperVoice = process.env.PIPER_VOICE
+    || piperVoices.find((v) => v.name === 'en_US-lessac-medium.onnx')?.path
+    || piperVoices[0]?.path
     || (existsSync(join(SPEECH_DIR, 'piper-voices', 'en_US-lessac-medium.onnx')) ? join(SPEECH_DIR, 'piper-voices', 'en_US-lessac-medium.onnx') : '')
     || join(__dirname, 'models', 'piper', 'voice.onnx');
   const kokoro = existsSync(join(SPEECH_DIR, 'tts-runtime', 'node_modules', 'kokoro-js'));
@@ -2480,7 +2494,9 @@ function speechSupport() {
     piper: Boolean(piper && existsSync(piperVoice)),
     piper_cli: piper ? piper : '',
     piper_voice: existsSync(piperVoice) ? piperVoice : '',
+    piper_voices: piperVoices,
     kokoro,
+    kokoro_voices: kokoro ? KOKORO_VOICES : [],
     installing: speechInstall != null && speechInstall.status !== 'ready' && speechInstall.status !== 'error',
   };
   return speechInfo;
@@ -2968,6 +2984,65 @@ function agentToolsAllowed(req) {
   if (cfg.mode !== 'local' || !isDirectLocalRequest(req)) return false;
   const origin = req.headers.origin || '';
   return !origin || origin === `http://${req.headers.host}`;
+}
+
+// ── MCP server governance ───────────────────────────────────────────────────
+// Registration spawns a real child process, so it rides the same governance as
+// every other agent power: a command allowlist (CAPSULE_MCP_ALLOW), plan-mode
+// blocking, sensitive-env refusal, param caps, and an audit journal.
+
+function mcpAllowlist() {
+  return String(process.env.CAPSULE_MCP_ALLOW || 'node,npx,uvx')
+    .split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+function mcpCommandAllowed(command) {
+  const list = mcpAllowlist();
+  if (!list.length) return false;
+  // Bare basenames (node, npx…) must be listed by name. Absolute/relative
+  // paths are allowed when the basename is listed, or the resolved path matches
+  // a listed path entry exactly.
+  if (command.includes('/') || command.includes('\\')) {
+    const abs = resolve(command);
+    if (list.some((entry) => (entry.includes('/') || entry.includes('\\')) && resolve(entry) === abs)) return true;
+  }
+  return list.includes(basename(command));
+}
+
+const MCP_LOG_LIMIT = 256 * 1024;
+function mcpAudit(action, fields = {}) {
+  try {
+    const file = join(DATA_DIR, 'agent', 'mcp.log');
+    mkdirSync(dirname(file), { recursive: true });
+    if (existsSync(file) && statSync(file).size > MCP_LOG_LIMIT) {
+      const tail = readFileSync(file, 'utf8').split('\n').slice(-200);
+      writeFileSync(file, tail.join('\n'));
+    }
+    appendFileSync(file, JSON.stringify({ ts: new Date().toISOString(), action, ...fields }) + '\n');
+  } catch {}
+}
+
+// Returns { client } for a live client (reviving a crashed one in place),
+// { error } when the restart failed, or null when the id is unknown.
+async function mcpAttach(clientId) {
+  const existing = mcpClients.get(clientId);
+  if (!existing) return null;
+  if (!existing._closed) return { client: existing };
+  if (existing._respawning) return { error: existing._respawnError || new Error('MCP server crashed and a restart is already being attempted') };
+  existing._respawning = true;
+  try {
+    const revived = await existing.respawn();
+    await existing.close();
+    mcpClients.set(clientId, revived);
+    mcpAudit('respawn', { id: clientId, command: revived.command, server: revived.serverInfo?.name || '' });
+    return { client: revived };
+  } catch (e) {
+    existing._respawnError = e;
+    mcpAudit('respawn_failed', { id: clientId, command: existing.command, error: e.message });
+    return { error: e };
+  } finally {
+    existing._respawning = false;
+  }
 }
 
 function localControlAllowed(req) {
@@ -3542,9 +3617,16 @@ async function handle(req, res) {
       } finally { try { unlinkSync(outFile); } catch {} }
     }
     if (!s.piper) return sendJSON(res, 400, { error: 'piper not detected. Install piper and set PIPER_VOICE.' });
+    let voicePath = s.piper_voice;
+    if (body.voice) {
+      if (!/^[a-z0-9][a-z0-9._-]*\.onnx$/i.test(String(body.voice))) return sendJSON(res, 400, { error: 'Invalid voice name' });
+      const match = s.piper_voices.find((v) => v.name === body.voice);
+      if (!match) return sendJSON(res, 400, { error: 'Voice not installed: ' + body.voice });
+      voicePath = match.path;
+    }
     const outFile = join(tmpRoot, 'tts-' + process.pid + '-' + randomBytes(4).toString('hex') + '.wav');
     try {
-      const code = await runChild(s.piper_cli, ['--model', s.piper_voice, '--output_file', outFile], { input: text });
+      const code = await runChild(s.piper_cli, ['--model', voicePath, '--output_file', outFile], { input: text });
       if (code !== 0) return sendJSON(res, 500, { error: 'piper failed with exit code ' + code });
       const wav = readFileSync(outFile);
       res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': wav.length, 'Cache-Control': 'no-store' });
@@ -4121,24 +4203,40 @@ async function handle(req, res) {
     if (p === '/api/agent/mcp/register') {
       let payload;
       try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      if (planModeBlocks(res)) return;
       const { command, args = [], env = {}, id: requestedId } = payload;
       if (!command || typeof command !== 'string') return sendJSON(res, 400, { error: 'command is required' });
+      if (!mcpCommandAllowed(command)) {
+        mcpAudit('register_refused', { command, reason: 'not_allowlisted' });
+        return sendJSON(res, 403, { error: 'MCP server command "' + command + '" is not allowlisted. Default list: node,npx,uvx — set CAPSULE_MCP_ALLOW=comma,separated,names to change it.' });
+      }
+      const sensitive = Object.keys(env).filter((k) => looksSensitiveEnvKey(k));
+      if (sensitive.length) {
+        mcpAudit('register_refused', { command, reason: 'sensitive_env', keys: sensitive });
+        return sendJSON(res, 400, { error: 'MCP env keys that look secret-bearing are refused: ' + sensitive.join(', ') + ' (set them server-side instead)' });
+      }
+      if (JSON.stringify(args).length > 20_000 || JSON.stringify(env).length > 20_000) return sendJSON(res, 400, { error: 'args/env too large' });
       const clientId = requestedId || 'mcp-' + randomBytes(4).toString('hex');
       if (mcpClients.has(clientId)) return sendJSON(res, 409, { error: 'Client ID already registered. Use /api/agent/mcp/unregister first.' });
       const client = new McpClient({ command, args, env });
       try {
         await client.connect();
         mcpClients.set(clientId, client);
+        mcpAudit('register', { id: clientId, command, server: client.serverInfo?.name || '', tools: client.tools.length });
         return sendJSON(res, 200, { id: clientId, serverInfo: client.serverInfo, tools: client.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) });
       } catch (e) {
         try { await client.close(); } catch {}
+        mcpAudit('register_failed', { id: clientId, command, error: e.message });
         return sendJSON(res, 502, { error: 'MCP server failed to start: ' + e.message });
       }
     }
     if (p === '/api/agent/mcp/list') {
       const result = [];
-      for (const [id, client] of mcpClients) {
-        result.push({ id, serverInfo: client.serverInfo, tools: client.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) });
+      for (const [id, registered] of mcpClients) {
+        // A crashed server is revived on demand so tools stay reachable.
+        const entry = registered._closed ? await mcpAttach(id) : { client: registered };
+        const client = entry && entry.client ? entry.client : registered;
+        result.push({ id, serverInfo: client.serverInfo, alive: !client._closed, restarted: client !== registered, tools: client.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) });
       }
       return sendJSON(res, 200, { clients: result });
     }
@@ -4148,12 +4246,18 @@ async function handle(req, res) {
       if (planModeBlocks(res)) return;
       const { clientId, tool, arguments: args = {} } = payload;
       if (!clientId || !tool) return sendJSON(res, 400, { error: 'clientId and tool are required' });
-      const client = mcpClients.get(clientId);
-      if (!client) return sendJSON(res, 404, { error: 'MCP client not found: ' + clientId });
+      if (JSON.stringify(args).length > 200_000) return sendJSON(res, 400, { error: 'arguments must stay under 200 KB' });
+      const entry = await mcpAttach(clientId);
+      if (!entry) return sendJSON(res, 404, { error: 'MCP client not found: ' + clientId });
+      if (entry.error) return sendJSON(res, 502, { error: 'MCP server failed to restart: ' + entry.error.message });
       try {
-        const result = await client.callTool(tool, args);
+        const result = await entry.client.callTool(tool, args);
+        mcpAudit('call', { id: clientId, tool, bytes: JSON.stringify(args).length, ok: true });
         return sendJSON(res, 200, { result });
-      } catch (e) { return sendJSON(res, 502, { error: e.message }); }
+      } catch (e) {
+        mcpAudit('call', { id: clientId, tool, ok: false, error: e.message });
+        return sendJSON(res, 502, { error: e.message });
+      }
     }
     if (p === '/api/agent/mcp/unregister') {
       let payload;
@@ -4164,6 +4268,7 @@ async function handle(req, res) {
       if (!client) return sendJSON(res, 404, { error: 'MCP client not found: ' + clientId });
       await client.close();
       mcpClients.delete(clientId);
+      mcpAudit('unregister', { id: clientId });
       return sendJSON(res, 200, { ok: true });
     }
 

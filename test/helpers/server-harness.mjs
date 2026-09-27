@@ -58,7 +58,11 @@ export async function bootServer(t, {
   const root = mkdtempSync(join(tmpdir(), 'capsule-http-'));
   const dataDir = join(root, 'data');
   mkdirSync(dataDir, { recursive: true });
-  for (const [name, contents] of Object.entries(seedFiles)) writeFileSync(join(dataDir, name), contents);
+  for (const [name, contents] of Object.entries(seedFiles)) {
+    const target = join(dataDir, name);
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, contents);
+  }
 
   let seededUsers = {};
   if (users.length) {

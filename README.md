@@ -229,6 +229,21 @@ Servers run over JSON-RPC stdio under the hood (see `lib/mcp-client.mjs`), and
 the HTTP routes behind the panel (`/api/agent/mcp/register|list|call|unregister`)
 are available only from the local app — never over Capsule Remote.
 
+MCP registrations are governed because they start real processes:
+
+- Registered commands must match `CAPSULE_MCP_ALLOW` (default `node,npx,uvx`;
+  comma-separated executable basenames, or exact paths).
+- Children start with a **hermetic environment** — `PATH` and home only — so
+  child servers never see your `AUTH_TOKEN`, provider keys, or data paths.
+  Secret-looking user env keys (matching `key|token|secret|passw`) are refused
+  outright; set `CAPSULE_MCP_INHERIT_ENV=1` only if a server truly needs full
+  inheritance.
+- Registration is blocked while plan mode is on.
+- Flooding servers are cut off (8 MB stdout limit), tool results larger than
+  1 MB are refused, crashed servers are revived transparently on the next call,
+  and every register/call/unregister/restart is journaled to
+  `data/agent/mcp.log`.
+
 Offline behavior packs live inside Agent Mode. Choose **Choose a skill** or use
 `/skills`; the selected pack updates the current chat's system prompt. Skills
 no longer occupy a separate Capsule sidebar entry.
@@ -281,13 +296,15 @@ cloud chat payload — and "Forget everything" destroys the index and its key.
 
 Press the microphone icon to open the full Voice Mode screen. It shows the
 selected model, live transcript, and clear Listening, Thinking, Speaking, and
-Muted states. Use Mute to pause the microphone, tap the animated orb to
-interrupt speech, or choose End voice to return to chat. Voice Mode listens for
-one utterance, sends the transcript, speaks the complete model response, and
-then resumes listening. It uses short recognition sessions for iPhone Safari
-compatibility, avoids listening while the answer is playing, chunks long
-answers for more reliable speech output, keeps the screen awake when supported,
-and prefers a local enhanced/neural OS voice when one is available.
+Muted states, with a **speech language** picker (used by browser speech
+recognition and by offline whisper alike) and a **voice** picker listing every
+installed Piper voice and Kokoro persona. Use Mute to pause the microphone, tap
+the animated orb to interrupt speech, or choose End voice to return to chat.
+Voice Mode listens for one utterance, sends the transcript, and speaks the
+model's response — starting with the first finished sentence and prefetching
+the next chunk while playback runs, so long answers flow without pauses. It
+keeps the screen awake when supported, and prefers a local enhanced/neural OS
+voice when one is available.
 
 The selected Ollama model remains the conversational model, so the spoken
 answer has the same behavior as typed chat. On browsers without speech support
@@ -496,6 +513,8 @@ Integrity and hardening:
 | `CAPSULE_MAX_CONTEXT`        | *(auto)*  | Override the auto RAM-based `num_ctx` cap (min 1024) |
 | `CAPSULE_RATE_PER_IP`        | `150`     | Per-client burst capacity of the shared API rate limiter |
 | `CAPSULE_RATE_REFILL`        | `20`      | Sustained tokens/second the rate buckets refill at (600-request global burst) |
+| `CAPSULE_MCP_ALLOW`          | `node,npx,uvx` | Executable allowlist for MCP server registration; comma-separated basenames or absolute paths |
+| `CAPSULE_MCP_INHERIT_ENV`    | *(unset)* | With `1`, MCP children inherit the server process env (not recommended) |
 | `LOCAL_AI_EMBED_STUB`        | *(unset)* | Internal/test: memory embedder stub |
 
 ## Tunnel mode

@@ -1,11 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, existsSync } from 'fs';
+import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync, chmodSync, readFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, dirname } from 'path';
 import { spawn } from 'child_process';
 import { createServer as netCreateServer } from 'net';
 import { cleanSpeechText, speechChunks, speechDecision } from '../lib/voice.mjs';
+import { bootServer } from './helpers/server-harness.mjs';
 
 function freePort() {
   return new Promise((resolve, reject) => {
@@ -109,4 +110,96 @@ test('speech endpoints: status and install report idle without touching the netw
     server.kill('SIGTERM');
     try { rmSync(dataDir, { recursive: true, force: true }); } catch {}
   }
+});
+// ── Engine stubs: piper + whisper-cli in a throwaway PATH (POSIX only) ──────
+function stubScripts(t) {
+  if (process.platform === 'win32') return null;
+  return {
+    seedFiles: {
+      'speech/whisper/ggml-base.bin': 'fake-model',
+      'speech/piper-voices/en_US-lessac-medium.onnx': 'fake-voice',
+      'speech/piper-voices/en_US-lessac-medium.onnx.json': '{}',
+      'speech/piper-voices/en_US-amy-medium.onnx': 'fake-voice-b',
+      'speech/piper-voices/en_US-amy-medium.onnx.json': '{}',
+    },
+    prepare: (root) => {
+      const bin = join(root, 'bin');
+      mkdirSync(bin, { recursive: true });
+      const piper = join(bin, 'piper');
+      writeFileSync(piper, [
+        '#!/bin/sh',
+        'echo "piper $@" >> "$STUB_LOG"',
+        'out=""',
+        'while [ "$#" -gt 0 ]; do if [ "$1" = "--output_file" ]; then out="$2"; shift 2; continue; fi; shift; done',
+        '[ -n "$out" ] && printf "RIFF-MOCK-WAV" > "$out"',
+        'exit 0',
+        '',
+      ].join('\n'));
+      chmodSync(piper, 0o755);
+      const whisper = join(bin, 'whisper-cli');
+      writeFileSync(whisper, [
+        '#!/bin/sh',
+        'echo "whisper $@" >> "$STUB_LOG"',
+        'out=""',
+        'while [ "$#" -gt 0 ]; do if [ "$1" = "-of" ]; then out="$2"; shift 2; continue; fi; shift; done',
+        '[ -n "$out" ] && printf "transcribed in test" > "$out.txt"',
+        'exit 0',
+        '',
+      ].join('\n'));
+      chmodSync(whisper, 0o755);
+      return { PATH: bin + ':' + (process.env.PATH || '/usr/bin:/bin'), STUB_LOG: join(root, 'stub.log') };
+    },
+  };
+}
+
+test('tts: every installed piper voice is listed and selectable; traversal refused', async (t) => {
+  const stubs = stubScripts(t);
+  if (!stubs) return;
+  const { base, root, call } = await bootServer(t, stubs);
+  const status = await call('/api/speech/status');
+  assert.equal(status.body.piper, true);
+  assert.deepEqual(status.body.piper_voices.map((v) => v.name), ['en_US-amy-medium.onnx', 'en_US-lessac-medium.onnx']);
+  assert.equal(status.body.piper_voice, join(root, 'data', 'speech', 'piper-voices', 'en_US-lessac-medium.onnx'), 'lessac stays the default when present');
+  assert.deepEqual(status.body.kokoro_voices, [], 'kokoro voice list is empty when kokoro is not installed');
+
+  const jsonInit = (body) => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+
+  const normal = await fetch(base + '/api/speech/tts', jsonInit({ text: 'hi there' }));
+  assert.equal(normal.status, 200);
+  assert.equal(normal.headers.get('content-type'), 'audio/wav');
+
+  const picked = await fetch(base + '/api/speech/tts', jsonInit({ text: 'hi there', voice: 'en_US-amy-medium.onnx' }));
+  assert.equal(picked.status, 200);
+  const log = () => readFileSync(join(root, 'stub.log'), 'utf8');
+  assert.match(log(), /--model \S*en_US-lessac-medium\.onnx/, 'default uses the pinned voice');
+  assert.match(log(), /--model \S*en_US-amy-medium\.onnx/, 'explicit voice is honored');
+
+  const traversal = await call('/api/speech/tts', jsonInit({ text: 'hi', voice: '../../etc/passwd.onnx' }));
+  assert.equal(traversal.status, 400);
+  assert.match(traversal.body.error, /Invalid voice name/);
+
+  const missing = await call('/api/speech/tts', jsonInit({ text: 'hi', voice: 'en_US-not-installed.onnx' }));
+  assert.equal(missing.status, 400);
+  assert.match(missing.body.error, /Voice not installed/);
+});
+
+test('whisper transcribe honors the language picker', async (t) => {
+  const stubs = stubScripts(t);
+  if (!stubs) return;
+  const { root, call } = await bootServer(t, stubs);
+  const jsonInit = (body) => ({ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+
+  const status = await call('/api/speech/status');
+  assert.equal(status.body.whisper, true);
+
+  const en = await call('/api/speech/transcribe', jsonInit({ audioBase64: 'AAAA' }));
+  assert.equal(en.status, 200);
+  assert.equal(en.body.text, 'transcribed in test');
+
+  const es = await call('/api/speech/transcribe', jsonInit({ audioBase64: 'AAAA', lang: 'es' }));
+  assert.equal(es.status, 200);
+
+  const log = readFileSync(join(root, 'stub.log'), 'utf8');
+  assert.match(log, /whisper[^\n]*-l en/, 'omitted lang falls back to English');
+  assert.match(log, /whisper[^\n]*-l es/, 'explicit lang passes through');
 });

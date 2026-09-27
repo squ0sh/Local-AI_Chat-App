@@ -1,5 +1,45 @@
 # Changelog
 
+## 1.10.0 — MCP hardening + voice polish
+
+### MCP hardening
+
+- **Allowlist-gated registration.** `/api/agent/mcp/register` refuses any
+  executable not in `CAPSULE_MCP_ALLOW` (default `node,npx,uvx`; absolute paths
+  must resolve to a listed name or exact path), and plan mode now blocks
+  registration just like tool calls — registering spawns a real process.
+- **Hermetic child environments by default.** MCP servers now receive `PATH` +
+  home only, so host secrets (`AUTH_TOKEN`, provider keys, data paths) can't
+  leak into tool servers. Caller-supplied env keys that look secret-bearing are
+  rejected. `CAPSULE_MCP_INHERIT_ENV=1` restores full inheritance when needed.
+- **Scream-proof client.** An 8 MB stdout buffer cap cuts off flooding servers
+  (and kills them), tool results larger than 1 MB are refused, `close()`
+  escalates SIGTERM → SIGKILL, and a crashed server is **revived transparently**
+  on the next list/call with its original spec.
+- **Audit journal.** Every register / unregister / call / respawn lands in
+  `data/agent/mcp.log` (size-capped), so you can always answer "who started
+  what, and did it work?"
+
+### Voice polish
+
+- **Speech language picker** in Voice Mode (Auto plus English, Español,
+  Français, Deutsch, Italiano, Português, Русский, 日本語, 中文, العربية,
+  हिन्दी). One setting drives both browser speech recognition and the offline
+  whisper fallback, and is remembered per machine.
+- **TTS voice picker.** The server now enumerates every installed Piper voice
+  and, when Kokoro is installed, its persona presets; Voice Mode shows them all
+  and remembers your choice. Voice names are allowlist-validated against the
+  on-disk files, so a request can't pick a path it was never offered.
+- **Prefetch playback.** While one sentence of the answer plays, the TTS for
+  the next sentence is already being rendered — spoken replies feel noticeably
+  more fluid, most of all with the larger Kokoro engine.
+
+### Quality
+
+- 4 browser probes cover the new pickers (66 pass); the MCP hardening adds
+  9 tests across the client and the HTTP layer (150 pass). The shared
+  `bootServer` test harness now creates nested seed directories.
+
 ## 1.9.0 — Server integration suite + README catch-up
 
 - **An HTTP-level regression net.** A new `test/http-security.test.mjs` boots

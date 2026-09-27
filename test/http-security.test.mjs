@@ -6,7 +6,7 @@
 // translation, the /v1 passthrough, and the MCP agent routes.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync } from 'fs';
+import { existsSync, mkdirSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { bootServer, TEST_PASSWORD } from './helpers/server-harness.mjs';
 import { startFakeOllama } from './helpers/fake-ollama.mjs';
@@ -261,4 +261,71 @@ test('mcp server end-to-end: register, list, call, unregister', async (t) => {
   assert.equal(unreg.status, 200);
   const after = await call('/api/agent/mcp/list');
   assert.deepEqual(after.body.clients, []);
+});
+
+// ── MCP hardening ───────────────────────────────────────────────────────────
+test('mcp register rejects commands outside CAPSULE_MCP_ALLOW', async (t) => {
+  const { call } = await bootServer(t);
+  const notAllowed = await call('/api/agent/mcp/register', { method: 'POST', headers: json, body: JSON.stringify({ command: 'bash', args: ['-c', 'echo hi'] }) });
+  assert.equal(notAllowed.status, 403);
+  assert.match(notAllowed.body.error, /not allowlisted/);
+  assert.match(notAllowed.body.error, /CAPSULE_MCP_ALLOW/);
+});
+
+test('mcp register refuses secret-looking env keys outright', async (t) => {
+  const { call } = await bootServer(t);
+  const sensitive = await call('/api/agent/mcp/register', { method: 'POST', headers: json, body: JSON.stringify({ command: 'node', args: ['server.js'], env: { AWS_SECRET_KEY: 'x' } }) });
+  assert.equal(sensitive.status, 400);
+  assert.match(sensitive.body.error, /secret-bearing/);
+  assert.match(sensitive.body.error, /AWS_SECRET_KEY/);
+});
+
+test('plan mode blocks mcp register (it starts a process)', async (t) => {
+  const { call } = await bootServer(t);
+  const plan = await call('/api/agent/mode', { method: 'POST', headers: json, body: JSON.stringify({ mode: 'plan' }) });
+  assert.equal(plan.status, 200);
+  const register = await call('/api/agent/mcp/register', { method: 'POST', headers: json, body: JSON.stringify({ command: 'node', args: ['server.js'] }) });
+  assert.equal(register.status, 409);
+  assert.equal(register.body.requiresBuild, true);
+  await call('/api/agent/mode', { method: 'POST', headers: json, body: JSON.stringify({ mode: 'build' }) });
+});
+
+test('mcp children get a hermetic environment by default', async (t) => {
+  const { root, call } = await bootServer(t);
+  const mockDir = join(root, 'mock');
+  mkdirSync(mockDir);
+  const mock = mockMcpServerPath(mockDir);
+  const envFile = join(root, 'mcp-env.json');
+  const reg = await call('/api/agent/mcp/register', { method: 'POST', headers: json, body: JSON.stringify({ id: 'env-mock', command: process.execPath, args: [mock], env: { MOCK_ENV_FILE: envFile } }) });
+  assert.equal(reg.status, 200);
+  const childEnv = JSON.parse(readFileSync(envFile, 'utf8'));
+  assert.ok(Array.isArray(childEnv));
+  assert.ok(childEnv.includes('PATH'), 'PATH survives for command resolution');
+  assert.ok(childEnv.includes('MOCK_ENV_FILE'), 'caller env passes through');
+  assert.ok(!childEnv.includes('LOCAL_AI_DATA_DIR'), 'server-internal env must not leak into the child');
+});
+
+test('a crashed mcp server is revived on the next call and journaled', async (t) => {
+  const { root, dataDir, call } = await bootServer(t);
+  const mockDir = join(root, 'mock');
+  mkdirSync(mockDir);
+  const mock = mockMcpServerPath(mockDir);
+  const reg = await call('/api/agent/mcp/register', { method: 'POST', headers: json, body: JSON.stringify({ id: 'crasher', command: process.execPath, args: [mock], env: {} }) });
+  assert.equal(reg.status, 200);
+
+  const crashed = await call('/api/agent/mcp/call', { method: 'POST', headers: json, body: JSON.stringify({ clientId: 'crasher', tool: '__crash' }) });
+  assert.equal(crashed.status, 502);
+  assert.match(crashed.body.error, /exited/i);
+
+  const revived = await call('/api/agent/mcp/call', { method: 'POST', headers: json, body: JSON.stringify({ clientId: 'crasher', tool: 'echo', arguments: { text: 'came back' } }) });
+  assert.equal(revived.status, 200);
+  assert.equal(revived.body.result.content[0].text, 'came back');
+
+  const list = await call('/api/agent/mcp/list');
+  assert.equal(list.body.clients[0].alive, true);
+
+  const audit = readFileSync(join(dataDir, 'agent', 'mcp.log'), 'utf8');
+  assert.match(audit, /"action":"register"/);
+  assert.match(audit, /"action":"call"/);
+  assert.match(audit, /"action":"respawn"/);
 });

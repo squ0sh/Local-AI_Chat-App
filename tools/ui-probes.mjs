@@ -226,6 +226,13 @@ await sleep(2200);
 ok('voice opens guided setup view (no alert)', (await ev("document.querySelector('.voice-mode').dataset.state || ''")) === 'setup' && !(await ev("window.__lastAlert||''")).length, await ev("window.__lastAlert||''"));
 ok('setup view explains itself', /one-time setup/i.test(await ev("document.querySelector('.voice-mode .voice-state')?.textContent || ''")));
 ok('setup view shows the install CTA', !(await ev("document.querySelector('.voice-install').hidden")));
+
+// Voice pickers: STT language + TTS voice are first-class controls now.
+ok('language picker ships the auto + 11 fixed locales', await ev("(()=>{const s=document.querySelector('.voice-lang-select');return s&&s.options.length===12&&s.options[0].value==='auto'})()"));
+ok('language choice persists to lc.voiceLang', await ev("(()=>{const s=document.querySelector('.voice-lang-select');s.value='es';s.dispatchEvent(new Event('change'));return localStorage.getItem('lc.voiceLang')==='es'})()"));
+ok('tts voice picker shows the default entry without engines', await ev("(()=>{const s=document.querySelector('.voice-tts-select');return s&&s.options.length===1&&s.options[0].value===''})()"));
+ok('tts voice choice persists to lc.ttsVoice', await ev("(()=>{const s=document.querySelector('.voice-tts-select');s.insertAdjacentHTML('beforeend','<option value=\"piper/en_US-lessac-medium.onnx\">Piper · en_US-lessac-medium</option>');s.value='piper/en_US-lessac-medium.onnx';s.dispatchEvent(new Event('change'));return localStorage.getItem('lc.ttsVoice')==='piper/en_US-lessac-medium.onnx'})()"));
+
 await ev("document.querySelector('.voice-mode .end')?.click()");
 await sleep(400);
 
