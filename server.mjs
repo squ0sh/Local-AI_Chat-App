@@ -2079,8 +2079,10 @@ function parseArgs(argv) {
 
 const cfg = parseArgs(process.argv.slice(2));
 // Generous ceilings: enough for interactive use and modest API clients, tight
-// enough to stop an abusive caller from pinning the machine or Ollama.
-const sharedRateLimiter = new RateLimiter({ globalCapacity: 600, perIpCapacity: 150, windowMs: 60_000 });
+// enough to stop an abusive caller from pinning the machine or Ollama. Note the
+// refill `rate` is sustained tokens per second — leaving it at the default
+// (capacity) would make the buckets refill instantly and limit nothing.
+const sharedRateLimiter = new RateLimiter({ globalCapacity: 600, perIpCapacity: 150, rate: 20, windowMs: 60_000 });
 const researchEngine = new ResearchEngine({
   dataDir: RESEARCH_DIR,
   complete: researchModelCompletion,
@@ -5146,7 +5148,8 @@ async function proxyV1(method, path, body, res) {
       timeout: 300000,
     });
 
-    for (const [k, v] of ['content-type', 'cache-control', 'connection', 'transfer-encoding']) {
+    // NOTE: destructure the loop variable, not the array of header names.
+    for (const k of ['content-type', 'cache-control', 'connection', 'transfer-encoding']) {
       const val = r.headers.get(k);
       if (val) res.setHeader(k, val);
     }
@@ -5226,7 +5229,8 @@ async function proxyCloud(method, path, body, res) {
     const h = { ...(mapped.body != null ? { 'Content-Type': 'application/json' } : {}), ...headers };
     const r = await fetch(url, { method, headers: h, ...(mapped.body != null ? { body: mapped.body } : {}) });
     logEgress({ provider: cfg.aiProvider, path, status: r.status, target: url });
-    for (const [k, v] of ['content-type', 'cache-control', 'connection', 'transfer-encoding']) {
+    // NOTE: destructure the loop variable, not the array of header names.
+    for (const k of ['content-type', 'cache-control', 'connection', 'transfer-encoding']) {
       const val = r.headers.get(k);
       if (val) res.setHeader(k, val);
     }

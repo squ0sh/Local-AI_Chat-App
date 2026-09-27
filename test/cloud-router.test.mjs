@@ -1,94 +1,51 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'child_process';
-import { createServer as netCreateServer } from 'net';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, chmodSync, readFileSync } from 'fs';
-import { tmpdir } from 'os';
-import { join, dirname } from 'path';
+import { mkdirSync, writeFileSync, chmodSync, readFileSync } from 'fs';
+import { join } from 'path';
+import { bootServer, freePort } from './helpers/server-harness.mjs';
 
-const repoRoot = dirname(new URL('../server.mjs', import.meta.url).pathname);
-
-function freePort() {
-  return new Promise((resolve) => {
-    const srv = netCreateServer();
-    srv.listen(0, '127.0.0.1', () => {
-      const { port } = srv.address();
-      srv.close(() => resolve(port));
-    });
-  });
-}
-
-// Boots the real server, isolated: temp data dir, temp docker stub dir,
-// temp freellmapi install dir. Docker behavior is steered by $STUB/docker,
-// a POSIX sh stub that logs its args to STUB_LOG.
+// Boots the real server on the shared harness with the cloud-router fixtures
+// on top: a docker PATH stub that logs its args to STUB_LOG, an optional
+// compose dir, and an isolated freellmapi install location. Docker behavior is
+// steered by $STUB/docker, a POSIX sh stub that logs its args to STUB_LOG.
 async function boot(t, { dockerInfoOk = false, customCmd = '', composeDir = false, desktop = '' } = {}) {
-  const port = await freePort();
-  const root = mkdtempSync(join(tmpdir(), 'cloud-router-test-'));
-  const dataDir = join(root, 'data');
-  const binDir = join(root, 'bin');
-  const fllmDir = join(root, 'fllm');
-  const stubLog = join(root, 'docker-stub.log');
-  mkdirSync(binDir, { recursive: true });
-  // Keep probes hermetic even if a real router happens to run on 3001.
-  mkdirSync(dataDir, { recursive: true });
-  writeFileSync(join(dataDir, 'ai_settings.env'), 'OPENAI_BASE_URL=http://127.0.0.1:1/v1\n');
-  if (composeDir) {
-    mkdirSync(fllmDir, { recursive: true });
-    writeFileSync(join(fllmDir, 'docker-compose.yml'), 'services:\n');
-  }
-  if (process.platform !== 'win32') {
-    const stub = join(binDir, 'docker');
-    writeFileSync(stub, [
-      '#!/bin/sh',
-      `echo "$@" >> "${stubLog}"`,
-      'if [ "$1" = "info" ]; then exit ' + (dockerInfoOk ? '0' : '1') + '; fi',
-      'exit 0',
-      '',
-    ].join('\n'));
-    chmodSync(stub, 0o755);
-  }
-  const env = {
-    ...process.env,
-    LOCAL_AI_DATA_DIR: dataDir,
-    OLLAMA_URL: 'http://127.0.0.1:1',
-    PATH: `${binDir}:${process.env.PATH || '/usr/bin:/bin'}`,
-    STUB_LOG: stubLog,
-    FREELLMAPI_DIR: fllmDir,
-    FREELLMAPI_DESKTOP: desktop,
-    // Isolate homedir(): a real ~/freellmapi install must not leak into tests.
-    HOME: root,
-    USERPROFILE: root,
-  };
-  if (customCmd) env.FREELLMAPI_CMD = customCmd;
-  else delete env.FREELLMAPI_CMD;
-  const server = spawn(process.execPath, ['server.mjs', '--mode', 'local', '--host', '127.0.0.1', '--port', String(port)], {
-    cwd: repoRoot,
-    env,
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let logs = '';
-  server.stdout.on('data', (d) => { logs += d; });
-  server.stderr.on('data', (d) => { logs += d; });
-  const base = `http://127.0.0.1:${port}`;
-  for (let i = 0; i < 100; i += 1) {
-    try { const r = await fetch(base + '/health'); if (r.status < 500) break; } catch {}
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  t.after(() => {
-    server.kill();
-    rmSync(root, { recursive: true, force: true });
-  });
-  return {
-    base,
-    stubLog,
-    root,
-    call: async (path, init = {}) => {
-      const r = await fetch(base + path, init);
-      let body = null;
-      try { body = await r.json(); } catch {}
-      return { status: r.status, body };
+  const { base, root, call } = await bootServer(t, {
+    // Keep probes hermetic even if a real router happens to run on 3001.
+    seedFiles: { 'ai_settings.env': 'OPENAI_BASE_URL=http://127.0.0.1:1/v1\n' },
+    // Isolate homedir() and drop any host-side router command so a real
+    // ~/freellmapi install can never leak into tests.
+    removeEnv: customCmd ? [] : ['FREELLMAPI_CMD'],
+    prepare: (home) => {
+      const binDir = join(home, 'bin');
+      const fllmDir = join(home, 'fllm');
+      const stubLog = join(home, 'docker-stub.log');
+      mkdirSync(binDir, { recursive: true });
+      if (composeDir) {
+        mkdirSync(fllmDir, { recursive: true });
+        writeFileSync(join(fllmDir, 'docker-compose.yml'), 'services:\n');
+      }
+      if (process.platform !== 'win32') {
+        const stub = join(binDir, 'docker');
+        writeFileSync(stub, [
+          '#!/bin/sh',
+          `echo "$@" >> "${stubLog}"`,
+          'if [ "$1" = "info" ]; then exit ' + (dockerInfoOk ? '0' : '1') + '; fi',
+          'exit 0',
+          '',
+        ].join('\n'));
+        chmodSync(stub, 0o755);
+      }
+      const env = {
+        PATH: `${binDir}:${process.env.PATH || '/usr/bin:/bin'}`,
+        STUB_LOG: stubLog,
+        FREELLMAPI_DIR: fllmDir,
+        FREELLMAPI_DESKTOP: desktop,
+      };
+      if (customCmd) env.FREELLMAPI_CMD = customCmd;
+      return env;
     },
-  };
+  });
+  return { base, root, stubLog: join(root, 'docker-stub.log'), call };
 }
 
 test('router status honors the ?port= override and reports dead ports truthfully', async (t) => {

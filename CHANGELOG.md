@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.9.0 — Server integration suite + README catch-up
+
+- **An HTTP-level regression net.** A new `test/http-security.test.mjs` boots
+  the real server in isolation against a hermetic in-process fake Ollama and
+  pins the surfaces the library tests couldn't reach: the multi-user auth gate,
+  login/logout with bearer + HttpOnly cookie flows, per-user encrypted chat
+  stores, the brute-force rate limit on `/api/auth/login`, the privacy-flag 403
+  plus its positive local-stream case, `CAPSULE_DENY_EGRESS` refusal, the
+  `/v1/responses` item/tool translation and SSE event sequence, `/v1/*`
+  passthrough streaming, and the MCP register/list/call/unregister routes over
+  HTTP (14 tests; the suite is now 139).
+- **Two real bugs the new suite caught.** `proxyV1`/`proxyCloud` iterated
+  `['content-type', …]` with array destructuring, so the upstream `Content-Type`
+  was never forwarded to `/v1/*` clients; and the shared rate limiter was built
+  with the 150-token per-IP *capacity* also acting as the per-second *refill*,
+  so bursts could never be denied — the buckets now refill at a sustained 20/s.
+- Shared server-boot harness extracted to `test/helpers/server-harness.mjs`
+  (ephemeral port, tmp `DATA_DIR`, isolated `HOME`, users/seed-file fixtures);
+  the cloud-router suite moved onto it unchanged; `test/helpers/fake-ollama.mjs`
+  is the small reusable OpenAI+native-API stub.
+- README update: the environment table grew long-missing rows (multi-user,
+  tunnel types, deny-egress, Peers/USB knobs, whisper/piper paths, runtime
+  pins), the endpoint table documents `/v1/responses`, a MCP section covers the
+  Agent dialog panel and `/api/agent/mcp/*`, and a short *Multi-user accounts*
+  section explains enabling sign-in mode and its isolation guarantees.
+
 ## 1.8.1 — Capsule↔Capsule handshakes (postcards over anything)
 
 - **A peer protocol that doesn't care how it travels.** Every exchangeable

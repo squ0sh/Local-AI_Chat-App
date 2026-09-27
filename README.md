@@ -218,6 +218,17 @@ everything; the ones worth knowing:
 - `/mcp` — list or call MCP tools (connect a local server via the MCP panel).
 - `/new`, `/model`, `/agent`, `/skills`, `/norms`, `/stop`, `/clear`, `/forget`.
 
+### MCP servers (local only)
+
+The agent can plug into any local MCP-compliant tool server. Open the **Agent**
+dialog, find the **MCP server** panel, enter a command (for example
+`node /path/to/server.mjs` or `npx my-mcp-server --flag`), and connect. Connected
+servers and their tools appear in the panel; the terminal lists and calls them
+with `/mcp` (and `/mcp call <client> <tool> <json>` after a confirmation).
+Servers run over JSON-RPC stdio under the hood (see `lib/mcp-client.mjs`), and
+the HTTP routes behind the panel (`/api/agent/mcp/register|list|call|unregister`)
+are available only from the local app — never over Capsule Remote.
+
 Offline behavior packs live inside Agent Mode. Choose **Choose a skill** or use
 `/skills`; the selected pack updates the current chat's system prompt. Skills
 no longer occupy a separate Capsule sidebar entry.
@@ -323,6 +334,39 @@ run this app on a small VM/container with Ollama, HTTPS, a persistent Cloudflare
 Tunnel, and real user authentication in front of it. Never put provider API
 keys into a publicly shared browser build.
 
+Three tunnel flavors are supported:
+
+- **Quick** (default) — `npm run tunnel`. Ephemeral `*.trycloudflare.com` URL.
+- **Tailscale Funnel** — `npm run tunnel:tailscale`. Publishes to your tailnet's
+  `https://…ts.net` name; requires a logged-in Tailscale on this machine.
+- **Named Cloudflare tunnel** — `TUNNEL_NAME=my-tunnel npm run tunnel:named`.
+  Uses a tunnel already created with `cloudflared tunnel create`; the URL stays
+  stable across restarts.
+
+All flavors still require `AUTH_TOKEN`. For a local-only box that should never
+send anything off-device, add `CAPSULE_DENY_EGRESS=1` — the cloud provider
+proxy and research web access are refused before any request leaves this
+machine.
+
+### Multi-user accounts (optional)
+
+By default the Capsule is a single-operator app. To gate the whole surface
+behind real sign-ins — each user with their own encrypted chat history under
+`data/users/<name>/chats/` — create at least one account:
+
+```bash
+node lib/user-store.mjs create alice "a long memorable password"
+```
+
+On the next start the app detects `data/users.json`, shows a sign-in dialog,
+and locks every `/api/*` and `/v1/*` route until a session is issued (bearer
+token and HttpOnly cookie both work; sessions last 10 hours). Passwords are
+scrypt-hashed, the file is written 0600-aware atomically, login attempts ride
+the same rate limiter as the chat API, and Capsule Remote is refused in this
+mode. Put the accounts file somewhere else with `CAPSULE_USERS_FILE`.
+
+Delete `data/users.json` to go back to single-operator mode.
+
 ### Cloud providers (optional) — including FreeLLMAPI
 
 The **Cloud** button connects the app to OpenAI, Anthropic, or Google Gemini
@@ -370,6 +414,7 @@ by default; use `--host 0.0.0.0` only when you intentionally want LAN access.
 | --------------------- | ------------------------------ |
 | `GET  /v1/models`     | List models                    |
 | `POST /v1/chat/completions` | Chat (streaming + non-streaming) |
+| `POST /v1/responses` | Responses API (passthrough to OpenAI provider; translates to the local model otherwise) |
 | `GET  /health`        | Server + Ollama status         |
 | `GET  /api/models`    | Native Ollama tag list         |
 | `GET  /api/models/library` | Local-app-only installed/catalog/storage report |
@@ -396,15 +441,60 @@ node tools/model-cli.mjs info llama3.2:3b
 
 ## Configuration (environment variables)
 
+Core:
+
 | Variable              | Default                  | Description                          |
 | --------------------- | ------------------------ | ------------------------------------ |
 | `OLLAMA_URL`          | `http://127.0.0.1:11434`| Ollama API base URL                  |
 | `PORT`                | `5173`                 | Local AI Chat listening port         |
 | `HOST`                | `127.0.0.1`            | Bind address; use `0.0.0.0` for LAN access |
 | `OLLAMA_API_KEY`      | *(unset)*                | Upstream auth bearer (if Ollama gated) |
+| `OLLAMA_MODELS`       | *(unset)*                | Override the Ollama model-library location |
 | `AUTH_TOKEN`          | *(unset)*                | Require `Authorization: Bearer` on this server |
-| `CLOUDFLARED_PATH`    | *(auto-detect)*          | Path to cloudflared binary           |
 | `RESEARCH_SEARXNG_URL`| *(unset)*                | Optional SearXNG search endpoint; otherwise DuckDuckGo with Bing RSS fallback |
+
+Runtimes and portable data:
+
+| Variable                  | Default          | Description                          |
+| ------------------------- | ---------------- | ------------------------------------ |
+| `LOCAL_AI_DATA_DIR`       | *(portable layout)* | Fully self-contained data directory |
+| `LOCAL_AI_NODE_BIN`       | *(auto-detect)*  | Explicit Node runtime binary         |
+| `LOCAL_AI_OLLAMA_BIN`     | *(auto-detect)*  | Explicit Ollama runtime binary       |
+| `LOCAL_AI_NO_BROWSER`     | *(unset)*        | Launchers will not auto-open the browser |
+| `LOCAL_AI_AUTO_DOWNLOADS` | *(unset)*        | Skip the launcher runtime prompt and re-download quietly |
+| `LOCAL_AI_USB_SCAN_ROOTS` | *(auto)*         | Override removable-drive scan roots for the USB builder (path list, `;` on Windows) |
+| `LOCAL_AI_PEER_PORT`      | `45917`          | UDP/TCP port for Peers LAN discovery and sync |
+
+Tunnel, cloud, and egress:
+
+| Variable                 | Default            | Description                       |
+| ------------------------ | ------------------ | --------------------------------- |
+| `TUNNEL_TYPE`            | `quick`            | Tunnel flavor: `quick` (ephemeral trycloudflare), `tailscale` (Funnel), `named` (persistent Cloudflare tunnel) |
+| `TUNNEL_NAME`            | *(unset)*          | Tunnel name when `TUNNEL_TYPE=named` |
+| `CLOUDFLARED_PATH`       | *(auto-detect)*    | Path to cloudflared binary        |
+| `CAPSULE_DENY_EGRESS`    | *(unset)*          | With `1` (or `--deny-egress`), refuse any upstream whose host is not loopback; research needs no outbound traffic either. Denials are journaled to `data/egress.log` |
+| `FREELLMAPI_CMD`         | *(unset)*          | Explicit FreeLLMAPI router start command (plus `FREELLMAPI_ARGS`) |
+| `FREELLMAPI_DIR`         | *(auto)*           | Router install directory          |
+| `FREELLMAPI_DESKTOP`     | *(auto)*           | Router desktop app path           |
+
+Multi-user and speech:
+
+| Variable              | Default                    | Description                        |
+| --------------------- | -------------------------- | ---------------------------------- |
+| `CAPSULE_USERS_FILE`  | `data/users.json`          | Accounts file enabling multi-user mode |
+| `WHISPER_CLI`         | *(auto-detect)*            | Path to a whisper.cpp binary       |
+| `WHISPER_MODEL`       | `models/whisper/ggml-base.bin` | Whisper STT model file          |
+| `PIPER_CLI`           | *(auto-detect)*            | Path to a piper binary             |
+| `PIPER_VOICE`         | `models/piper/voice.onnx`  | Piper TTS voice file               |
+
+Integrity and hardening:
+
+| Variable                     | Default   | Description                         |
+| ---------------------------- | --------- | ----------------------------------- |
+| `CAPSULE_ALLOW_UNSIGNED`     | *(unset)* | Accept an unsigned integrity manifest (dev machines without the signing key; the portable launchers set this automatically) |
+| `CAPSULE_ALLOW_INSECURE_BIND`| *(unset)* | Allow binding a tokenless server on a non-loopback host (dangerous; normally refused) |
+| `CAPSULE_MAX_CONTEXT`        | *(auto)*  | Override the auto RAM-based `num_ctx` cap (min 1024) |
+| `LOCAL_AI_EMBED_STUB`        | *(unset)* | Internal/test: memory embedder stub |
 
 ## Tunnel mode
 
