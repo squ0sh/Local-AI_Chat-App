@@ -1941,6 +1941,213 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
   $('peers-close').onclick=()=>d.close();
 })();
 
+// ── Transports panel + postcard carriers over every medium (light, sound, ───
+// bridge, radio). Each carrier surfaces in the Peers dialog with its own
+// transmit / receive door; everything lands in the same consent inbox.
+(()=>{
+  if(!['localhost','127.0.0.1'].includes(location.hostname))return;
+  // Vendored decoders ride along as classic scripts; loading is idempotent.
+  if(!window.jsQR&&!document.querySelector('script[src="/jsqr.js"]')){const s=document.createElement('script');s.src='/jsqr.js';document.head.append(s)}
+  if(!window.SoundModem&&!document.querySelector('script[src="/sound-modem.js"]')){const s=document.createElement('script');s.src='/sound-modem.js';document.head.append(s)}
+  const dialog=[...document.querySelectorAll('dialog')].find(x=>x.querySelector('#peers-words'));
+  if(!dialog)return;
+  const $=id=>dialog.querySelector('#'+id);
+  const norm=m=>window.humanizeErrorText?window.humanizeErrorText(m):m;
+  const css=document.createElement('style');
+  css.textContent='.tx-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;border:1px solid var(--line);border-radius:9px;background:var(--panel2);padding:8px 10px;margin:6px 0;font-size:12.5px}.tx-row b{min-width:64px}.tx-status{font-size:11px;color:var(--muted);flex:1;min-width:150px}.tx-dot{width:8px;height:8px;border-radius:50%;background:#5b6470;flex:none;margin-right:2px}.tx-dot.on{background:var(--green)}.tx-modal{font-size:12.5px}.tx-frames{display:grid;gap:10px;justify-items:center}.tx-frames img{background:#fff;border-radius:12px;padding:10px;width:min(280px,60vw)}.tx-head{display:flex;align-items:center;justify-content:center;gap:12px;margin:10px 0}';
+  document.head.append(css);
+  const td=document.createElement('dialog');
+  td.innerHTML='<div class="settings tx-modal"><h2 id="tx-title">Transmit</h2><p class="privacy" id="tx-copy"></p><div id="tx-body"></div><div class="notice" id="tx-status"></div><div class="dialog-actions"><button class="plain-btn" id="tx-close">Done</button></div></div>';
+  document.body.append(td);
+  const T=id=>td.querySelector('#'+id);
+  let stopActive=null;
+  const openTx=(title,copy)=>{try{stopActive?.()}catch{};stopActive=null;T('tx-title').textContent=title;T('tx-copy').textContent=copy||'';T('tx-body').replaceChildren();T('tx-status').textContent='';td.showModal()};
+  T('tx-close').onclick=()=>{try{stopActive?.()}catch{};stopActive=null;td.close();T('tx-body').replaceChildren()};
+  td.addEventListener('cancel',()=>{try{stopActive?.()}catch{};stopActive=null;td.close()});
+  const cat=(a,b)=>{const o=new Float32Array(a.length+b.length);o.set(a);o.set(b);return o};
+  const envelopeFromForm=async()=>{
+    const kind=$('peers-kind').value,fp=$('peers-target').value||'';
+    const payload={kind,fp,title:$('peers-item-title').value||undefined};
+    if(kind==='note')payload.text=$('peers-note').value;
+    if(kind==='procedure'){const id=$('peers-proc-pick')?.querySelector('input[type=radio]:checked')?.value;if(!id)throw Error('Pick which of your procedures to wrap.');payload.procedureId=id}
+    if(kind==='note'&&!payload.text&&!payload.title)throw Error('Now make a note first — a title alone is enough.');
+    const r=await fetch('/api/peers/postcard',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)}),j=await r.json();
+    if(!r.ok)throw Error(j.error||'could not build postcard');
+    return j;
+  };
+  const framesFor=async(env)=>{
+    const r=await fetch('/api/peers/transport/frames',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:env.text,maxBytes:700})}),j=await r.json();
+    if(!r.ok)throw Error(j.error||'could not build frames');
+    return j.frames||[];
+  };
+  const lightTx=async()=>{
+    openTx('Light — transmit as QR','Hold your screen to the other capsule’s camera. Each code is one frame; keep it still until it reads, then it advances.');
+    const st=T('tx-status');st.textContent='Building frames…';
+    try{
+      const frames=await framesFor(await envelopeFromForm());
+      if(!frames.length)throw Error('nothing to send — make a postcard first');
+      T('tx-body').innerHTML='<div class="tx-head"><button class="plain-btn" id="tx-prev">◀ Previous</button><span class="peer-pill" id="tx-i"></span><button class="plain-btn" id="tx-next">Next ▶</button></div><div class="tx-frames"></div>';
+      const box=T('tx-body').querySelector('.tx-frames'),pill=T('tx-i');
+      let i=0,timer=0;
+      const show=n=>{
+        i=n;clearTimeout(timer);
+        box.innerHTML='';const im=document.createElement('img');im.alt='QR frame '+(n+1);im.src='/api/peers/transport/qr?cellSize=6&v='+Date.now()+'&text='+encodeURIComponent(frames[n]);box.append(im);
+        pill.textContent='frame '+(n+1)+' / '+frames.length;
+        if(n<frames.length-1)timer=setTimeout(()=>show(n+1),2800);
+      };
+      T('tx-prev').onclick=()=>{i>0?(show(i-1)):(show(0))};
+      T('tx-next').onclick=()=>{i<frames.length-1?show(i+1):show(i)};
+      show(0);
+      st.textContent='Showing QR code '+frames.length+' frame(s), ~2.8s each — receive on the other screen via Light → Receive.';
+    }catch(e){st.textContent=norm(e.message)}
+  };
+  const lightRx=async()=>{
+    openTx('Light — receive from camera','Point this camera at the sender’s codes. Every frame that reads goes through the same consent inbox.');
+    const st=T('tx-status');st.textContent='Opening camera…';
+    T('tx-body').innerHTML='<video id="tx-video" playsinline muted style="width:100%;max-width:360px;border-radius:10px;border:1px solid var(--line);background:#000"></video><canvas id="tx-canvas" hidden></canvas>';
+    const video=T('tx-video'),canvas=T('tx-canvas');
+    let done=false,stream=null;
+    stopActive=()=>{done=true;stream?.getTracks().forEach(x=>x.stop());stream=null};
+    try{
+      stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}});
+      video.srcObject=stream;await video.play();
+      const cv=canvas.getContext('2d',{willReadFrequently:true});
+      let last='';
+      const tick=async()=>{
+        if(done)return;
+        if(video.videoWidth&&window.jsQR){
+          canvas.width=video.videoWidth;canvas.height=video.videoHeight;cv.drawImage(video,0,0);
+          const d=cv.getImageData(0,0,canvas.width,canvas.height);
+          const code=window.jsQR(d.data,d.width,d.height);
+          if(code&&code.data&&code.data!==last){
+            last=code.data;
+            const m=code.data.match(/^TX\|(\d+)\|(\d+)\|([0-9a-f]+)\|(.*)$/);
+            if(m)try{
+              const r=await fetch('/api/peers/transport/rx',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({via:'light',sid:'camera',seq:Number(m[1]),total:Number(m[2]),crc:m[3],data:m[4]})}),j=await r.json();
+              if(j.complete){stopActive();st.textContent='✓ Complete postcard received — approve it in the inbox below.';return}
+              st.textContent='frame '+j.got+' / '+j.total+' — keep reading codes';
+            }catch(e){}
+          }
+        }
+        requestAnimationFrame(tick);
+      };
+      tick();
+    }catch(e){st.textContent='Camera unavailable (or permission denied). Paste the sender’s frames in “Receive a postcard” instead.'}
+  };
+  const soundTx=async()=>{
+    openTx('Sound — transmit as tones','Turn the volume up; the other capsule listens with a microphone. Tones live near 16–19 kHz, only just audible.');
+    const st=T('tx-status');st.textContent='Building tone bursts…';
+    try{
+      const frames=await framesFor(await envelopeFromForm());
+      if(!frames.length)throw Error('nothing to send — make a postcard first');
+      const SM=window.SoundModem;
+      if(!SM||!SM.encode)throw Error('sound modem not loaded yet — try again in a moment');
+      const ctx=new (window.AudioContext||window.webkitAudioContext)();
+      stopActive=()=>{try{ctx.close()}catch{}};
+      const gap=new Float32Array(Math.round(48000*0.6));
+      let buf=new Float32Array(0);
+      for(const f of frames){buf=cat(buf,gap);buf=cat(buf,SM.encode(f))}
+      buf=cat(buf,gap);
+      const ab=ctx.createBuffer(1,buf.length,48000);ab.getChannelData(0).set(buf);
+      const src=ctx.createBufferSource();src.buffer=ab;src.connect(ctx.destination);
+      src.onended=()=>{st.textContent='All '+frames.length+' burst(s) played — did the other capsule hear them?'};
+      src.start();
+      st.textContent='Playing '+frames.length+' tone burst(s); each frame takes a few seconds.';
+    }catch(e){st.textContent=norm(e.message)}
+  };
+  const soundRx=async()=>{
+    openTx('Sound — listen for tones','Keep this near the sender’s speaker. Tone bursts decode in live, and each postcard lands in the inbox once complete.');
+    const st=T('tx-status');st.textContent='Opening microphone…';
+    let done=false,stream=null;
+    stopActive=()=>{done=true;stream?.getTracks().forEach(x=>x.stop());stream=null};
+    try{
+      const SM=window.SoundModem;
+      if(!SM||!SM.decodeAll)throw Error('sound modem not loaded yet — try again in a moment');
+      stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false}});
+      const ctx=new AudioContext();
+      const src=ctx.createMediaStreamSource(stream);
+      const proc=ctx.createScriptProcessor(16384,1,1);
+      let acc=new Float32Array(0);
+      stopActive=()=>{done=true;try{proc.disconnect()}catch{};try{src.disconnect()}catch{};stream?.getTracks().forEach(x=>x.stop());stream=null;try{ctx.close()}catch{}};
+      const sendFrag=async(txt)=>{
+        const m=String(txt).trim().match(/^TX\|(\d+)\|(\d+)\|([0-9a-f]+)\|(.*)$/);
+        if(!m)return;
+        try{
+          const r=await fetch('/api/peers/transport/rx',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({via:'sound',sid:'mic',seq:Number(m[1]),total:Number(m[2]),crc:m[3],data:m[4]})}),j=await r.json();
+          if(j.complete){st.textContent='✓ Complete postcard received — approve it in the inbox below.';stopActive();}
+        }catch{}
+      };
+      proc.onaudioprocess=e=>{
+        if(done)return;
+        const ch=e.inputBuffer.getChannelData(0);
+        acc=cat(acc,ch.subarray?new Float32Array(ch):ch);
+        if(acc.length>=ctx.sampleRate*4){
+          const chunk=acc;acc=new Float32Array(0);
+          try{const found=SM.decodeAll(chunk);(found||[]).forEach(sendFrag)}catch{}
+        }
+      };
+      src.connect(proc);proc.connect(ctx.destination);
+      st.textContent='Listening… frames decode as they arrive.';
+    }catch(e){st.textContent=norm(e.message)}
+  };
+  const radioTx=async()=>{
+    openTx('Radio — transmit through the dongle','Frames ride as text through the LoRa / Meshtastic-style CLI. The receiving capsule polls on its own and lands the postcard in the inbox.');
+    const st=T('tx-status');st.textContent='Checking radio…';
+    try{
+      const env=await envelopeFromForm();
+      const r=await fetch('/api/peers/transport/radio',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text:env.text,maxBytes:700})}),j=await r.json();
+      if(!r.ok)throw Error(j.error||'radio send failed');
+      T('tx-body').innerHTML='<span class="peer-pill">'+j.sent+' frame(s) transmitted · '+j.mode+' PHY</span>';
+      st.textContent='Put on the air. The other capsule picks it up automatically.';
+    }catch(e){st.textContent=norm(e.message)}
+  };
+  const bridgeTx=async()=>{
+    openTx('Bridge — ship to the drop folder','Writes the postcard as a file in the USB / drop-folder. The other capsule watches that folder and lands it in the inbox.');
+    const st=T('tx-status');st.textContent='Writing file…';
+    try{
+      const kind=$('peers-kind').value;
+      const item=kind==='procedure'?{kind:'procedure',id:$('peers-proc-pick')?.querySelector('input[type=radio]:checked')?.value}:{kind:'note',title:$('peers-item-title').value,text:$('peers-note').value};
+      if(!item.id&&!item.text&&!item.title)throw Error('Now make a note or pick a procedure first.');
+      const r=await fetch('/api/peers/bridge/export',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({items:[item]})}),j=await r.json();
+      if(!r.ok)throw Error(j.error||'could not export');
+      st.textContent='Wrote '+(j.written||[]).length+' postcard file(s) to the drop folder — move it to the receiving capsule.';
+      $('peers-notice').textContent=(j.path||'')+' · '+((j.written||[]).length+' file(s)');
+    }catch(e){st.textContent=norm(e.message)}
+  };
+  const actions={
+    bridge:{label:'USB / drop folder',on:true,hint:'read/write live on this chip',tx:{label:'Ship to folder',fn:bridgeTx}},
+    light:{label:'Light (QR)',on:true,hint:'camera → screen',tx:{label:'Transmit',fn:lightTx},rx:{label:'Receive',fn:lightRx}},
+    sound:{label:'Sound (tones)',on:true,hint:'speaker → microphone',tx:{label:'Transmit',fn:soundTx},rx:{label:'Listen',fn:soundRx}},
+    radio:{label:'Radio',on:false,hint:'no hardware seen',tx:{label:'Transmit',fn:radioTx}},
+  };
+  const paintTransports=async()=>{
+    const el=$('peers-transports');if(!el)return;
+    let data;
+    try{const q=await fetch('/api/peers/transport');data=await q.json()}catch{el.textContent='Transporters unavailable while offline from the local app.';return}
+    const t=data?.transports||{};
+    const rows=Object.keys(actions).map(k=>{
+      const a=actions[k],s=t[k]||{};
+      const on=k==='radio'?!!s.available:true;
+      const hint=k==='radio'?(s.mode||s.hint||'no hardware'):(s.mode||(s.path||k));
+      const buttons=['<button class="plain-btn" style="padding:3px 9px;font-size:11px" data-tx="'+k+'">'+a.tx.label+'</button>'];
+      if(a.rx)buttons.push('<button class="plain-btn" style="padding:3px 9px;font-size:11px" data-rx="'+k+'">'+a.rx.label+'</button>');
+      return '<div class="tx-row"><span class="tx-dot'+(on?' on':'')+'"></span><b>'+a.label+'</b><span class="tx-status">'+hint+'</span>'+buttons.join('')+'</div>';
+    }).join('');
+    el.innerHTML=rows;
+    el.querySelectorAll('[data-tx]').forEach(btn=>{btn.onclick=actions[btn.dataset.tx].tx.fn});
+    el.querySelectorAll('[data-rx]').forEach(btn=>{btn.onclick=actions[btn.dataset.rx].rx.fn});
+  };
+  const anchor=dialog.querySelector('#peers-notice');
+  if(anchor){
+    const box=document.createElement('div');box.id='peers-transports';box.textContent='Checking transporters…';
+    const lab=document.createElement('label');lab.textContent='Transports — the postcard above can leave by any road';
+    const wrap=anchor.parentElement||dialog;
+    wrap.insertBefore(box,anchor);wrap.insertBefore(lab,box);
+  }
+  paintTransports();
+  setInterval(()=>{if(dialog.open)paintTransports()},3000);
+})();
+
 // ── Brain escrow: social recovery for memory + procedures ────────────────────
 // Rides the postcard system: each holder becomes a consent-gated retainer of a
 // Shamir shard + the sealed brain blob. Rebuilding needs the threshold count

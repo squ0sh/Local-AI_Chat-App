@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.15.0 — Postcards over any medium: the transport bus
+
+- **One seam, four new carriers.** A `peer-transport` bus (`lib/peer-transport.mjs`,
+  integrity-tracked) gives every postcard the same road out and the same
+  consent inbox back — nothing lands silently on any medium, and everything is
+  journaled. Carriers: **bridge** (USB/drop folder, watched from boot),
+  **light** (screen-to-camera QR), **sound** (speaker-to-microphone FSK),
+  **radio** (any Meshtastic-style CLI). A LAN sync remains the always-on option.
+- **Fragments survive tiny channels.** Wordy postcards split into
+  `TX|seq|total|crc|data` frames (CRC-32 per chunk) and reassemble on the far
+  side through `/api/peers/transport/rx`; one dominant envelope fits a single
+  QR or radio burst unchanged. The absolute, hard floor — a 2300-character
+  envelope — is pinned in the tests.
+- **Light:** `/api/peers/transport/qr` renders one SVG per frame for the
+  transmit page; the receive page runs vendored **jsQR** (`lib/vendor/jsqr-core.cjs`,
+  Apache-2.0) over the camera feed and posts every read code.
+- **Sound:** vendored pure-DSP modem (`lib/vendor/sound-modem.cjs`, MIT) —
+  16.5/18.5 kHz FSK at 48 k samples at ~120 baud, symbol-phase search + CRC
+  validation strong enough to decode through volume drops, mic delay up to tens
+  of thousands of samples, and resampled 44.1 kHz mics.
+- **Radio:** a dongle-shaped transport. `CAPSULE_RADIO_CMD` + `%T` frame splice
+  (shell-quoted so the `|` stays inside one argument),
+  `CAPSULE_RADIO_RECEIVE_CMD`, and `CAPSULE_RADIO_POLL_MS` (default 15 s). The
+  fake-binary tests stand in for a real modem: two shell scripts over spools,
+  one fragment per transmission, proving reassembly and the empty-air silence
+  rule end-to-end.
+- **UI:** a **Transports** panel in the Peers dialog shows every carrier with a
+  live dot, mode and one-button **Transmit / Receive** doors — QR stream,
+  tone bursts, radio push, or write-to-folder — plus honest messaging when
+  hardware or a camera/mic is missing. 9 browser probes cover the panel and
+  the transmit/receive doors.
+- 22 new tests (bus fragmentation, bridge, light, sound, radio) plus the
+  existing LAN/paste suite. Suite: 214 / 79 green.
+
 ## 1.14.0 — Machine body telemetry: the capsule can feel itself
 
 - **New sidebar Machine card.** Live CPU %, RAM, temperature, fan, battery,

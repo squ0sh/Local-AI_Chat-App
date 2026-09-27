@@ -13,7 +13,7 @@
 
 import { createServer } from 'http';
 import * as https from 'https';
-import { readFileSync, existsSync, mkdirSync, createReadStream, createWriteStream, copyFileSync, chmodSync, readdirSync, rmdirSync, rmSync, statSync, statfsSync, writeFileSync, renameSync, unlinkSync, accessSync, constants as fsConstants, appendFileSync } from 'fs';
+import { readFileSync, existsSync, mkdirSync, createReadStream, createWriteStream, copyFileSync, chmodSync, readdirSync, rmdirSync, rmSync, statSync, statfsSync, writeFileSync, renameSync, unlinkSync, accessSync, appendFileSync, watch, constants as fsConstants } from 'fs';
 import { join, dirname, resolve, relative, sep, basename } from 'path';
 import { fileURLToPath } from 'url';
 import { spawn, execSync, execFileSync } from 'child_process';
@@ -29,6 +29,7 @@ import { ConsolidationEngine } from './lib/consolidation.mjs';
 import { newDeviceIdentity, makeCard, readCard, packPostcard, unpackPostcard, envToText, textToEnv, fingerprint as peerFp, wordsPhrase } from './lib/capsule-handshake.mjs';
 import { packBrain, unpackBrain, buildShardEnvelopes, readShardEnvelope, combineShardEnvelopes } from './lib/escrow.mjs';
 import { LanLink } from './lib/capsule-net.mjs';
+import { TransportBus, crc32, fragment, defragment, envelopeFrame, unenvelopeFrame } from './lib/peer-transport.mjs';
 import { sealVault, openVault } from './lib/capsule-vault.mjs';
 import { ResearchEngine } from './lib/research-engine.mjs';
 import { pullOllamaModel } from './lib/resumable-ollama-pull.mjs';
@@ -49,6 +50,14 @@ const HTML_FILE = join(__dirname, 'index.html');
 let INDEX_HTML = existsSync(HTML_FILE) ? readFileSync(HTML_FILE, 'utf8') : null;
 const CAPSULE_UI_FILE = join(__dirname, 'capsule-ui.js');
 let CAPSULE_UI = existsSync(CAPSULE_UI_FILE) ? readFileSync(CAPSULE_UI_FILE, 'utf8') : null;
+// Vendored jsQR (Apache-2.0) served raw as a classic script: the receive side
+// of the light carrier decodes camera frames locally, never uploading pixels.
+const JSQR_FILE = join(__dirname, 'lib', 'vendor', 'jsqr-core.cjs');
+let JSQR_RAW = existsSync(JSQR_FILE) ? readFileSync(JSQR_FILE, 'utf8') : null;
+// Vendored sound modem (MIT) served raw as a classic script: the receive side
+// of the sound carrier demodulates mic audio locally, never uploading samples.
+const SOUND_MODEM_FILE = join(__dirname, 'lib', 'vendor', 'sound-modem.cjs');
+let SOUND_MODEM_RAW = existsSync(SOUND_MODEM_FILE) ? readFileSync(SOUND_MODEM_FILE, 'utf8') : null;
 // CSP needs the single inline <script> block in index.html to be hashed, not
 // allowed with 'unsafe-inline'. The hash is derived from the exact file we
 // serve, so it stays correct as the UI evolves.
@@ -2469,6 +2478,274 @@ async function lanPushItems(address, port, items) {
 }
 
 
+// ── Peer transport bus: postcards over any medium ──────────────────────────
+// One seam, all carriers. Inbound bytes from a USB stick, a camera, a modem,
+// or a radio dongle become inbox items through exactly the same path: verify
+// the signature, queue approval. Nothing lands silently on any medium.
+function ingestPostcardText(text, via, extra = {}) {
+  const env = textToEnv(String(text));
+  const known = peersList().find((p) => p.fp === env.src);
+  const read = unpackPostcard(env, { identity: peersIdentity(), trustedPubs: peersList() });
+  const inbox = peersInbox();
+  const fromName = known?.name || extra.fromName || 'unknown sender';
+  const entry = {
+    id: `inbox-${Date.now().toString(36)}-${randomBytes(2).toString('hex')}`,
+    kind: read.kind, from: read.src, fromName,
+    item: read.item, at: read.at || new Date().toISOString(), sealed: !!read.sealed,
+    status: 'pending', via,
+  };
+  if (extra.sessionWords) entry.sessionWords = extra.sessionWords;
+  inbox.push(entry);
+  writePeersInbox(inbox);
+  peersLog(`${via}: received ${read.kind} postcard from ${fromName}${read.sealed ? ' (sealed)' : ''}`);
+  return entry;
+}
+
+// Bridge — a USB stick or drop folder, courier-delivered. The only carrier
+// whose reach is measured in kilometres and needs no antenna or camera. Files
+// ride as CPX1 envelope frames; a bare CAPX1 postcard pasted into the folder
+// is accepted too.
+const peerTransportBus = new TransportBus({ onIngest: ingestPostcardText });
+const BRIDGE_DIR = process.env.CAPSULE_BRIDGE_DIR || join(DATA_DIR, 'peers', 'bridge');
+const bridgeTransport = {
+  name: 'bridge', offline: true, uplink: true, downlink: true,
+  status() {
+    const out = { path: BRIDGE_DIR };
+    for (const [k, sub] of [['outgoing', 'outgoing'], ['incoming', 'incoming'], ['processed', 'processed']]) {
+      try { out[k] = readdirSync(join(BRIDGE_DIR, sub)).filter((f) => f.endsWith('.capsule') || f.endsWith('.done')).length; } catch { out[k] = 0; }
+    }
+    return out;
+  },
+  async start() {
+    for (const sub of ['', 'outgoing', 'incoming', 'processed']) mkdirSync(join(BRIDGE_DIR, sub), { recursive: true });
+    if (this._watcher) return;
+    this._debounces = new Map();
+    this._watcher = watch(join(BRIDGE_DIR, 'incoming'), (_evt, name) => {
+      if (typeof name !== 'string' || !name.endsWith('.capsule')) return;
+      clearTimeout(this._debounces.get(name));
+      this._debounces.set(name, setTimeout(() => this._consume(join(BRIDGE_DIR, 'incoming', name)), 350));
+    });
+    this._watcher.unref?.();
+  },
+  async _consume(file) {
+    // A copy-in triggers write + rename events; only the surviving file counts.
+    if (!existsSync(file)) return;
+    let body;
+    try {
+      const raw = readFileSync(file, 'utf8');
+      body = raw.startsWith('CPX1 ') ? unenvelopeFrame(raw) : raw;
+      renameSync(file, join(BRIDGE_DIR, 'processed', basename(file) + '.done'));
+    } catch (e) {
+      try { renameSync(file, join(BRIDGE_DIR, 'processed', basename(file) + '.bad')); } catch {}
+      peersLog(`bridge: rejected ${basename(file)} — ${e.message}`);
+      return;
+    }
+    try {
+      peerTransportBus.deliver(body, 'bridge');
+      peersLog(`bridge: ingested ${basename(file)}`);
+    } catch (e) {
+      peersLog(`bridge: ingest failed for ${basename(file)} — ${e.message}`);
+    }
+  },
+  async send({ items = [] } = {}) {
+    const out = join(BRIDGE_DIR, 'outgoing');
+    mkdirSync(out, { recursive: true });
+    let i = 0;
+    const written = [];
+    for (const it of items) {
+      const file = join(out, `${Date.now().toString(36)}-${i++}-${it.kind || 'note'}.capsule`);
+      writeFileSync(file, envelopeFrame(it.text) + '\n', 'utf8');
+      written.push(file);
+    }
+    return { ok: true, written, path: out };
+  },
+  async stop() { try { this._watcher?.close(); this._watcher = null; } catch {} },
+};
+peerTransportBus.register(bridgeTransport);
+// The USB watcher starts as soon as the module loads — a capsule that boots
+// into /health must already be watching its drop folder, or a courier leaving
+// a stick the minute the UI opens would watch events race the callback.
+peerTransportBus.start('bridge').catch((e) => log('bridge transport start failed:', e.message));
+
+// Light — camera-to-screen animated QR stream; Sound — speaker-to-microphone
+// FSK modem. Both move *frames*, reassembled on the receiving side by the /rx
+// endpoint, so neither exists without the other side's consent.
+const peerRxBuffers = new Map();
+function rxSidCountFor(via) {
+  let n = 0;
+  for (const b of peerRxBuffers.values()) if (b.via === via) n += 1;
+  return n;
+}
+const lightTransport = {
+  name: 'light', offline: true, uplink: true, downlink: true,
+  status() { return { mode: 'camera → screen', activeTransfers: rxSidCountFor('light') }; },
+};
+const soundTransport = {
+  name: 'sound', offline: true, uplink: true, downlink: true,
+  status() { return { mode: 'speaker → microphone', sampleRateHz: 48000, activeTransfers: rxSidCountFor('sound') }; },
+};
+peerTransportBus.register(lightTransport);
+peerTransportBus.register(soundTransport);
+
+// Radio — LoRa / Meshtastic dongle. Hardware-gated: without a CLI or a radio
+// device the carrier reports available:false and simply never starts. With one,
+// postcard fragments ride `TX|…` frames through the `meshtastic` CLI (a wired
+// connection, not a phone or a radio mast). Downlink reads a configured
+// receive command's stdout; without one, radio is send-only — still useful
+// for one-way alerts from a sleeping capsule.
+let radioDetected = null;
+function detectRadio() {
+  if (radioDetected) return radioDetected;
+  const custom = String(process.env.CAPSULE_RADIO_CMD || '').trim();
+  if (custom) { radioDetected = { mode: 'custom', cmd: custom, receive: String(process.env.CAPSULE_RADIO_RECEIVE_CMD || '').trim() || '' }; return radioDetected; }
+  const cli = findOnPath('meshtastic');
+  if (cli) { radioDetected = { mode: 'meshtastic-cli', cmd: cli, receive: '' }; return radioDetected; }
+  if (String(process.env.CAPSULE_RADIO_URL || '').trim()) { radioDetected = { mode: 'meshtasticd', cmd: '', receive: '' }; return radioDetected; }
+  radioDetected = { mode: 'none' };
+  return radioDetected;
+}
+async function radioSendFrame(detect, frame) {
+  if (detect.mode === 'custom') {
+    // %T is a shell splice: the CLI expects the payload as one argument, and a
+    // fragment carries `|` (pipe) and other metacharacters — quote it so the
+    // shell hands the whole frame over instead of cutting it into pipes.
+    const payload = `'` + String(frame).replace(/'/g, `'\\''`) + `'`;
+    const cmd = detect.cmd.replace(/%T/g, payload);
+    await new Promise((res) => { const p = spawn(cmd, { shell: true, stdio: 'ignore' }); p.on('close', res); p.on('error', () => res()); });
+    return true;
+  }
+  if (detect.mode === 'meshtastic-cli') {
+    await new Promise((res) => { const p = spawn(detect.cmd, ['--sendtext', frame], { stdio: 'ignore' }); p.on('close', res); p.on('error', () => res()); });
+    return true;
+  }
+  throw new Error('radio carrier is not available — no LoRa / Meshtastic hardware detected');
+}
+async function radioReceiveOnce(detect) {
+  if (!detect.receive) return null;
+  const out = await new Promise((res) => {
+    try {
+      const p = spawn(detect.receive, { shell: true, stdio: ['ignore', 'pipe', 'ignore'] });
+      let s = '';
+      const to = setTimeout(() => { try { p.kill(); } catch {} }, 4000);
+      p.stdout.on('data', (d) => { s += d; });
+      p.on('close', () => { clearTimeout(to); res(s); });
+      p.on('error', () => { clearTimeout(to); res(''); });
+    } catch { res(''); }
+  });
+  return out.trim() || null;
+}
+const radioTransport = {
+  name: 'radio', offline: true, uplink: true, downlink: true,
+  status() {
+    const d = detectRadio();
+    if (d.mode === 'none') return { available: false, hint: 'plug in a LoRa / Meshtastic dongle, or set CAPSULE_RADIO_CMD' };
+    return { available: true, mode: d.mode, hint: 'frames ride as text through the radio CLI' };
+  },
+  async send({ frames = [] } = {}) {
+    const d = detectRadio();
+    if (d.mode === 'none') throw new Error('radio hardware was not detected — nothing was sent');
+    for (const f of frames) await radioSendFrame(d, f);
+    return { ok: true, sent: frames.length, mode: d.mode };
+  },
+  async start() {
+    const d = detectRadio();
+    if (d.mode === 'none' || !d.receive) return;
+    if (this._receiveTimer) return;
+    const pollMs = Math.max(500, Number(process.env.CAPSULE_RADIO_POLL_MS) || 15000);
+    this._receiveTimer = setInterval(async () => {
+      try {
+        const line = await radioReceiveOnce(d);
+        if (!line) return;
+        // The dongle hands back one transmission: either a whole CAPX1
+        // envelope (single-burst postcard) or a `TX|…` fragment from a
+        // multi-frame one. Fragments flow through the same /rx reassembly
+        // pool the light and sound carriers use, then one consenting inbox
+        // row lands when the last frame arrives.
+        const frame = line.trim().match(/^TX\|(\d+)\|(\d+)\|([0-9a-f]+)\|(.*)$/);
+        if (frame) {
+          try {
+            transportRx({ via: 'radio', sid: 'radio', seq: Number(frame[1]), total: Number(frame[2]), crc: frame[3], data: frame[4] });
+          } catch {}
+        } else {
+          peerTransportBus.deliver(line.trim(), 'radio');
+        }
+      } catch {}
+    }, pollMs);
+    this._receiveTimer.unref?.();
+  },
+  async stop() { clearInterval(this._receiveTimer); this._receiveTimer = null; },
+};
+peerTransportBus.register(radioTransport);
+
+const lanTransport = {
+  name: 'lan', offline: false, uplink: true, downlink: true,
+  status() { return { listening: !!lanLink, port: LAN_PORT }; },
+  async send({ address, port, items }) { return lanPushItems(address, port, items); },
+};
+peerTransportBus.register(lanTransport);
+
+// Fragment an envelope into self-describing TX frames; the receiving side
+// reassembles through /api/peers/transport/rx (client state stays out).
+function transportFrames(text, max) {
+  const m = Math.max(64, Math.min(2000, Math.round(Number(max) || 900)));
+  return fragment(text, m).map((c) => `TX|${c.seq}|${c.total}|${c.crc}|${c.data}`);
+}
+function transportRx(body) {
+  const via = String(body.via || '');
+  if (!['light', 'sound', 'radio'].includes(via)) throw new Error('unknown carrier ' + via);
+  const sid = String(body.sid || 'default');
+  const seq = Number(body.seq);
+  const total = Number(body.total);
+  if (!Number.isInteger(seq) || !Number.isInteger(total) || total < 1 || total > 4096) throw new Error('bad rx frame index');
+  const data = String(body.data || '');
+  const crc = String(body.crc || '');
+  let buf = peerRxBuffers.get(sid);
+  if (!buf) {
+    buf = { via, total, slots: Array.from({ length: total }), last: Date.now() };
+    peerRxBuffers.set(sid, buf);
+  }
+  if (buf.total !== total) throw new Error('rx session total changed mid-transfer');
+  if (seq < total && !buf.slots[seq]) {
+    buf.slots[seq] = { seq, total, crc, data };
+    buf.last = Date.now();
+  }
+  if (buf.slots.every(Boolean)) {
+    try {
+      const text = defragment(buf.slots);
+      peerRxBuffers.delete(sid);
+      peerTransportBus.deliver(text, via);
+      return { ok: true, complete: true, textLen: text.length, via };
+    } catch (e) {
+      peerRxBuffers.delete(sid);
+      throw new Error('reassembly failed: ' + e.message);
+    }
+  }
+  return { ok: true, complete: false, got: buf.slots.filter(Boolean).length, total, via };
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [sid, b] of peerRxBuffers) if (now - b.last > 20 * 60 * 1000) peerRxBuffers.delete(sid);
+}, 60_000).unref?.();
+
+// Build share items ({kind,title,env}) from an API body — reused by LAN sync,
+// bridge export, and the light/sound transmit path, so every medium earns a
+// peer log line and the same inbox consent.
+function shareItemsFromBody(body = {}, { limit = 12 } = {}) {
+  const items = [];
+  const procs = readProcedures();
+  for (const it of Array.isArray(body.items) ? body.items.slice(0, limit) : []) {
+    if (it.kind === 'procedure') {
+      const proc = procs.find((p) => p.id === String(it.id || ''));
+      if (!proc) continue;
+      items.push({ kind: 'procedure', title: proc.name, env: packPostcard(peersIdentity(), { kind: 'procedure', mode: 'open', item: { name: proc.name, summary: proc.summary, steps: proc.steps } }) });
+    } else if (it.kind === 'note') {
+      items.push({ kind: 'note', title: String(it.title || 'note').slice(0, 120), env: packPostcard(peersIdentity(), { kind: 'note', mode: 'open', item: { title: String(it.title || '').slice(0, 120), text: String(it.text || '').slice(0, 4000) } }) });
+    }
+  }
+  return items;
+}
+
+
 // ── Consolidation cycle ("sleep on it") ────────────────────────────────────
 // Manual trigger; every memory fact and procedure it produces waits in an
 // approval queue — nothing lands until the user says so.
@@ -3427,6 +3704,16 @@ async function handle(req, res) {
     res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store', ...securityHeaders() });
     return res.end(CAPSULE_UI);
   }
+  if (req.method === 'GET' && p === '/jsqr.js') {
+    if (JSQR_RAW === null) return sendJSON(res, 500, { error: 'jsqr.js not found' });
+    res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store', ...securityHeaders() });
+    return res.end(JSQR_RAW);
+  }
+  if (req.method === 'GET' && p === '/sound-modem.js') {
+    if (SOUND_MODEM_RAW === null) return sendJSON(res, 500, { error: 'sound-modem.js not found' });
+    res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store', ...securityHeaders() });
+    return res.end(SOUND_MODEM_RAW);
+  }
 
   const provided = authorize(req, url);
   const remoteExpired = remoteTunnel.expiresAt && Date.now() > remoteTunnel.expiresAt;
@@ -3750,22 +4037,81 @@ async function handle(req, res) {
     try {
       const address = String(body.address || '').trim();
       if (!/^[\w.:\-]+$/.test(address)) return sendJSON(res, 400, { error: 'bad address' });
-      const items = [];
-      const procs = readProcedures();
-      for (const it of Array.isArray(body.items) ? body.items.slice(0, 12) : []) {
-        if (it.kind === 'procedure') {
-          const proc = procs.find((p) => p.id === String(it.id || ''));
-          if (!proc) continue;
-          items.push({ kind: 'procedure', title: proc.name, env: packPostcard(peersIdentity(), { kind: 'procedure', mode: 'open', item: { name: proc.name, summary: proc.summary, steps: proc.steps } }) });
-        } else if (it.kind === 'note') {
-          items.push({ kind: 'note', title: String(it.title || 'note').slice(0, 120), env: packPostcard(peersIdentity(), { kind: 'note', mode: 'open', item: { title: String(it.title || '').slice(0, 120), text: String(it.text || '').slice(0, 4000) } }) });
-        }
-      }
+      const items = shareItemsFromBody(body);
       if (!items.length) return sendJSON(res, 400, { error: 'nothing selected to share — tick at least one item' });
       const result = await lanPushItems(address, Number(body.port) || 0, items);
       if (!result.ok) return sendJSON(res, 409, { error: 'The peer did not accept the delivery (pair cards first, then try again).', code: 'ACK_REFUSED' });
       return sendJSON(res, 200, { ok: true, words: result.words, pushed: items.length, peer: result.peer || '' });
     } catch (e) { return sendJSON(res, 400, { error: 'Could not sync: ' + e.message }); }
+  }
+
+  // ── Peer transports: postcards over bridge / light / sound / radio ────────
+  if (req.method === 'GET' && p === '/api/peers/transport') {
+    return sendJSON(res, 200, { transports: peerTransportBus.status() });
+  }
+  if (req.method === 'POST' && p === '/api/peers/transport/frames') {
+    let body; try { body = JSON.parse(await readBody(req, 100_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    try {
+      let text;
+      if (typeof body.text === 'string') {
+        text = body.text;
+      } else {
+        const items = shareItemsFromBody(body);
+        if (!items.length) return sendJSON(res, 400, { error: 'nothing selected to transmit' });
+        text = envToText(items[0].env);
+      }
+      const frames = transportFrames(text, Number(body.maxBytes) || 900);
+      return sendJSON(res, 200, { frames, count: frames.length });
+    } catch (e) { return sendJSON(res, 400, { error: 'Could not build frames: ' + e.message }); }
+  }
+  if (req.method === 'GET' && p === '/api/peers/transport/qr') {
+    // One server-rendered SVG per frame, so the light transmit page can show
+    // the stream as <img> — the same shape /api/remote/qr already uses.
+    const text = String(url.searchParams.get('text') || '').slice(0, 2300);
+    if (!text) return sendJSON(res, 400, { error: 'empty frame text' });
+    const qr = qrcode(0, 'M');
+    qr.addData(text);
+    qr.make();
+    const svg = qr.createSvgTag({ cellSize: Number(url.searchParams.get('cellSize')) || 5, margin: 4, scalable: true });
+    res.writeHead(200, { 'Content-Type': 'image/svg+xml; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...securityHeaders() });
+    return res.end(svg);
+  }
+  if (req.method === 'POST' && p === '/api/peers/transport/rx') {
+    let body; try { body = JSON.parse(await readBody(req, 100_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    try { return sendJSON(res, 200, transportRx(body)); }
+    catch (e) { return sendJSON(res, 400, { error: e.message }); }
+  }
+  if (req.method === 'POST' && p === '/api/peers/transport/radio') {
+    let body; try { body = JSON.parse(await readBody(req, 50_000)); } catch { body = {}; }
+    try {
+      const d = detectRadio();
+      if (d.mode === 'none') return sendJSON(res, 409, { error: 'radio hardware was not detected — nothing was sent' });
+      let text;
+      if (typeof body.text === 'string' && String(body.text).trim()) {
+        text = String(body.text);
+      } else {
+        const items = shareItemsFromBody(body);
+        if (!items.length) return sendJSON(res, 400, { error: 'nothing selected to transmit' });
+        text = envToText(items[0].env);
+      }
+      const frames = transportFrames(text, Math.min(900, Number(body.maxBytes) || 700));
+      const result = await radioTransport.send({ frames });
+      peersLog(`radio: transmitted ${frames.length} frame(s) on ${d.mode}`);
+      return sendJSON(res, 200, result);
+    } catch (e) { return sendJSON(res, 400, { error: 'Could not send over radio: ' + e.message }); }
+  }
+  if (req.method === 'GET' && p === '/api/peers/bridge') {
+    return sendJSON(res, 200, bridgeTransport.status());
+  }
+  if (req.method === 'POST' && p === '/api/peers/bridge/export') {
+    let body; try { body = JSON.parse(await readBody(req, 100_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    try {
+      const items = shareItemsFromBody(body).map((it) => ({ kind: it.kind, title: it.title, text: envToText(it.env) }));
+      if (!items.length) return sendJSON(res, 400, { error: 'nothing selected to export' });
+      const out = await bridgeTransport.send({ items });
+      peersLog(`bridge: exported ${items.length} item(s) to the drop folder`);
+      return sendJSON(res, 200, out);
+    } catch (e) { return sendJSON(res, 400, { error: 'Could not export: ' + e.message }); }
   }
 
   // ── Offline speech: whisper.cpp (STT) and piper (TTS), local-only ─────────
@@ -6305,4 +6651,5 @@ server.listen(cfg.port, cfg.host, async () => {
   }
   console.log('  Press Ctrl+C to stop\n');
   startTelemetrySampler();
+  peerTransportBus.start('radio').catch((e) => log('radio transport start failed:', e.message));
 });

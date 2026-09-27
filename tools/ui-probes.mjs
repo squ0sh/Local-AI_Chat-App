@@ -206,6 +206,49 @@ ok('accepting drains the inbox', /Inbox is empty/.test(await ev("document.queryS
 await ev("document.querySelector('#peers-close')?.click()");
 await ev("delete window.__capxFrames");
 
+// ── Peers transports panel: carriers, transmit doors, vendored decoders ─────
+await ev("document.getElementById('peers-launch').click()");
+await sleep(1400);
+ok('transports panel renders a row per carrier', (await ev("document.querySelectorAll('#peers-transports .tx-row').length")) >= 4, (await ev("document.querySelector('#peers-transports')?.textContent || ''")).slice(0, 120));
+ok('vendored decoders are served for the carriers', !!await ev("fetch('/jsqr.js').then(r=>r.ok).catch(()=>!!0)") && !!await ev("fetch('/sound-modem.js').then(r=>r.ok).catch(()=>!!0)"), 'jsqr.js / sound-modem.js must both 200');
+
+// Light transmit opens a QR stream of the postcard above
+await ev("document.querySelector('#peers-transports [data-tx=light]').click()");
+await sleep(1100);
+ok('light transmit opens a QR frame view', (await ev("[...document.querySelectorAll('dialog')].some(x=>x.open&&/Light — transmit/.test(x.querySelector('#tx-title')?.textContent||''))")) && !!(await ev("document.querySelector('dialog[open] #tx-body img')")), await ev("document.querySelector('dialog[open] #tx-title')?.textContent||'no tx dialog'"));
+await ev("document.querySelector('dialog[open] #tx-close')?.click()");
+await sleep(300);
+
+// Light receive surfaces the camera path (or an honest fallback headless)
+await ev("document.querySelector('#peers-transports [data-rx=light]').click()");
+await sleep(900);
+ok('light receive offers a camera or a paste fallback', await ev("!!document.querySelector('dialog[open] #tx-video') || /Camera unavailable|permission/i.test((document.querySelector('dialog[open] #tx-status')?.textContent)||'')"), await ev("(document.querySelector('dialog[open] #tx-status')?.textContent)||'no dialog'"));
+await ev("document.querySelector('dialog[open] #tx-close')?.click()");
+await sleep(300);
+
+// Sound transmit drives the vendored modem
+await ev("document.querySelector('#peers-transports [data-tx=sound]').click()");
+await sleep(1800);
+ok('sound transmit homes the tone bursts', await ev("(/Playing|tone burst|not loaded/.test((document.querySelector('dialog[open] #tx-status')?.textContent)||''))"), await ev("(document.querySelector('dialog[open] #tx-status')?.textContent)||'no dialog'"));
+await ev("document.querySelector('dialog[open] #tx-close')?.click()");
+await sleep(300);
+
+// Radio transmit explains itself without hardware
+await ev("document.querySelector('#peers-transports [data-tx=radio]').click()");
+await sleep(900);
+ok('radio transmit reports no hardware honestly', /not detected|hardware|LoRa|Meshtastic|CAPSULE_RADIO_CMD/i.test(await ev("(document.querySelector('dialog[open] #tx-status')?.textContent)||''")), await ev("(document.querySelector('dialog[open] #tx-status')?.textContent)||'no dialog'"));
+await ev("document.querySelector('dialog[open] #tx-close')?.click()");
+await sleep(300);
+
+// Bridge ships the postcard to the drop folder
+await ev("document.querySelector('#peers-transports [data-tx=bridge]').click()");
+await sleep(1100);
+ok('bridge writes a capsule file to the drop folder', await ev("(/Wrote 1 postcard|Wrote [1-9]/.test((document.querySelector('dialog[open] #tx-status')?.textContent)||''))"), await ev("(document.querySelector('dialog[open] #tx-status')?.textContent)||'no dialog'"));
+await ev("document.querySelector('dialog[open] #tx-close')?.click()");
+await sleep(300);
+await ev("document.querySelector('#peers-close')?.click()");
+await sleep(400);
+
 // ── Setup checklist on the welcome screen ────────────────────────────────────
 await sleep(1200);
 ok('setup checklist appears on empty chat', await ev("!!document.querySelector('.welcome .setup-card')"));

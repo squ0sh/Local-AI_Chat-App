@@ -328,8 +328,23 @@ dismiss each; nothing writes until you click.
 The **Peers** entry opens capsule-to-capsule handshakes: pair two capsules by
 exchanging signed cards (QR-able, typeable 6-word safety phrase, or pasted
 frames), then trade memory facts and procedures as **postcards** over any
-medium — a live encrypted LAN sync, a USB stick, a pasted Meshtastic message,
-or a sign-only frame for ham radio (it refuses to encrypt there on purpose).
+medium. A **Transports** panel in the dialog shows every carrier at a glance,
+and each one lands in the same consent inbox:
+
+- **Bridge** — a USB stick or a drop folder. The watcher runs from boot; your
+  postcard writes into `outgoing/` and the far capsule picks it out of its
+  `incoming/` (set a shared path with `CAPSULE_BRIDGE_DIR`).
+- **Light** — screen-to-camera QR. One code per frame, auto-advanced for the
+  receiver; the other capsule reads them with its camera (jsQR decodes in-page)
+  with zero radio hardware.
+- **Sound** — speaker-to-microphone data-over-audio. Pure-DSP FSK tones near
+  16–19 kHz; each burst is a frame and the mic decodes it live.
+- **Radio** — any `meshtastic`-style CLI: set `CAPSULE_RADIO_CMD`, a receive
+  command, and a poll interval (`CAPSULE_RADIO_RECEIVE_CMD`,
+  `CAPSULE_RADIO_POLL_MS`, default 15 s). Frames ride as text — or, on ham
+  radio, as a deliberately sign-only (`QM1`) frame that refuses to encrypt.
+- **LAN** — the live encrypted sync already described below.
+
 Received items always wait in an approval inbox; nothing lands silently.
 
 **Brain escrow** (in the same sidebar) fixes the "my machine died and took my
