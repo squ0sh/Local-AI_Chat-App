@@ -2081,8 +2081,15 @@ const cfg = parseArgs(process.argv.slice(2));
 // Generous ceilings: enough for interactive use and modest API clients, tight
 // enough to stop an abusive caller from pinning the machine or Ollama. Note the
 // refill `rate` is sustained tokens per second — leaving it at the default
-// (capacity) would make the buckets refill instantly and limit nothing.
-const sharedRateLimiter = new RateLimiter({ globalCapacity: 600, perIpCapacity: 150, rate: 20, windowMs: 60_000 });
+// (capacity) would make the buckets refill instantly and limit nothing. The
+// burst/refill values are overridable for operators who want tighter limits on
+// a LAN or tunnel deployment (and for the brute-force integration test).
+const sharedRateLimiter = new RateLimiter({
+  globalCapacity: 600,
+  perIpCapacity: Number(process.env.CAPSULE_RATE_PER_IP || 150),
+  rate: Number(process.env.CAPSULE_RATE_REFILL || 20),
+  windowMs: 60_000,
+});
 const researchEngine = new ResearchEngine({
   dataDir: RESEARCH_DIR,
   complete: researchModelCompletion,

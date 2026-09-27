@@ -494,6 +494,8 @@ Integrity and hardening:
 | `CAPSULE_ALLOW_UNSIGNED`     | *(unset)* | Accept an unsigned integrity manifest (dev machines without the signing key; the portable launchers set this automatically) |
 | `CAPSULE_ALLOW_INSECURE_BIND`| *(unset)* | Allow binding a tokenless server on a non-loopback host (dangerous; normally refused) |
 | `CAPSULE_MAX_CONTEXT`        | *(auto)*  | Override the auto RAM-based `num_ctx` cap (min 1024) |
+| `CAPSULE_RATE_PER_IP`        | `150`     | Per-client burst capacity of the shared API rate limiter |
+| `CAPSULE_RATE_REFILL`        | `20`      | Sustained tokens/second the rate buckets refill at (600-request global burst) |
 | `LOCAL_AI_EMBED_STUB`        | *(unset)* | Internal/test: memory embedder stub |
 
 ## Tunnel mode

@@ -15,7 +15,8 @@
   `['content-type', …]` with array destructuring, so the upstream `Content-Type`
   was never forwarded to `/v1/*` clients; and the shared rate limiter was built
   with the 150-token per-IP *capacity* also acting as the per-second *refill*,
-  so bursts could never be denied — the buckets now refill at a sustained 20/s.
+  so bursts could never be denied — burst/refill are now a sustained 150/20 by
+  default and operator-tunable via `CAPSULE_RATE_PER_IP` / `CAPSULE_RATE_REFILL`.
 - Shared server-boot harness extracted to `test/helpers/server-harness.mjs`
   (ephemeral port, tmp `DATA_DIR`, isolated `HOME`, users/seed-file fixtures);
   the cloud-router suite moved onto it unchanged; `test/helpers/fake-ollama.mjs`

@@ -104,31 +104,24 @@ test('per-user chat history is sealed per account on disk', async (t) => {
   assert.doesNotMatch(onDisk, /top secret/);
 });
 
-// Pins the real brute-force path: every request spends one per-IP token before
-// any handler runs, and each scrypt login (~90 ms) paces well inside the bucket
-// refill — so drain the bucket first with cheap instant 401s, then prove that
-// the login endpoint itself is throttled (the security property that matters).
-// Drain one probe at a time until the first 429 so the timing never depends on
-// suite-wide CPU contention; a refill token only appears ~50 ms after that.
+// Pins the real brute-force path. The shared limiter is seeded with a small
+// per-IP bucket (CAPSULE_RATE_PER_IP=5, refill 1/s), so a burst of bad logins
+// genuinely drains it — every attempt still runs the full scrypt verify, and
+// beyond the 5-token burst the bucket needs ~1 s to recover each token, which
+// no login pace can outrun.
 test('login endpoint rate-limits brute force with Retry-After', async (t) => {
-  const { base } = await bootServer(t, { users: ['carol'] });
+  const { base } = await bootServer(t, {
+    users: ['carol'],
+    extraEnv: { CAPSULE_RATE_PER_IP: '5', CAPSULE_RATE_REFILL: '1' },
+  });
   const attempt = () => fetch(base + '/api/auth/login', { method: 'POST', headers: json, body: JSON.stringify({ username: 'carol', password: 'always wrong 123' }) });
-  const probe = () => fetch(base + '/api/agent/mcp/list');
-
-  const first = await attempt();
-  assert.equal(first.status, 401, 'login should fail as unauthorized while tokens remain');
-
-  let sawThrottled = 0;
-  for (let i = 0; i < 600; i += 1) {
-    sawThrottled = (await probe()).status;
-    if (sawThrottled === 429) break;
-  }
-  assert.equal(sawThrottled, 429, 'per-IP bucket must exhaust under sustained load');
-
-  const last = await attempt();
-  assert.equal(last.status, 429);
-  assert.ok(Number(last.headers.get('retry-after')) >= 1);
-  assert.match((await last.json()).error, /Too many requests/);
+  const responses = await Promise.all(Array.from({ length: 15 }, attempt));
+  const statuses = responses.map((r) => r.status);
+  assert.ok(statuses.slice(0, 5).includes(401), 'requests inside the burst capacity fail as unauthorized');
+  const throttled = responses.filter((r) => r.status === 429);
+  assert.ok(throttled.length >= 5, 'requests beyond the burst capacity are throttled');
+  assert.ok(Number(throttled[0].headers.get('retry-after')) >= 1);
+  assert.match((await throttled[0].json()).error, /Too many requests/);
 });
 
 test('Capsule Remote is refused when user accounts are enabled', async (t) => {
