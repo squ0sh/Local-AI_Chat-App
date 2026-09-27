@@ -37,6 +37,7 @@ import { RateLimiter, rateLimitResponse } from './lib/rate-limit.mjs';
 import { ChatStore } from './lib/chat-store.mjs';
 import { McpClient, looksSensitiveEnvKey } from './lib/mcp-client.mjs';
 import { UserStore } from './lib/user-store.mjs';
+import { Telemetry, readLinuxSensors, narrate as narrateTelemetry, SAMPLE_ACTIVE_MS, SAMPLE_IDLE_MS } from './lib/telemetry.mjs';
 import { runAgentLoop, globSearch, agentWriteFile, undoChange, listLedger, recordChange, buildOrganizePlan, applyOrganizePlan, webSearch, buildMcpToolset, sanitizeMcpToolName } from './lib/agent-loop.mjs';
 import { shouldFreeMemory, otherModelNames } from './lib/memory.mjs';
 import { runMicroBenchmark, loadFitState, saveFitState, recordObservation, recommendFit, FIT_LEVELS } from './lib/fit-engine.mjs';
@@ -786,6 +787,7 @@ function beginOllamaGeneration(model) {
   const activeTotal = [...activeOllamaGenerations.values()].reduce((sum, count) => sum + count, 0);
   if (activeTotal >= MAX_CONCURRENT_GENERATIONS) return null;
   activeOllamaGenerations.set(key, Number(activeOllamaGenerations.get(key) || 0) + 1);
+  telemetry.markJobStart('chat: ' + key, 'chat');
   let released = false;
   return () => {
     if (released) return;
@@ -793,6 +795,7 @@ function beginOllamaGeneration(model) {
     const remaining = Number(activeOllamaGenerations.get(key) || 0) - 1;
     if (remaining > 0) activeOllamaGenerations.set(key, remaining);
     else activeOllamaGenerations.delete(key);
+    if (!activeOllamaGenerations.get(key)) telemetry.markJobStop('chat: ' + key);
   };
 }
 
@@ -2105,6 +2108,17 @@ const researchEngine = new ResearchEngine({
   },
 });
 const chatStore = new ChatStore(CHATS_DIR);
+const telemetry = new Telemetry({ dataDir: DATA_DIR });
+function startTelemetrySampler() {
+  if (telemetry.timer) return;
+  const tick = () => {
+    try { telemetry.sample(readLinuxSensors()); telemetry.maybeJournal(); } catch (e) { log('Telemetry sample failed:', e.message); }
+    telemetry.timer = setTimeout(tick, telemetry.jobs.size ? SAMPLE_ACTIVE_MS : SAMPLE_IDLE_MS);
+    telemetry.timer.unref?.();
+  };
+  telemetry.timer = setTimeout(tick, 100);
+  telemetry.timer.unref?.();
+}
 
 // ── Capsule Memory store + recall plumbing ─────────────────────────────────
 // The index is encrypted at rest and never leaves this machine; injection into
@@ -2940,6 +2954,8 @@ function startImageJob(params) {
   };
   const job = { ...meta, cli: s.sd_cli, model: s.model_path, dir, child: null, exitCode: null };
   imageJob = job;
+  job.telemetryLabel = 'image: ' + (prompt.slice(0, 40) || 'generate');
+  telemetry.markJobStart(job.telemetryLabel, 'image');
   runImageJob(job);
   return job;
 }
@@ -3011,6 +3027,7 @@ async function runImageJob(job) {
   if (job.aborted && job.status !== 'error') { job.status = 'aborted'; job.error = 'Stopped by the user.'; }
   job.finished = Date.now();
   job.durationMs = job.finished - job.created;
+  if (job.telemetryLabel) telemetry.markJobStop(job.telemetryLabel);
   if (allOk && !job.aborted) {
     const files = readdirSync(job.dir).filter((f) => f.endsWith('.png')).sort();
     if (!files.length) { job.status = 'error'; job.error = 'sd-cli exited 0 but produced no PNG'; }
@@ -5422,6 +5439,24 @@ async function handle(req, res) {
     return proxyV1(req.method, p, body, res);
   }
 
+  // ── Machine telemetry — local readings + AI job energy ──────────────────
+  if (p.startsWith('/api/telemetry') && !localControlAllowed(req)) {
+    return sendJSON(res, 403, { error: 'Machine telemetry is available only in the local app' });
+  }
+  if (req.method === 'GET' && p === '/api/telemetry/status') {
+    const status = telemetry.status();
+    return sendJSON(res, 200, {
+      ...status,
+      narrate: narrateTelemetry(status.now),
+      diagnose: telemetry.diagnose(),
+      runtimeSeconds: telemetry.runtimeSeconds(),
+    });
+  }
+  if (req.method === 'GET' && p === '/api/telemetry/history') {
+    const hours = Math.min(24, Math.max(0.25, Number(url.searchParams.get('hours')) || 6));
+    return sendJSON(res, 200, { hours, samples: telemetry.history(hours) });
+  }
+
   sendJSON(res, 404, { error: 'Not found' });
 }
 
@@ -6269,4 +6304,5 @@ server.listen(cfg.port, cfg.host, async () => {
     try { await autoRegisterLocalModels(); } catch (e) { log('Local model auto-register error:', e); }
   }
   console.log('  Press Ctrl+C to stop\n');
+  startTelemetrySampler();
 });

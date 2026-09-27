@@ -309,6 +309,15 @@ and private-network destinations, caps page sizes and timeouts, and converts
 only collected source IDs into clickable citations. Research controls and
 saved reports are unavailable through Capsule Remote.
 
+The **Machine** entry in the Capsule sidebar is *body telemetry*: live CPU,
+memory, temperature, fan, and (where the box reports it) battery, plus an
+honest estimated-watts readout tied to AI work the capsule just ran (the
+sampler adapts to 1 Hz while a job cooks, 60 s otherwise). "Why is that?" asks
+the local model to explain the last minute in plain language, with the burn
+attributed to the exact job that did it (chat, image, research). Everything
+stays on disk — this is **your own machine's telemetry**, the mirror image of
+vendor monitoring: nothing is reported anywhere.
+
 ### Capsule Memory
 
 The **Sleep cycle** entry runs an overnight-style consolidation: the capsule

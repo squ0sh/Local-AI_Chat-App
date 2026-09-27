@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.14.0 — Machine body telemetry: the capsule can feel itself
+
+- **New sidebar Machine card.** Live CPU %, RAM, temperature, fan, battery,
+  estimated watts, and active AI jobs on a sparkline; "Why is that?" asks the
+  local model to narrate the last minute (with the burn attributed to the exact
+  job) instead of scanning a ghost dashboard. Everything is read from
+  `/proc`/`hwmon` and journaled under `data/telemetry/` — your machine's
+  telemetry is yours again.
+- **Adaptive sampling.** ~1 Hz while a job cooks, once a minute when idle; the
+  in-memory ring caps at 48 hours and the journal writes one line per sampled
+  minute, so a long conversation costs exactly what it costs.
+- **No egress by posture.** `/api/telemetry/*` answers only to the local app
+  (loopback + same-origin) and never calls out — no exception URL, no remote
+  view. The information-locked guarantee is test-pinned.
+- 9 unit tests for the parsers, watts model, ring capping, and job sharing;
+  1 HTTP route test; 3 browser probes. Suite: 188 / 72 green.
+
 ## 1.13.0 — Brain escrow: social recovery, no cloud
 
 - **Your Capsule's brain can survive the house fire.** Memory index + procedures

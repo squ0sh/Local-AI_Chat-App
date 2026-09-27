@@ -467,6 +467,29 @@ test('escrow: create → status → sealed postcards, and a fresh capsule recove
   assert.equal(tooFew.status, 400);
 });
 
+// ── Machine telemetry, over HTTP ─────────────────────────────────────────────
+test('telemetry routes: status tells the machine story, history is bounded, remote is refused', async (t) => {
+  const { base, call } = await bootServer(t);
+  const status = await call('/api/telemetry/status');
+  assert.equal(status.status, 200);
+  assert.ok('running' in status.body);
+  assert.ok('narrate' in status.body);
+  assert.ok('diagnose' in status.body);
+  assert.ok(Array.isArray(status.body.today.totals ? Object.keys(status.body.today.totals) : []));
+  assert.ok(typeof status.body.ringMinutes === 'number');
+
+  const hist = await call('/api/telemetry/history?hours=1');
+  assert.equal(hist.status, 200);
+  assert.ok(Array.isArray(hist.body.samples));
+  const silly = await call('/api/telemetry/history?hours=999999');
+  assert.equal(silly.status, 200, 'huge hours is clamped, never a memory bomb');
+  assert.ok(silly.body.hours <= 24);
+
+  const evil = await fetch(base + '/api/telemetry/status', { headers: { Origin: 'http://evil.example' } });
+  assert.equal(evil.status, 403);
+});
+
+// ── Escrow continues: inbound postcard path ──────────────────────────────────
 test('escrow: an inbound shard postcard becomes a consent item; accepting stores it locally', async (t) => {
   const { call, dataDir } = await bootServer(t, { seedFiles: {} });
   const peers = await call('/api/peers');

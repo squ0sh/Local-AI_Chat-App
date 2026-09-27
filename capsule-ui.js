@@ -846,7 +846,7 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
 
 
 
-(()=>{const sidebar=document.querySelector('aside');if(!sidebar)return;const style=document.createElement('style');style.textContent='#capsule-nav{border-top:1px solid var(--line);padding:10px 8px}#capsule-nav h3{margin:0 10px 6px;color:var(--muted);font-size:10px;letter-spacing:.09em}#capsule-nav button{position:static!important;display:block!important;width:100%!important;height:auto!important;min-height:32px!important;margin:2px 0!important;padding:7px 10px!important;text-align:left!important;border:0!important;border-radius:7px!important;background:transparent!important;color:var(--muted)!important;font-size:12px!important;box-shadow:none!important}#capsule-nav button:hover{background:var(--panel3)!important;color:var(--text)!important}#capsule-nav button.on{color:var(--blue2)!important}';document.head.append(style);const nav=document.createElement('section');nav.id='capsule-nav';nav.innerHTML='<h3>CAPSULE</h3>';const labels={"portable-launch":"Portable readiness","vault-launch":"Vault","memory-launch":"Memory","sleep-launch":"Sleep cycle","peers-launch":"Peers","escrow-launch":"Escrow","cloud-launch":"Cloud connection","agent-launch":"Agent mode","remote-launch":"Capsule Remote"};Object.entries(labels).forEach(([id,label])=>{const el=document.getElementById(id);if(el){el.textContent=label;el.title=label;nav.append(el)}});sidebar.insertBefore(nav,sidebar.querySelector('.sidebar-bottom'))})();
+(()=>{const sidebar=document.querySelector('aside');if(!sidebar)return;const style=document.createElement('style');style.textContent='#capsule-nav{border-top:1px solid var(--line);padding:10px 8px}#capsule-nav h3{margin:0 10px 6px;color:var(--muted);font-size:10px;letter-spacing:.09em}#capsule-nav button{position:static!important;display:block!important;width:100%!important;height:auto!important;min-height:32px!important;margin:2px 0!important;padding:7px 10px!important;text-align:left!important;border:0!important;border-radius:7px!important;background:transparent!important;color:var(--muted)!important;font-size:12px!important;box-shadow:none!important}#capsule-nav button:hover{background:var(--panel3)!important;color:var(--text)!important}#capsule-nav button.on{color:var(--blue2)!important}';document.head.append(style);const nav=document.createElement('section');nav.id='capsule-nav';nav.innerHTML='<h3>CAPSULE</h3>';const labels={"portable-launch":"Portable readiness","vault-launch":"Vault","memory-launch":"Memory","machine-launch":"Machine","sleep-launch":"Sleep cycle","peers-launch":"Peers","escrow-launch":"Escrow","cloud-launch":"Cloud connection","agent-launch":"Agent mode","remote-launch":"Capsule Remote"};Object.entries(labels).forEach(([id,label])=>{const el=document.getElementById(id);if(el){el.textContent=label;el.title=label;nav.append(el)}});sidebar.insertBefore(nav,sidebar.querySelector('.sidebar-bottom'))})();
 
 
 
@@ -2007,4 +2007,76 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
   const smallBadge = () => { b.classList.add('on'); };
   fetch('/api/escrow/status').then((r) => r.json()).then((s) => { if ((s.inbound || []).length) smallBadge(); }).catch(() => {});
   $('#escrow-close').onclick = () => d.close();
+})();
+
+// ── Machine body telemetry: what the capsule feels ───────────────────────────
+// Everything is local — the capsule asks the box how it is doing, attributes
+// joules to the AI job that burned them, and (optionally) *asks the model*
+// to explain the last hour in plain words.
+(() => {
+  const b = document.createElement('button'); b.id = 'machine-launch'; b.textContent = 'Machine'; b.title = 'Machine health — live body of the capsule'; document.body.append(b);
+  const d = document.createElement('dialog'); d.id = 'machine-dialog';
+  d.innerHTML = '<div class="settings"><h2>Machine <span class="agent-badge">local</span></h2>'
+    + '<p>This is how your capsule feels right now. Everything here was measured on this box and never leaves it.</p>'
+    + '<div class="sleep-hero"><div class="sleep-moon">🫀</div><div><div id="machine-narrate"><b>gathering readings…</b></div><div class="sleep-verbs" id="machine-diagnose"></div></div></div>'
+    + '<div class="sleep-verbs" id="machine-jobs"></div>'
+    + '<canvas id="machine-spark" width="360" height="56" style="width:100%;background:var(--panel2);border-radius:8px"></canvas>'
+    + '<div class="sleep-verbs" id="machine-history-note"></div>'
+    + '<div class="peer-row"><button class="plain-btn" id="machine-refresh">Refresh</button><button class="plain-btn" id="machine-ask">Why is that? (ask the model)</button></div>'
+    + '<div id="machine-answer" class="sleep-brief" hidden></div>'
+    + '<div class="notice" id="machine-note"></div>'
+    + '<div class="dialog-actions"><button class="plain-btn" id="machine-close">Done</button></div></div>';
+  document.body.append(d);
+  const $ = (id) => d.querySelector(id);
+  let refreshTimer = 0;
+
+  function drawSpark(samples) {
+    const c = $('#machine-spark'); if (!c) return;
+    const ctx = c.getContext('2d'); if (!ctx) return;
+    ctx.clearRect(0, 0, c.width, c.height);
+    if (!samples.length) { $('#machine-history-note').textContent = 'a minute or two and a few readings…'; return; }
+    $('#machine-history-note').textContent = `${samples.length} sample(s) over this boot — solid line CPU %, dashed line temp °C.`;
+    const xs = samples.map((s) => s.cpuPct ?? 0);
+    const ts = samples.map((s) => s.tempC ?? 0);
+    const maxY = Math.max(100, ...ts, 1);
+    const segmentX = c.width / Math.max(1, xs.length - 1);
+    ctx.lineWidth = 2; ctx.strokeStyle = '#6ea0ff';
+    ctx.beginPath(); xs.forEach((v, i) => { const x = i * segmentX; const y = c.height - (v / 100) * (c.height - 6) - 3; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }); ctx.stroke();
+    ctx.setLineDash([3, 2]); ctx.strokeStyle = '#ff9090';
+    ctx.beginPath(); ts.forEach((v, i) => { const x = i * segmentX; const y = c.height - (v / maxY) * (c.height - 6) - 3; i ? ctx.lineTo(x, y) : ctx.moveTo(x, y); }); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  async function paint() {
+    const res = await fetch('/api/telemetry/status');
+    const j = await res.json();
+    if (!res.ok) { $('#machine-diagnose').textContent = j.error || 'unreachable'; return; }
+    $('#machine-narrate').textContent = j.narrate || '…';
+    $('#machine-diagnose').textContent = j.diagnose?.note || '';
+    const jobs = (j.now && j.now.jobs) || [];
+    $('#machine-jobs').textContent = jobs.length
+      ? `burning right now: ${jobs.map((x) => `${x.label} (${x.seconds}s)`).join(', ')} — today ≈ ${j.today.kwh} kWh of AI work`
+      : `AI work today ≈ ${j.today.kwh} kWh — quiet right now.`;
+    const h = await fetch('/api/telemetry/history?hours=2').then((r) => r.json()).catch(() => ({ samples: [] }));
+    drawSpark(h.samples || []);
+  }
+
+  $('#machine-ask').onclick = async () => {
+    const j = await fetch('/api/telemetry/status').then((r) => r.json());
+    const prompt = 'You are the machine speaking plainly. Given these measurements just taken from the computer, explain in one short paragraph why it might feel hot or slow, who is responsible, the recommendation in one sentence. Data: ' + JSON.stringify(j.now) + ' — recent causes: ' + (j.diagnose?.causes || []).join('; ');
+    $('#machine-answer').hidden = false;
+    $('#machine-answer').textContent = 'thinking…';
+    try {
+      const r = await fetch('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mode: 'local', messages: [{ role: 'user', content: prompt }] }) });
+      const t2 = await r.text();
+      const done = (t2.match(/"type":"done","fullText":"([^"]+)"/) || [])[1] || t2.slice(-400);
+      $('#machine-answer').textContent = done;
+    } catch (e) { $('#machine-answer').textContent = 'Ask failed: ' + e.message; }
+  };
+  $('#machine-refresh').onclick = () => paint();
+  paint();
+  refreshTimer = setInterval(() => { if (!d.open) return; paint(); }, 4000);
+  b.onclick = () => { d.showModal(); $('#machine-answer').hidden = true; $('#machine-answer').textContent = ''; paint(); };
+  d.addEventListener('close', () => clearInterval(refreshTimer));
+  $('#machine-close').onclick = () => d.close();
 })();

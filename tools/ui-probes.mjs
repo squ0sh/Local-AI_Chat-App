@@ -224,6 +224,16 @@ ok('escrow dialog opens with the create form', !!(await ev("document.querySelect
 ok('no-ledger status tells you there is nothing escrowed yet', /no escrow yet/.test(await ev("document.getElementById('escrow-state').textContent || ''")));
 await ev("document.getElementById('escrow-close')?.click()");
 
+// ── Machine telemetry card ───────────────────────────────────────────────────
+ok('machine entry lands in the capsule nav', !!(await ev("document.getElementById('machine-launch')")) && (await ev("document.getElementById('machine-launch').textContent")) === 'Machine');
+await ev("document.getElementById('machine-launch').click()");
+await sleep(400);
+ok('machine dialog opens', !!(await ev("document.querySelector('#machine-dialog[open]')")));
+await sleep(1600);
+const narrate = await ev("document.getElementById('machine-narrate')?.textContent || ''");
+ok('machine narrate line fills with real or degraded readings', narrate.length > 3 && !/gathering readings/.test(narrate), narrate.slice(0, 90));
+await ev("document.getElementById('machine-close')?.click()");
+
 // ── Voice guided setup (speech APIs were removed above) ─────────────────────
 await ev("window.__lastAlert=''; document.getElementById('mic-button').click()");
 await sleep(1200);
