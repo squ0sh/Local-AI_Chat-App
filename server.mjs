@@ -27,6 +27,7 @@ import { portableIntegrityReport, rebuildManifest, repairReleaseFiles, releaseTr
 import { MemoryStore, makeOllamaEmbedder, makeStubEmbedder } from './lib/capsule-memory.mjs';
 import { ConsolidationEngine } from './lib/consolidation.mjs';
 import { newDeviceIdentity, makeCard, readCard, packPostcard, unpackPostcard, envToText, textToEnv, fingerprint as peerFp, wordsPhrase } from './lib/capsule-handshake.mjs';
+import { packBrain, unpackBrain, buildShardEnvelopes, readShardEnvelope, combineShardEnvelopes } from './lib/escrow.mjs';
 import { LanLink } from './lib/capsule-net.mjs';
 import { sealVault, openVault } from './lib/capsule-vault.mjs';
 import { ResearchEngine } from './lib/research-engine.mjs';
@@ -2238,6 +2239,149 @@ function writePeers(list) { mkdirSync(PEERS_DIR, { recursive: true }); writeFile
 function peersInbox() { try { const j = JSON.parse(readFileSync(PEERS_INBOX_FILE, 'utf8')); return Array.isArray(j.items) ? j.items : []; } catch { return []; } }
 function writePeersInbox(list) { mkdirSync(PEERS_DIR, { recursive: true }); writeFileSync(PEERS_INBOX_FILE + '.tmp', JSON.stringify({ schema: 1, items: list }, null, 2)); renameSync(PEERS_INBOX_FILE + '.tmp', PEERS_INBOX_FILE); }
 function peersLog(line) { try { mkdirSync(PEERS_DIR, { recursive: true }); appendFileSync(PEERS_LOG_FILE, `${new Date().toISOString()} ${line}\n`, 'utf8'); } catch {} }
+
+// ── Brain escrow storage & flows ────────────────────────────────────────────
+// Outbound records: data/escrow/outbound/<epoch>.json — { epoch, k, n, digest,
+// passphraseWrapped, holderFps, createdAt }. Inbound shards you keep for a
+// friend: data/escrow/inbound/<ownerFpShort>-<epoch>.json — { envelope, holderNote }.
+const ESCROW_DIR = join(DATA_DIR, 'escrow');
+function escrowAtomicWrite(file, payload) {
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file + '.tmp', JSON.stringify(payload, null, 2) + '\n', 'utf8');
+  try { chmodSync(file + '.tmp', 0o600); } catch {}
+  renameSync(file + '.tmp', file);
+}
+function escrowReadJson(file) { try { return JSON.parse(readFileSync(file, 'utf8')); } catch { return null; } }
+function escrowStatus() {
+  const outDir = join(ESCROW_DIR, 'outbound');
+  const inDir = join(ESCROW_DIR, 'inbound');
+  const outbound = [];
+  try {
+    for (const name of readdirSync(outDir)) {
+      const rec = escrowReadJson(join(outDir, name));
+      if (!rec || rec.v !== 1) continue;
+      outbound.push({
+        epoch: rec.epoch, k: rec.k, n: rec.n, digest: rec.digest, created: rec.created,
+        passphraseWrapped: rec.passphraseWrapped, holderFps: rec.holderFps,
+      });
+    }
+  } catch {}
+  const inbound = [];
+  try {
+    for (const name of readdirSync(inDir)) {
+      const rec = escrowReadJson(join(inDir, name));
+      if (!rec?.envelope) continue;
+      inbound.push({
+        owner: rec.ownerName || rec.envelope.owner, epoch: rec.envelope.epoch, index: rec.envelope.index,
+        total: rec.envelope.total, threshold: rec.envelope.threshold, keptAt: rec.keptAt,
+      });
+    }
+  } catch {}
+  return { outbound, inbound };
+}
+
+// Create an escrow round: pack the brain, split the wrap key, emit one sealed
+// postcard per holder. Owners never store plaintext shards; their record keeps
+// only the roster metadata + brain digest.
+async function escrowCreate(body = {}, { req } = {}) {
+  const n = Math.max(2, Math.min(255, Number(body.shares ?? body.n ?? 3)));
+  const k = Math.max(2, Math.min(n, Number(body.threshold ?? body.k ?? 2)));
+  const passphrase = String(body.passphrase || '');
+  const peerFps = Array.isArray(body.peerFps) ? body.peerFps.map(String) : [];
+  const peers = peersList();
+  const holders = peerFps.map((fp) => peers.find((p) => p.fp === fp)).filter(Boolean);
+  if (holders.length !== n) return { error: `Need exactly ${n} trusted peers, saw ${holders.length} unknown/missing.`, status: 400 };
+  const { blob, brainKey, wrapped } = packBrain({ dataDir: DATA_DIR, passphrase });
+  const epoch = 'e' + randomBytes(4).toString('hex');
+  const owner = peerFp(peersIdentity().pub).slice(0, 12);
+  const envelopes = buildShardEnvelopes({ brainKey, n, k, owner, epoch, blob });
+  const postcards = holders.map((peer, i) => ({
+    toFp: peer.fp, toName: peer.name, index: envelopes[i].index,
+    text: envToText(packPostcard(peersIdentity(), {
+      kind: 'escrow', to: peer.fp, toDhPub: peer.dhPub || '', mode: 'sealed',
+      item: envelopes[i],
+    })),
+  }));
+  try {
+    escrowAtomicWrite(join(ESCROW_DIR, 'outbound', `${epoch}.json`), {
+      v: 1, epoch, k, n, digest: envelopes[0].digest, passphraseWrapped: wrapped,
+      holderFps: holders.map((p) => p.fp), holderNames: holders.map((p) => p.name), created: Date.now(),
+    });
+  } catch (e) { return { error: 'Failed to store the escrow record: ' + e.message, status: 500 }; }
+  peersLog(`escrow created: epoch ${epoch}, ${k}-of-${n}, holders ${holders.map((p) => p.name).join(', ')}`);
+  return { ok: true, epoch, k, n, digest: envelopes[0].digest, passphraseWrapped: wrapped, postcards };
+}
+
+function escrowRevoke(body = {}) {
+  const epoch = String(body.epoch || '');
+  const file = join(ESCROW_DIR, 'outbound', `${epoch}.json`);
+  if (!existsSync(file)) return { error: 'Unknown epoch: ' + epoch };
+  rmSync(file, { force: true });
+  peersLog(`escrow revoked: epoch ${epoch} (holders keep their shards; create a fresh round to retire them)`);
+  return { ok: true, epoch };
+}
+
+// Recovery, requester side: emit kind 'escrow-release' postcards asking each
+// holder to hand the shard back to this (new) identity.
+function escrowRequestRecovery(body = {}) {
+  const fps = Array.isArray(body.peerFps) ? body.peerFps.map(String) : [];
+  const myself = peersIdentity();
+  const myFp = peerFp(myself.pub).slice(0, 12);
+  const requests = [];
+  for (const fp of fps) {
+    const peer = peersList().find((p) => p.fp === fp);
+    if (!peer) return { error: 'Not a trusted peer: ' + fp, status: 404 };
+    requests.push({
+      toFp: fp, toName: peer.name,
+      text: envToText(packPostcard(myself, {
+        kind: 'escrow-release', to: peer.fp, toDhPub: peer.dhPub || '', mode: 'sealed',
+        item: { v: 1, kind: 'escrow-release', requesterFp: myFp, forEpoch: String(body.epoch || ''), note: String(body.note || '').slice(0, 500) },
+      })),
+    });
+  }
+  peersLog(`escrow recovery requested from ${fps.length} holder(s) (epoch ${body.epoch || '?'})`);
+  return { ok: true, cards: requests };
+}
+
+// Recovery, applicant side: paste at least k shard envelopes (each carries the
+// same sealed blob), rebuild the wrap key, open the blob, restore the brain's
+// files into the fresh data dir. Refused while a brain already exists here,
+// unless force=true.
+function escrowApplyRecovery(body = {}) {
+  const envs = (Array.isArray(body.shards) ? body.shards : []).map((s) => readShardEnvelope(typeof s === 'string' ? JSON.parse(s) : s));
+  if (!envs.length) return { error: 'Provide at least one shard envelope.', status: 400 };
+  const k = envs[0].threshold;
+  if (envs.length < k) return { error: `Need ${k} shards, got ${envs.length}.`, status: 400 };
+  const digest = envs[0].digest;
+  const epochs = new Set(envs.map((e) => e.epoch));
+  if (epochs.size !== 1 || envs.some((e) => e.digest !== digest)) return { error: 'Shards disagree — different escrow epochs or digest mismatch', status: 400 };
+  if (existsSync(join(DATA_DIR, 'memory.key')) && body.force !== true) {
+    return { error: 'This capsule already holds an escrowed brain — pass force:true only if you want it overwritten.', status: 409 };
+  }
+  const files = unpackBrain({ blob: envs[0].blob, shards: envs.map((e) => ({ index: e.index, bytes: Buffer.from(e.shard, 'base64') })), passphrase: String(body.passphrase || '') });
+  const written = escrowRestoreFiles(files);
+  peersLog(`escrow recovered: epoch ${envs[0].epoch} — ${written.length} file(s) restored from ${envs.length} shard(s)`);
+  return { ok: true, epoch: envs[0].epoch, files: written, restored: written.length };
+}
+
+function escrowRestoreFiles(files) {
+  const written = [];
+  for (const name of ['memory.key', 'memory-store.json.enc', 'procedures.json']) {
+    if (!(name in files) || !files[name]) continue;
+    const target = join(DATA_DIR, name);
+    const tmp = target + '.tmp-' + randomBytes(3).toString('hex');
+    const data = name.endsWith('.json') ? files[name] : Buffer.from(files[name], 'base64');
+    writeFileSync(tmp, data);
+    try { chmodSync(tmp, 0o600); } catch {}
+    renameSync(tmp, target);
+    written.push(name);
+    if (name === 'memory.key') {
+      // The new key may differ from the cached in-memory one.
+      // The next memory access re-reads it from disk.
+    }
+  }
+  return written;
+}
 function peersStatus() {
   const identity = peersIdentity();
   const card = makeCard(identity, { name: deviceName() });
@@ -3499,6 +3643,34 @@ async function handle(req, res) {
           const list = readProcedures();
           list.push({ id: `proc-${Date.now().toString(36)}-${randomBytes(2).toString('hex')}`, name: String(it.item?.name || 'shared procedure'), summary: String(it.item?.summary || ''), steps: (it.item?.steps || []).filter(Boolean).slice(0, 12), source_task: `peer:${it.fromName}`, created: new Date().toISOString(), uses: 0 });
           writeProcedures(list);
+        } else if (it.kind === 'escrow') {
+          // I became a shard retainer. My capsule keeps the envelope sealed at
+          // rest with the same rules as every other private record.
+          const envelope = readShardEnvelope(it.item);
+          const ownerShort = String(it.from || 'unknown').slice(0, 12);
+          escrowAtomicWrite(join(ESCROW_DIR, 'inbound', `${ownerShort}-${envelope.epoch}.json`), {
+            envelope,
+            ownerName: it.fromName || 'unknown sender',
+            keptAt: Date.now(),
+          });
+          peersLog(`escrow: now holding shard ${envelope.index}/${envelope.total} of ${ownerShort}'s brain (epoch ${envelope.epoch})`);
+        } else if (it.kind === 'escrow-release') {
+          // A friend is asking for their shard back. Only send what they ask
+          // for, to the identity the relationship already trusts.
+          const epoch = String(it.item?.forEpoch || '');
+          const ownerShort = String(it.from || '').slice(0, 12);
+          const held = escrowReadJson(join(ESCROW_DIR, 'inbound', `${ownerShort}-${epoch}.json`));
+          if (!held?.envelope) return sendJSON(res, 404, { error: "I don't hold that shard." });
+          const requester = peersList().find((p) => peerFp(p.pub).slice(0, 12) === ownerShort) || peersList().find((p) => p.fp === it.from);
+          if (!requester) return sendJSON(res, 403, { error: 'The requester is not a trusted peer here. Re-pair first.' });
+          const reply = envToText(packPostcard(peersIdentity(), {
+            kind: 'escrow-release', to: requester.fp, toDhPub: requester.dhPub || '', mode: 'sealed',
+            item: held.envelope,
+          }));
+          peersLog(`escrow: released shard ${held.envelope.index} back to ${requester.name} (epoch ${epoch})`);
+          it.status = 'accepted';
+          writePeersInbox(inbox);
+          return sendJSON(res, 200, { ok: true, reply });
         }
       } catch (e) { return sendJSON(res, 500, { error: 'Accepted but storing failed: ' + e.message }); }
       it.status = 'accepted';
@@ -3517,6 +3689,43 @@ async function handle(req, res) {
       }
       return sendJSON(res, 200, { ok: true, listening: !!lanLink });
     } catch (e) { return sendJSON(res, 500, { error: 'Could not listen on the LAN: ' + e.message }); }
+  }
+
+  // ── Brain escrow: social recovery over postcards ──────────────────────────
+  if (p.startsWith('/api/escrow') && !isDirectLocalRequest(req)) {
+    return sendJSON(res, 403, { error: 'Escrow is available only in the local app' });
+  }
+  if (req.method === 'GET' && p === '/api/escrow/status') {
+    return sendJSON(res, 200, escrowStatus());
+  }
+  if (req.method === 'POST' && p === '/api/escrow/create') {
+    let body; try { body = JSON.parse(await readBody(req, 100_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    try {
+      const result = await escrowCreate(body, { req });
+      if (result.error) return sendJSON(res, result.status || 400, result);
+      return sendJSON(res, 200, result);
+    } catch (e) { return sendJSON(res, 500, { error: e.message }); }
+  }
+  if (req.method === 'POST' && p === '/api/escrow/revoke') {
+    let body; try { body = JSON.parse(await readBody(req, 20_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const result = escrowRevoke(body);
+    return sendJSON(res, result.ok ? 200 : 404, result);
+  }
+  if (req.method === 'POST' && p === '/api/escrow/recover/request') {
+    let body; try { body = JSON.parse(await readBody(req, 20_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    try {
+      const result = escrowRequestRecovery(body);
+      if (result.error) return sendJSON(res, result.status || 400, result);
+      return sendJSON(res, 200, result);
+    } catch (e) { return sendJSON(res, 500, { error: e.message }); }
+  }
+  if (req.method === 'POST' && p === '/api/escrow/recover/apply') {
+    let body; try { body = JSON.parse(await readBody(req, 3_000_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    try {
+      const result = escrowApplyRecovery(body);
+      if (result.error) return sendJSON(res, result.status || 400, result);
+      return sendJSON(res, 200, result);
+    } catch (e) { return sendJSON(res, 400, { error: e.message }); }
   }
   if (req.method === 'POST' && p === '/api/peers/sync') {
     let body; try { body = await readBody(req, 50_000).then(JSON.parse).catch(() => null); } catch { body = null; }

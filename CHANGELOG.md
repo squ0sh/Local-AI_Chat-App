@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.13.0 — Brain escrow: social recovery, no cloud
+
+- **Your Capsule's brain can survive the house fire.** Memory index + procedures
+  now pack into one small sealed blob; its wrap key is Shamir-split k-of-n
+  (default 2-of-3) and each shard ships to a friend's capsule as a sealed
+  CAPX1 postcard — riding the same trust-list and consent inbox as everything
+  else. Holders see only the shard they keep; only you see the whole roster.
+- **Two-factor by construction, not by policy.** The payload is sealed with
+  `brainKey XOR scrypt(recovery passphrase)`: shards alone give nothing, the
+  passphrase alone gives nothing, and the AEAD tag punishes a wrong phrase.
+- **Every step is consent—and—journal.** Friends approve shard-keeping in the
+  same pending-card grammar as procedures; recovery requests reach holders as
+  postcards too. A fresh Capsule re-pairs, gathers k envelopes, and walks
+  `Escrow → Rebuild brain` to prevail.
+- The new `lib/escrow.mjs` (pure GF(256) Shamir, KAT-tested) plus
+  `/api/escrow/{status,create,revoke,recover/*}` rides the loopback-only guard
+  — and the whole Escrow flow is covered by 10 new lib/HTTP tests and 3 browser
+  probes (178 / 69 green).
+- The signed manifest now tracks every runtime library it actually protects
+  (`capsule-handshake`, `capsule-net`, `capsule-memory`, `consolidation`,
+  `escrow`, `mcp-client`, `user-store`, `agent-loop`, `memory`, …, 52 files).
+
 ## 1.12.0 — MCP tools join the agent
 
 - **Registered MCP servers are now agent tools.** Every connected server's

@@ -323,6 +323,16 @@ medium — a live encrypted LAN sync, a USB stick, a pasted Meshtastic message,
 or a sign-only frame for ham radio (it refuses to encrypt there on purpose).
 Received items always wait in an approval inbox; nothing lands silently.
 
+**Brain escrow** (in the same sidebar) fixes the "my machine died and took my
+memory with it" problem without a cloud: your memory index + procedures are
+sealed into one small blob, the wrap key is **Shamir-split k-of-n across
+friends' capsules**, and each shard travels as a consent-gated postcard.
+Single shards are information-theoretically worthless, a roster of holders is
+visible to you from the Escrow panel, and the build sequence makes even the k
+friends useless without your recovery passphrase (`brainKey XOR scrypt(pass)` —
+the AEAD tag catches a wrong one). Everything is journaled in the peers
+handshake log as it happens.
+
 The **Memory** entry in the Capsule sidebar turns on private long-term recall:
 your chats and research reports index into an encrypted store on this machine,
 so the agent can answer "what did we decide about X?" with links back to the

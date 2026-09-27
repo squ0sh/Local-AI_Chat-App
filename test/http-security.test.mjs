@@ -11,6 +11,8 @@ import { join } from 'path';
 import { bootServer, TEST_PASSWORD } from './helpers/server-harness.mjs';
 import { startFakeOllama } from './helpers/fake-ollama.mjs';
 import { mockMcpServerPath } from './helpers/mock-mcp-server.mjs';
+import { newDeviceIdentity, makeCard, packPostcard, unpackPostcard, textToEnv, envToText, fingerprint } from '../lib/capsule-handshake.mjs';
+import { readdirSync, writeFileSync } from 'fs';
 
 const json = { 'Content-Type': 'application/json' };
 const bearer = (token) => ({ Authorization: 'Bearer ' + token });
@@ -408,4 +410,89 @@ test('agent loop: an MCP call rejected at the approval card ends the run without
   const audit = readFileSync(join(dataDir, 'agent', 'mcp.log'), 'utf8');
   assert.ok(audit.includes('"action":"register"'), 'register is journaled');
   assert.ok(!audit.includes('"via":"agent","ok":true'), 'no agent-visiting mcp call is journaled as ok');
+});
+// ── Brain escrow, over HTTP routes ──────────────────────────────────────────
+function peerCardText(name) {
+  const identity = newDeviceIdentity();
+  const card = makeCard(identity, { name });
+  return { identity, card, text: envToText(packPostcard(identity, { kind: 'cardref', mode: 'open', item: card, to: '*' })) };
+}
+
+test('escrow: create refuses when there is nothing to escrow', async (t) => {
+  const { call } = await bootServer(t, { users: ['alice'] });
+  const login = await call('/api/auth/login', { method: 'POST', headers: json, body: JSON.stringify({ username: 'alice', password: TEST_PASSWORD }) });
+  const r = await call('/api/escrow/create', { method: 'POST', headers: { ...json, ...bearer(login.body.token) }, body: JSON.stringify({ passphrase: 'x', shares: 2, threshold: 2, peerFps: [] }) });
+  assert.equal(r.status, 400);
+});
+
+test('escrow: create → status → sealed postcards, and a fresh capsule recovers from two shards', async (t) => {
+  const { call, dataDir } = await bootServer(t, {
+    seedFiles: { 'procedures.json': JSON.stringify({ procedures: [{ name: 'p1' }] }) },
+  });
+  writeFileSync(join(dataDir, 'memory.key'), Buffer.from('K'.repeat(32), 'utf8'));
+  writeFileSync(join(dataDir, 'memory-store.json.enc'), Buffer.from('sealed-index-payload'));
+
+  const friendA = peerCardText('friend-a');
+  const friendB = peerCardText('friend-b');
+  for (const f of [friendA, friendB]) {
+    const r = await call('/api/peers/import-card', { method: 'POST', headers: json, body: JSON.stringify({ text: f.text }) });
+    assert.equal(r.status, 200, JSON.stringify(r.body));
+  }
+
+  const created = await call('/api/escrow/create', { method: 'POST', headers: json, body: JSON.stringify({ passphrase: 'recovery phrase', shares: 2, threshold: 2, peerFps: [fingerprint(friendA.identity.pub), fingerprint(friendB.identity.pub)] }) });
+  assert.equal(created.status, 200, JSON.stringify(created.body));
+  assert.equal(created.body.postcards.length, 2);
+  assert.ok(created.body.postcards.every((p) => p.text.startsWith('CAPX1 ')), 'shards ship as CAPX1 postcards');
+
+  const status = await call('/api/escrow/status');
+  assert.equal(status.body.outbound.length, 1);
+  assert.equal(status.body.outbound[0].k, 2);
+  assert.ok(existsSync(join(dataDir, 'escrow', 'outbound', created.body.epoch + '.json')), 'roster persisted');
+
+  // Only the intended friend can unwrap its own postcard, given the owner's card.
+  const ownerCard = (await call('/api/peers')).body.card;
+  const envelopes = [friendA, friendB].map((f, i) =>
+    unpackPostcard(textToEnv(created.body.postcards[i].text), { identity: f.identity, trustedPubs: [{ pub: ownerCard.pub }] }).item);
+  assert.equal(envelopes.length, 2);
+  assert.ok(envelopes.every((e) => e.kind === 'escrow' && e.epoch === created.body.epoch && typeof e.blob === 'string'));
+  assert.throws(() => unpackPostcard(textToEnv(created.body.postcards[0].text), { identity: friendB.identity, trustedPubs: [{ pub: ownerCard.pub }] }));
+
+  const { call: callFresh, dataDir: freshDir } = await bootServer(t, { seedFiles: {} });
+  const applied = await callFresh('/api/escrow/recover/apply', { method: 'POST', headers: json, body: JSON.stringify({ passphrase: 'recovery phrase', shards: envelopes }) });
+  assert.equal(applied.status, 200, JSON.stringify(applied.body));
+  assert.deepEqual(new Set(applied.body.files), new Set(['memory.key', 'memory-store.json.enc', 'procedures.json']));
+  assert.ok(existsSync(join(freshDir, 'memory.key')));
+
+  const tooFew = await callFresh('/api/escrow/recover/apply', { method: 'POST', headers: json, body: JSON.stringify({ passphrase: 'recovery phrase', shards: [envelopes[0]], force: true }) });
+  assert.equal(tooFew.status, 400);
+});
+
+test('escrow: an inbound shard postcard becomes a consent item; accepting stores it locally', async (t) => {
+  const { call, dataDir } = await bootServer(t, { seedFiles: {} });
+  const peers = await call('/api/peers');
+  const me = peers.body.card;
+  const sender = peerCardText('alice-if');
+  // Trust first: sealed postcards from unknown senders are refused.
+  const carded = await call('/api/peers/import-card', { method: 'POST', headers: json, body: JSON.stringify({ text: sender.text }) });
+  assert.equal(carded.status, 200);
+  const envelope = {
+    v: 1, kind: 'escrow', epoch: 'e_fixture', index: 1, threshold: 2, total: 2,
+    owner: 'alicefp', shard: Buffer.from('shard-bytes').toString('base64'), blob: '{"v":1}',
+    digest: 'digest-x', issuedAt: new Date().toISOString(),
+  };
+  const postcard = envToText(packPostcard(sender.identity, { kind: 'escrow', to: me.fp, toDhPub: me.dh, mode: 'sealed', item: envelope }));
+  const imported = await call('/api/peers/import', { method: 'POST', headers: json, body: JSON.stringify({ text: postcard }) });
+  assert.equal(imported.status, 200, JSON.stringify(imported.body));
+  assert.equal(imported.body.inbox.kind, 'escrow');
+
+  const decided = await call('/api/peers/inbox/decide', { method: 'POST', headers: json, body: JSON.stringify({ id: imported.body.inbox.id, action: 'accept' }) });
+  assert.equal(decided.status, 200, JSON.stringify(decided.body));
+
+  const inDir = join(dataDir, 'escrow', 'inbound');
+  assert.ok(existsSync(inDir), 'inbound dir exists');
+  const files = readdirSync(inDir);
+  assert.equal(files.length, 1);
+  const held = JSON.parse(readFileSync(join(inDir, files[0]), 'utf8'));
+  assert.equal(held.envelope.epoch, 'e_fixture');
+  assert.equal(held.envelope.index, 1);
 });

@@ -216,6 +216,14 @@ await ev("document.querySelector('.setup-card .setup-head .plain-btn')?.click()"
 await sleep(300);
 ok('checklist hides on demand', !(await ev("!!document.querySelector('.welcome .setup-card')")));
 
+// ── Brain escrow dialog (sidebar entry, roster, wizard surfaces) ─────────────
+ok('escrow entry lands in the capsule nav', !!(await ev("document.getElementById('escrow-launch')")) && (await ev("document.getElementById('escrow-launch').textContent")) === 'Escrow');
+await ev("document.getElementById('escrow-launch').click()");
+await sleep(400);
+ok('escrow dialog opens with the create form', !!(await ev("document.querySelector('#escrow-dialog[open] #escrow-create')")), 'no #escrow-create when dialog open');
+ok('no-ledger status tells you there is nothing escrowed yet', /no escrow yet/.test(await ev("document.getElementById('escrow-state').textContent || ''")));
+await ev("document.getElementById('escrow-close')?.click()");
+
 // ── Voice guided setup (speech APIs were removed above) ─────────────────────
 await ev("window.__lastAlert=''; document.getElementById('mic-button').click()");
 await sleep(1200);

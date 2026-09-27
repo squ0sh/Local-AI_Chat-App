@@ -846,7 +846,7 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
 
 
 
-(()=>{const sidebar=document.querySelector('aside');if(!sidebar)return;const style=document.createElement('style');style.textContent='#capsule-nav{border-top:1px solid var(--line);padding:10px 8px}#capsule-nav h3{margin:0 10px 6px;color:var(--muted);font-size:10px;letter-spacing:.09em}#capsule-nav button{position:static!important;display:block!important;width:100%!important;height:auto!important;min-height:32px!important;margin:2px 0!important;padding:7px 10px!important;text-align:left!important;border:0!important;border-radius:7px!important;background:transparent!important;color:var(--muted)!important;font-size:12px!important;box-shadow:none!important}#capsule-nav button:hover{background:var(--panel3)!important;color:var(--text)!important}#capsule-nav button.on{color:var(--blue2)!important}';document.head.append(style);const nav=document.createElement('section');nav.id='capsule-nav';nav.innerHTML='<h3>CAPSULE</h3>';const labels={"portable-launch":"Portable readiness","vault-launch":"Vault","memory-launch":"Memory","sleep-launch":"Sleep cycle","peers-launch":"Peers","cloud-launch":"Cloud connection","agent-launch":"Agent mode","remote-launch":"Capsule Remote"};Object.entries(labels).forEach(([id,label])=>{const el=document.getElementById(id);if(el){el.textContent=label;el.title=label;nav.append(el)}});sidebar.insertBefore(nav,sidebar.querySelector('.sidebar-bottom'))})();
+(()=>{const sidebar=document.querySelector('aside');if(!sidebar)return;const style=document.createElement('style');style.textContent='#capsule-nav{border-top:1px solid var(--line);padding:10px 8px}#capsule-nav h3{margin:0 10px 6px;color:var(--muted);font-size:10px;letter-spacing:.09em}#capsule-nav button{position:static!important;display:block!important;width:100%!important;height:auto!important;min-height:32px!important;margin:2px 0!important;padding:7px 10px!important;text-align:left!important;border:0!important;border-radius:7px!important;background:transparent!important;color:var(--muted)!important;font-size:12px!important;box-shadow:none!important}#capsule-nav button:hover{background:var(--panel3)!important;color:var(--text)!important}#capsule-nav button.on{color:var(--blue2)!important}';document.head.append(style);const nav=document.createElement('section');nav.id='capsule-nav';nav.innerHTML='<h3>CAPSULE</h3>';const labels={"portable-launch":"Portable readiness","vault-launch":"Vault","memory-launch":"Memory","sleep-launch":"Sleep cycle","peers-launch":"Peers","escrow-launch":"Escrow","cloud-launch":"Cloud connection","agent-launch":"Agent mode","remote-launch":"Capsule Remote"};Object.entries(labels).forEach(([id,label])=>{const el=document.getElementById(id);if(el){el.textContent=label;el.title=label;nav.append(el)}});sidebar.insertBefore(nav,sidebar.querySelector('.sidebar-bottom'))})();
 
 
 
@@ -1939,4 +1939,72 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
   };
   b.onclick=async()=>{d.showModal();$('peers-notice').textContent='';await paint()};
   $('peers-close').onclick=()=>d.close();
+})();
+
+// ── Brain escrow: social recovery for memory + procedures ────────────────────
+// Rides the postcard system: each holder becomes a consent-gated retainer of a
+// Shamir shard + the sealed brain blob. Rebuilding needs the threshold count
+// plus the owner's recovery passphrase — nothing is a one-key-fits-all breach.
+(() => {
+  const b = document.createElement('button'); b.id = 'escrow-launch'; b.textContent = 'Escrow'; b.title = 'Brain escrow — recover your memory and procedures with friends'; document.body.append(b);
+  const d = document.createElement('dialog'); d.id = 'escrow-dialog'; d.className = 'restorer'; d.innerHTML = '<div class="settings"><h2>Brain escrow <span class="agent-badge">sovereign</span></h2><p>Seal a copy of your <b>memory + procedures</b> for the friends you choose. Any <i>threshold</i> of them can give it back — no cloud knows, nobody alone can read it. Chats and your vault stay out.</p>'
+    + '<div class="peer-row"><span class="peer-pill" id="escrow-state">checking…</span></div><div id="escrow-outbound"></div><div id="escrow-inbound"></div>'
+    + '<h3 style="margin:14px 0 6px">Create an escrow</h3>'
+    + '<div class="notice" id="escrow-create-note">3 shard holders is a good start; 2 of 3 must cooperate to recover.</div>'
+    + '<div class="peer-row"><label>Threshold = </label><input id="escrow-k" type="number" min="2" max="255" value="2" style="width:64px"><label>of</label><input id="escrow-n" type="number" min="2" max="255" value="3" style="width:64px"><label>holders</label></div>'
+    + '<label>Holders (trusted peers)</label><div id="escrow-peer-list" style="max-height:140px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:8px"></div>'
+    + '<label>Recovery passphrase (required for rebuild — with it, shards alone are nothing)</label><input id="escrow-pass" type="password" autocomplete="new-password" placeholder="A phrase only you know">'
+    + '<div class="peer-row"><button class="plain-btn" id="escrow-create">Seal + write postcards</button></div>'
+    + '<div id="escrow-postcards"></div>'
+    + '<h3 style="margin:14px 0 6px">Recover a capsule</h3>'
+    + '<div class="notice">On the NEW machine: send holders your re-pairing card, paste the shard envelopes they return (one per line), and enter the passphrase.</div>'
+    + '<textarea id="escrow-shards" rows="4" placeholder="Paste each CAPX1 escrow-release chat here, one per line…"></textarea>'
+    + '<div class="peer-row"><input id="escrow-recover-pass" type="password" placeholder="Recovery passphrase (only if set)" style="flex:1"><button class="plain-btn" id="escrow-apply">Rebuild brain</button></div>'
+    + '<div class="notice" id="escrow-log"></div>'
+    + '<div class="dialog-actions"><button class="plain-btn" id="escrow-close">Done</button></div></div>';
+  document.body.append(d);
+  const $ = (id) => d.querySelector(id);
+  const post = (path, body) => fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json', ...(window.__authToken ? { Authorization: 'Bearer ' + window.__authToken } : {}) }, body: JSON.stringify(body) }).then(async (r) => { const j = await r.json().catch(() => ({})); if (!r.ok) throw Error(j.error || r.statusText); return j; });
+
+  async function paint() {
+    const s = await fetch('/api/escrow/status').then((r) => r.json());
+    const out = s.outbound || [], inn = s.inbound || [];
+    $('#escrow-state').textContent = (out.length ? 'escrow active' : 'no escrow yet') + (inn.length ? ` · holding ${inn.length} shard(s) for friends` : '');
+    $('#escrow-outbound').innerHTML = out.map((r2) => `<div class="peer-row" style="border:1px solid var(--line);border-radius:8px;padding:8px;margin:6px 0"><span style="font-family:var(--mono);font-size:11px">${r2.epoch} · ${r2.k}-of-${r2.n} · ${r2.digest.slice(0, 12)}…</span><button class="plain-btn" data-revoke="${r2.epoch}">Revoke</button></div>`).join('');
+    $('#escrow-outbound').querySelectorAll('[data-revoke]').forEach((btn) => { btn.onclick = async () => { try { await post('/api/escrow/revoke', { epoch: btn.dataset.revoke }); $('#escrow-log').textContent = 'Epoch revoked — retire is just "no longer honored"; old shards stay stale and useless.'; paint(); } catch (e) { $('#escrow-log').textContent = e.message; } }; });
+    $('#escrow-inbound').innerHTML = inn.map((r2) => `<div class="peer-row" style="font-family:var(--mono);font-size:11px">holding shard ${r2.index}/${r2.total} for ${r2.owner} (epoch ${r2.epoch})</div>`).join('');
+    const peers = (await fetch('/api/peers').then((r) => r.json()).catch(() => ({ peers: [] }))).peers || [];
+    $('#escrow-peer-list').innerHTML = peers.length ? peers.map((p) => `<label style="display:flex;gap:8px"><input type="checkbox" data-fp="${p.fp}"> ${p.name} <span style="color:var(--muted);font-family:var(--mono);font-size:10px">${p.fp.slice(0, 12)}</span></label>`).join('') : '<div class="notice">No trusted peers yet — pair first from the Peers panel.</div>';
+  }
+
+  $('#escrow-create').onclick = async () => {
+    try {
+      const checked = [...d.querySelectorAll('#escrow-peer-list input:checked')].map((x) => x.dataset.fp);
+      const payload = { passphrase: $('#escrow-pass').value || '', threshold: Number($('#escrow-k').value) || 2, shares: checked.length, peerFps: checked };
+      if (!checked.length) throw Error('Pick at least two trusted holders.');
+      if (payload.threshold < 2 || payload.threshold > payload.shares) throw Error('Threshold must be ≥ 2 and ≤ holder count.');
+      if (payload.passphrase && payload.passphrase.length < 12) throw Error('Recovery passphrase needs at least 12 characters — leave blank only if you accept shard-only recovery.');
+      const r = await post('/api/escrow/create', payload);
+      $('#escrow-log').textContent = `Escrow sealed · epoch ${r.epoch} · ${r.k}-of-${r.n} · digest ${r.digest}.`;
+      $('#escrow-postcards').innerHTML = '<label>Give each holder their postcard (USB/message/radio):</label>' + r.postcards.map((p) => `<div class="peer-frame">to ${p.toName} <button class="plain-btn" data-frame="${p.index}">Copy frames</button><pre class="peer-frame" data-body="${p.index}" style="display:none">${p.text}</pre></div>`).join('');
+      $('#escrow-postcards').querySelectorAll('[data-frame]').forEach((btn) => { btn.onclick = async () => { const el = $('#escrow-postcards').querySelector(`[data-body="${btn.dataset.frame}"]`); el.style.display = 'block'; try { await navigator.clipboard.writeText(el.textContent); btn.textContent = 'Copied'; } catch { btn.textContent = 'select + copy this text'; } }; });
+      paint();
+    } catch (e) { $('#escrow-log').textContent = e.message; }
+  };
+
+  $('#escrow-apply').onclick = async () => {
+    try {
+      const lines = String($('#escrow-shards').value || '').split('\n').map((x) => x.trim()).filter(Boolean).map((x) => JSON.parse(x));
+      if (!lines.length) throw Error('Paste the shard envelopes the holders returned, one per line.');
+      const r = await post('/api/escrow/recover/apply', { passphrase: $('#escrow-recover-pass').value || '', shards: lines });
+      $('#escrow-log').textContent = `Brain rebuilt (${r.files.length} file(s) restored). Restart this capsule to wake it fully.`;
+      $('#escrow-shards').value = '';
+    } catch (e) { $('#escrow-log').textContent = e.message; }
+  };
+
+  b.onclick = async () => { d.showModal(); $('#escrow-log').textContent = ''; $('#escrow-postcards').innerHTML = ''; try { await paint(); } catch (e) { $('#escrow-log').textContent = e.message; } };
+  // Sidebar badge while anything is held for friends.
+  const smallBadge = () => { b.classList.add('on'); };
+  fetch('/api/escrow/status').then((r) => r.json()).then((s) => { if ((s.inbound || []).length) smallBadge(); }).catch(() => {});
+  $('#escrow-close').onclick = () => d.close();
 })();
