@@ -47,6 +47,37 @@ streams a byte-verified, resumable kit to the drive. On the other machine it is
 one command: `bash start-portable.sh` (Linux/macOS) or `start-portable.cmd`
 (Windows).
 
+### Run it as a service
+
+The portable kit is also the service artifact — same folder, same
+`start-portable.sh/.cmd`, same `.portable/data`. One command per platform:
+
+| Platform | Install | Uninstall | Notes |
+| -------- | ------- | --------- | ----- |
+| Linux    | `bash tools/service.sh install`     | `bash tools/service.sh uninstall` | systemd **user** service (`~/.config/systemd/user`); one-time `loginctl enable-linger "$USER"` keeps it up across sign-outs |
+| macOS    | `bash tools/service.sh install`     | `bash tools/service.sh uninstall` | launchd LaunchAgent (`~/Library/LaunchAgents`); auto-starts at login |
+| Windows  | `tools\service.cmd install`         | `tools\service.cmd uninstall`     | Task Scheduler task at logon |
+
+Each installer runs the integrity check first, refuses an open service unless
+`AUTH_TOKEN` is set or a multi-user account exists (`--allow-open` overrides
+that deliberate risk), and installs with `LOCAL_AI_NO_BROWSER=1` so nothing
+pops on a headless box. `status` and `logs` tell you whether the app answers —
+not just whether the process is up. Uninstall removes the service definition
+only; **data and models stay** in `.portable/data`, so the kit can go back onto
+a stick at any moment.
+
+The macOS and Windows generators are shaped as one-line recipes both verified
+by tests here and verified-for-real when you run them on that platform; if
+something misbehaves, `tools/service.cmd` and the plist are plain text with
+full read-back. A root system service (`/etc/systemd`, `/opt`, `/var/lib`)
+remains a documented manual path for now.
+
+**Upgrade a deployed service:**
+`node tools/capsule-backup.mjs` → swap the kit (or `git pull`) → `systemctl
+--user restart local-ai-capsule` (or re-run the installer) → the launcher
+verifies the signed manifest on start; a restore rolls back with the same
+backup file. No auto-updater — the manifest is the version contract.
+
 ### Capsule integrity
 
 `capsule-integrity.json` pins every release file with a sha256 hash, signed with

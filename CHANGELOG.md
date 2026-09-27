@@ -1,5 +1,27 @@
 # Changelog
 
+## 1.11.0 — Deployment story: the Capsule runs itself, and stays portable
+
+- **`tools/service.sh` (Linux + macOS) and `tools/service.cmd` (Windows)** turn
+  the same portable kit into a per-user background service: systemd user unit /
+  launchd LaunchAgent / Task Scheduler task, all launching the unchanged
+  `start-portable` launcher with `LOCAL_AI_NO_BROWSER=1`, `Restart=on-failure`
+  hardening, and an auth gate — a service without `AUTH_TOKEN` or a multi-user
+  account refuses unless you pass `--allow-open` deliberately. Every write is
+  sandboxed behind `XDG_CONFIG_HOME`/`LOCAL_AI_AGENT_DIR` overrides and a
+  `--dry-run` mode, so the installers are fully testable (7 new tests cover
+  unit-content hardening, auth gating, uninstall never touching data, the
+  launchd plist shape, and the schtasks wrapper).
+- **Nothing about portability changes.** `.portable/data` is the service's data
+  dir; `uninstall` removes the service definition and leaves models + history
+  in place; a deployed kit can be zipped back onto a USB stick at any moment.
+  The service installer surfaces in the signed manifest like every other
+  release tool.
+- **README grows the operational section**: a platform table for installing,
+  the upgrade/rollback recipe built on the shipped `capsule-backup` snapshot
+  and the signed manifest (no auto-updater — the manifest is the contract) —
+  and the root-owned system service left as a documented manual path.
+
 ## 1.10.0 — MCP hardening + voice polish
 
 ### MCP hardening
