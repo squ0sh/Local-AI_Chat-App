@@ -269,3 +269,101 @@ test('critic: off by default — no critic events unless requested', async () =>
   });
   assert.ok(!events.some((e) => e.type.startsWith('critic') || e.type.startsWith('revision')));
 });
+
+// ── MCP → agent-loop bridge ────────────────────────────────────────────────
+import { buildMcpToolset, sanitizeMcpToolName, executeTool } from '../lib/agent-loop.mjs';
+
+test('MCP toolset names, sanitizes and maps back', () => {
+  const set = buildMcpToolset([{ id: 'files', tools: [{ name: 'read file', description: 'open something' }, { name: 'list-dir' }] }]);
+  assert.ok(!set.error);
+  assert.deepEqual(Object.keys(set.map), ['mcp_files_read_file', 'mcp_files_list-dir']);
+  assert.deepEqual(set.map.mcp_files_read_file, { client: 'files', tool: 'read file' });
+  assert.equal(set.tools[0].function.description, 'open something');
+  assert.deepEqual(set.tools[0].function.parameters, { type: 'object', properties: {} });
+  assert.equal(sanitizeMcpToolName('a b', 'c d'), 'mcp_a_b_c_d');
+});
+
+test('MCP toolset refuses shadowed tool names', () => {
+  const set = buildMcpToolset([
+    { id: 'my-server', tools: [{ name: 'read file' }, { name: 'read/file' }] },
+  ]);
+  assert.equal(typeof set.error, 'string');
+  assert.match(set.error, /collision/i);
+});
+
+test('MCP tools join the model-visible set in build mode and disappear in plan mode', () => {
+  const set = buildMcpToolset([{ id: 'files', tools: [{ name: 'lookup' }] }]);
+  const build = toolsForMode(false, { mcpTools: set.tools });
+  assert.ok(build.some((t) => t.function.name === 'mcp_files_lookup'));
+  const plan = toolsForMode(true, { mcpTools: set.tools });
+  assert.ok(!plan.some((t) => t.function.name.startsWith('mcp_')));
+});
+
+test('executeTool gates mcp_* behind approval in every autonomy mode', async () => {
+  for (const autonomy of ['supervised', 'selective', 'auto']) {
+    const r = await executeTool('mcp_files_lookup', { q: 'x' }, '/tmp', { autonomy, hooks: { mcpMap: { mcp_files_lookup: { client: 'files', tool: 'lookup' } }, mcpCall: async () => ({ content: [{ type: 'text', text: 'ok' }] }) } });
+    assert.equal(r.blocked, true, autonomy + ' must require approval');
+  }
+  const r2 = await executeTool('mcp_files_lookup', { q: 'x', _approved: true }, '/tmp', { autonomy: 'selective', hooks: { mcpMap: { mcp_files_lookup: { client: 'files', tool: 'lookup' } }, mcpCall: async (t) => ({ content: [{ type: 'text', text: 'via ' + t.client + '/' + t.tool }] }) } });
+  assert.equal(r2.content, 'via files/lookup');
+});
+
+test('executeTool mcp_*: unknown tool, missing bridge, plan mode all fail cleanly', async () => {
+  const unknown = await executeTool('mcp_nope_nothing', { _approved: true }, '/tmp', { autonomy: 'auto' });
+  assert.match(unknown.error, /not connected/);
+  const plan = await executeTool('mcp_files_lookup', { _approved: true }, '/tmp', { autonomy: 'auto', readonly: true });
+  assert.equal(plan.blocked, true);
+  assert.match(plan.error, /plan mode/i);
+});
+
+test('full loop: MCP call pauses for approval and lands its flattened result', async () => {
+  const events = [];
+  const calls = [];
+  let step = 0;
+  const llmCall = async () => {
+    step += 1;
+    if (step === 1) return { content: '', tool_calls: [{ name: 'mcp_mock_echo', arguments: { text: 'ring' } }], tokens: 1 };
+    return { content: 'Answered with the tool result.', tool_calls: [], tokens: 1 };
+  };
+  const hooks = {
+    mcpMap: { mcp_mock_echo: { client: 'mock', tool: 'echo' } },
+    mcpCall: async (target, args, ) => { calls.push([target, args]); return { content: [{ type: 'text', text: 'heard: ' + args.text }] }; },
+  };
+  const result = await runAgentLoop({
+    task: 'test',
+    model: 'test-model',
+    workspaceRoot: '/tmp',
+    autonomy: 'auto',
+    onEvent: (e) => {
+      events.push(e);
+      if (e.type === 'waiting_approval') e.resolve(true);
+    },
+    llmCall,
+    hooks,
+    signal: new AbortController().signal,
+  });
+  assert.equal(result.status, 'complete');
+  assert.deepEqual(calls, [[{ client: 'mock', tool: 'echo' }, { text: 'ring', _approved: true }]]);
+  assert.ok(events.some((e) => e.type === 'waiting_approval' && e.name === 'mcp_mock_echo'));
+  assert.ok(result.thread.some((m) => typeof m.content === 'string' && m.content.includes('heard: ring')), 'flattened text lands in the thread');
+});
+
+test('full loop: a rejected MCP call is relayed to the model as blocked', async () => {
+  let step = 0;
+  const llmCall = async () => {
+    step += 1;
+    if (step === 1) return { content: '', tool_calls: [{ name: 'mcp_mock_echo', arguments: {} }], tokens: 1 };
+    return { content: 'understood, not doing it', tool_calls: [], tokens: 1 };
+  };
+  const result = await runAgentLoop({
+    task: 'test',
+    model: 'test-model',
+    workspaceRoot: '/tmp',
+    autonomy: 'auto',
+    onEvent: (e) => { if (e.type === 'waiting_approval') e.resolve(false); },
+    llmCall,
+    signal: new AbortController().signal,
+  });
+  assert.equal(result.status, 'complete');
+  assert.ok(result.thread.some((m) => typeof m.content === 'string' && /rejected/.test(m.content)), 'rejection is visible in the thread');
+});

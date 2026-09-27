@@ -353,6 +353,7 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
   document.getElementById('model-select')?.addEventListener('change',paintCritic);
   paintCritic();
   const toolLabel={read_file:'read file',write_file:'write file',list_dir:'list directory',run_command:'run command',run_tests:'run tests',search_files:'search files',grep_search:'grep search',git:'git',web_search:'web search',web_fetch:'fetch page'};
+  const prettyToolName=(n)=>n&&String(n).startsWith('mcp_')?'mcp · '+String(n).slice(4).split('_').filter(Boolean).join(' / '):(toolLabel[n]||n);
   let agentStream={update:null,count:0};
   function streamAgentTokens(delta){
     if(!delta)return;
@@ -389,13 +390,13 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
     const isNorms=kind==='norms';item.className='agent-terminal-event pending agent-approval';mark.className='agent-event-mark';content.className='agent-event-content';heading.className='agent-event-title';detail.className='agent-event-body';
     mark.textContent='?';
     if(isNorms){heading.textContent=`defer — ${rule||name}`;detail.textContent=`This request may collide with a binding norm. Override to proceed deliberately, or honor the deferral. An override is recorded in norms.log.\n\nRequest: ${typeof args==='object'&&args?args.request||JSON.stringify(args,null,2):args}`}
-    else{heading.textContent=`approve ${toolLabel[name]||name}`;detail.textContent=JSON.stringify(args,null,2)}
+    else{heading.textContent=`approve ${prettyToolName(name)}`;detail.textContent=JSON.stringify(args,null,2)}
     const approve=document.createElement('button'),reject=document.createElement('button');approve.className='plain-btn';reject.className='plain-btn danger';row.style.cssText='display:flex;gap:8px;margin-top:8px';
     if(isNorms){approve.textContent='✓ Override · proceed';approve.style.borderColor='var(--agent-green)';approve.style.color='var(--agent-green)';reject.textContent='Honor defer (do not act)'}
     else{approve.textContent='Approve';approve.style.borderColor='var(--agent-green)';approve.style.color='var(--agent-green)';reject.textContent='Reject'}
     row.append(approve,reject);
     window.__voiceLastApproval={id,approve,reject};
-    approve.onclick=async()=>{try{await json('/api/agent/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({approval_id:id,approved:true})});item.className='agent-terminal-event pending';mark.textContent='✓';if(isNorms){heading.textContent='overrode defer · recorded';detail.textContent='Proceeding as requested. Override logged to norms.log.';row.remove()}else{heading.textContent=`running ${toolLabel[name]||name}…`;detail.textContent=''}resolve(true)}catch{resolve(false)}};
+    approve.onclick=async()=>{try{await json('/api/agent/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({approval_id:id,approved:true})});item.className='agent-terminal-event pending';mark.textContent='✓';if(isNorms){heading.textContent='overrode defer · recorded';detail.textContent='Proceeding as requested. Override logged to norms.log.';row.remove()}else{heading.textContent=`running ${prettyToolName(name)}…`;detail.textContent=''}resolve(true)}catch{resolve(false)}};
     reject.onclick=async()=>{try{await json('/api/agent/approve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({approval_id:id,approved:false})});item.remove();resolve(false)}catch{resolve(false)}};
     content.append(heading,detail,row);item.append(mark,content);messages.append(item);scroll.scrollTop=scroll.scrollHeight;
   })}
@@ -422,9 +423,9 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
     agentStream.update=null;agentReasoning.update=null;
     if(data.type==='started'){finalizer('pending','agent started','');return}
     if(data.type==='thinking'){appendEvent('pending',data.message||`step ${data.iteration} · thinking`);return}
-    if(data.type==='tool_call'){try{agentLoop.toolTrail?.push(String(data.name||''))}catch{}const t=appendEvent('pending',`proposing ${toolLabel[data.name]||data.name}`,JSON.stringify(data.arguments));return}
-    if(data.type==='executing'){appendEvent('pending',data.message||`running ${toolLabel[data.name]||data.name}`);return}
-    if(data.type==='tool_result'){const ok=data.result&&!data.result.error&&!data.result.blocked;appendEvent(ok?'success':'error',`${toolLabel[data.name]||data.name} ${ok?'complete':'returned an issue'}`,JSON.stringify(data.result,null,2).slice(0,4000));return}
+    if(data.type==='tool_call'){try{agentLoop.toolTrail?.push(String(data.name||''))}catch{}const t=appendEvent('pending',`proposing ${prettyToolName(data.name)}`,JSON.stringify(data.arguments));return}
+    if(data.type==='executing'){appendEvent('pending',data.message||`running ${prettyToolName(data.name)}`);return}
+    if(data.type==='tool_result'){const ok=data.result&&!data.result.error&&!data.result.blocked;appendEvent(ok?'success':'error',`${prettyToolName(data.name)} ${ok?'complete':'returned an issue'}`,JSON.stringify(data.result,null,2).slice(0,4000));return}
     if(data.type==='approval_needed'){approveDialog(data.approval_id,data.name,data.arguments,data.kind,data.rule);return}
     if(data.type==='completed'){finalizer('success','agent complete',data.content||'');agentLoop.running=false;return}
     if(data.type==='cancelled'){finalizer('info','agent cancelled');agentLoop.running=false;agentLoop.plan=false;paintMode();return}
@@ -902,6 +903,7 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
   const agentModeValue=()=>{try{const v=localStorage.getItem('local-ai-agent-mode');return v==='plan'||v==='code'?v:'build'}catch{return 'build'}};
   const agentAutonomy=()=>{try{return JSON.parse(localStorage.getItem('local-ai-agent-autonomy'))||'selective'}catch{return 'selective'}};
   const toolLabel={read_file:'read file',write_file:'write file',list_dir:'list directory',run_command:'run command',run_tests:'run tests',search_files:'search files',grep_search:'grep search',git:'git',web_search:'web search',web_fetch:'fetch page'};
+  const prettyToolName=(n)=>n&&String(n).startsWith('mcp_')?'mcp · '+String(n).slice(4).split('_').filter(Boolean).join(' / '):(toolLabel[n]||n);
   const cleanSpeech=text=>String(text||'').replace(/```[\s\S]*?```/g,' code omitted ').replace(/`([^`]+)`/g,'$1').replace(/!\[[^\]]*\]\([^)]*\)/g,'').replace(/\[([^\]]+)\]\([^)]*\)/g,'$1').replace(/^#{1,6}\s+/gm,'').replace(/[*_~>|]/g,' ').replace(/\s+/g,' ').trim();
   const trimFiller=text=>{const t=String(text||'').replace(/^(?:hey|okay|ok|so|um|uh|hmm|alright|right|yeah|no problem)\b[,\s]+/i,'');return t.replace(/\s+/g,' ').trim()};
   function sentenceChunks(text,max=260){const clean=cleanSpeech(trimFiller(text));if(!clean)return[];if(clean.length<=max)return[clean];const out=[],parts=clean.split(/(?<=[.!?;:])\s+/);let buf='';for(const part of parts){if(part.length>max){if(buf)out.push(buf);buf='';for(let i=0;i<part.length;i+=max)out.push(part.slice(i,i+max))}else if(buf&&buf.length+1+part.length>max){out.push(buf);buf=part}else{buf=buf?buf+' '+part:part}}if(buf)out.push(buf);return out}
@@ -1086,7 +1088,7 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
       case 'tool_result':return;
       case 'approval_needed':{
         waiting=false;expectingDecision='approval';
-        const rule=data.kind==='norms'?cleanSpeech(data.rule||data.name||'this request'):(toolLabel[data.name]||data.name||'this step');
+        const rule=data.kind==='norms'?cleanSpeech(data.rule||data.name||'this request'):(prettyToolName(data.name)||'this step');
         queueSpeech(data.kind==='norms'
           ?`Norm check: ${rule}. Say over-ride to proceed, or honor to decline.`
           :`Approve ${rule}? Say yes or no.`,{cut:true});

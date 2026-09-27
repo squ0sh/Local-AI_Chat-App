@@ -8,9 +8,10 @@
 // request-shape assertions. Pure Node http, cross-platform.
 import { createServer } from 'http';
 
-export function startFakeOllama(t, { model = 'fake-llama:3b', chunks } = {}) {
+export function startFakeOllama(t, { model = 'fake-llama:3b', chunks, agentScript } = {}) {
   const tokenChunks = chunks || ['hello', ' ', 'world'];
   const fullReply = tokenChunks.join('');
+  const script = Array.isArray(agentScript) ? [...agentScript] : null;
   const created = Math.floor(Date.now() / 1000);
   const calls = [];
 
@@ -33,6 +34,17 @@ export function startFakeOllama(t, { model = 'fake-llama:3b', chunks } = {}) {
       if (req.method === 'POST') calls.push({ method: req.method, path: req.url, body: parsed });
 
       if (req.method === 'POST' && req.url === '/api/chat') {
+        // Optional agent scripting: an array of strings consumed per request —
+        // each string becomes the assistant's content for that step. Lets an
+        // e2e test drive tool calls through the loop's XML-fallback parser.
+        if (script) {
+          const stepText = script.length ? script.shift() : 'done';
+          res.writeHead(200, { 'Content-Type': 'application/x-ndjson' });
+          res.write(JSON.stringify({ model, created_at: new Date().toISOString(), message: { role: 'assistant', content: stepText }, done: false }) + '\n');
+          res.write(JSON.stringify({ model, created_at: new Date().toISOString(), message: { role: 'assistant', content: '' }, done: true, prompt_eval_count: 2, eval_count: 1, eval_duration: 1e9 }) + '\n');
+          res.end();
+          return;
+        }
         if (parsed && parsed.stream === false) {
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({

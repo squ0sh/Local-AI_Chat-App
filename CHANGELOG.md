@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.12.0 — MCP tools join the agent
+
+- **Registered MCP servers are now agent tools.** Every connected server's
+  tools appear to the local model as `mcp_<server>_<tool>` (names sanitized and
+  capped for model limits), right beside read/write/list/run — far more useful
+  than manual `/mcp` invocations from the terminal.
+- **Universal approval gating, no exceptions.** Every `mcp_*` call pauses on
+  the existing approval card regardless of autonomy mode (supervised, selective,
+  *auto*) — external processes keep host powers, so the human decides every
+  single time. Rejections are narrated back to the model instead of failing the
+  run, and plan mode doesn't surface them at all.
+- **Crash-transparent dispatch.** Calls route through the hardened client's
+  auto-revive: register-name collisions across servers are refused with a `409`
+  at connect time, and agent-side calls land in the same
+  `data/agent/mcp.log` journal as terminal `/mcp` calls (marked `via: 'agent'`).
+- **Proven end to end**: 9 new loop-level + full-HTTP tests drive a register →
+  model tool call → approval card → server tool call sequence and its
+  mirror (rejected call never runs, the rejection is journaled). Suite is at
+  166 passing; 66 browser probes green.
+
 ## 1.11.0 — Deployment story: the Capsule runs itself, and stays portable
 
 - **`tools/service.sh` (Linux + macOS) and `tools/service.cmd` (Windows)** turn

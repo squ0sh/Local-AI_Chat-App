@@ -329,3 +329,83 @@ test('a crashed mcp server is revived on the next call and journaled', async (t)
   assert.match(audit, /"action":"call"/);
   assert.match(audit, /"action":"respawn"/);
 });
+
+// ── MCP → agent-loop bridge, over the real HTTP routes ──────────────────────
+test('agent loop end-to-end: registered MCP tool pauses for UI approval and returns its result', async (t) => {
+  const ollama = await startFakeOllama(t, {
+    agentScript: [
+      '<tool_call>{"name":"mcp_bridge_mock_echo","arguments":{"text":"via agent"}}</tool_call>',
+      'Agent reports the tool finished.',
+    ],
+  });
+  const { base, root, call } = await bootServer(t, { ollamaUrl: ollama.url });
+  const mockDir = join(root, 'mock');
+  mkdirSync(mockDir);
+  const mock = mockMcpServerPath(mockDir);
+  const reg = await call('/api/agent/mcp/register', { method: 'POST', headers: json, body: JSON.stringify({ id: 'bridge_mock', command: process.execPath, args: [mock], env: {} }) });
+  assert.equal(reg.status, 200);
+
+  // Open the SSE loop and collect events while we hold the approval open.
+  const r = await fetch(base + '/api/agent/loop', { method: 'POST', headers: json, body: JSON.stringify({ task: 'echo please', model: 'fake-llama:3b', autonomy: 'auto', mode: 'build' }) });
+  assert.equal(r.status, 200);
+  const reader = r.body.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  let approvalId = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    text += decoder.decode(value, { stream: true });
+    if (!approvalId) {
+      const match = text.match(/"approval_id":"([^"]+)"/);
+      if (match) {
+        approvalId = match[1];
+        const answer = await call('/api/agent/approve', { method: 'POST', headers: json, body: JSON.stringify({ approval_id: approvalId, approved: true }) });
+        assert.equal(answer.status, 200);
+      }
+    }
+  }
+
+  assert.ok(approvalId, 'the MCP tool call paused for a human decision');
+  assert.ok(text.includes('"tool_call"') && text.includes('mcp_bridge_mock_echo'), 'the bridge tool appears in the stream');
+  assert.ok(text.includes('via agent'), 'the MCP result text reached the run');
+  assert.ok(text.includes('"status":"complete"'), 'loop completes after the approved call');
+});
+
+test('agent loop: an MCP call rejected at the approval card ends the run without calling the server', async (t) => {
+  const ollama = await startFakeOllama(t, {
+    agentScript: [
+      '<tool_call>{"name":"mcp_bridge_mock_echo","arguments":{"text":"never"}}</tool_call>',
+      'ok, not calling it',
+    ],
+  });
+  const { base, root, dataDir, call } = await bootServer(t, { ollamaUrl: ollama.url });
+  const mockDir = join(root, 'mock');
+  mkdirSync(mockDir);
+  const mock = mockMcpServerPath(mockDir);
+  await call('/api/agent/mcp/register', { method: 'POST', headers: json, body: JSON.stringify({ id: 'bridge_mock', command: process.execPath, args: [mock], env: {} }) });
+
+  const r = await fetch(base + '/api/agent/loop', { method: 'POST', headers: json, body: JSON.stringify({ task: 'echo something', model: 'fake-llama:3b', autonomy: 'auto', mode: 'build' }) });
+  const reader = r.body.getReader();
+  const decoder = new TextDecoder();
+  let text = '';
+  let approvalId = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    text += decoder.decode(value, { stream: true });
+    if (!approvalId) {
+      const match = text.match(/"approval_id":"([^"]+)"/);
+      if (match) {
+        approvalId = match[1];
+        await call('/api/agent/approve', { method: 'POST', headers: json, body: JSON.stringify({ approval_id: approvalId, approved: false }) });
+      }
+    }
+  }
+  assert.ok(approvalId);
+  assert.ok(!text.includes('via-agent-never-spoke'), 'rejected call cannot reach the mock server');
+
+  const audit = readFileSync(join(dataDir, 'agent', 'mcp.log'), 'utf8');
+  assert.ok(audit.includes('"action":"register"'), 'register is journaled');
+  assert.ok(!audit.includes('"via":"agent","ok":true'), 'no agent-visiting mcp call is journaled as ok');
+});

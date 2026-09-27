@@ -36,7 +36,7 @@ import { RateLimiter, rateLimitResponse } from './lib/rate-limit.mjs';
 import { ChatStore } from './lib/chat-store.mjs';
 import { McpClient, looksSensitiveEnvKey } from './lib/mcp-client.mjs';
 import { UserStore } from './lib/user-store.mjs';
-import { runAgentLoop, globSearch, agentWriteFile, undoChange, listLedger, recordChange, buildOrganizePlan, applyOrganizePlan, webSearch } from './lib/agent-loop.mjs';
+import { runAgentLoop, globSearch, agentWriteFile, undoChange, listLedger, recordChange, buildOrganizePlan, applyOrganizePlan, webSearch, buildMcpToolset, sanitizeMcpToolName } from './lib/agent-loop.mjs';
 import { shouldFreeMemory, otherModelNames } from './lib/memory.mjs';
 import { runMicroBenchmark, loadFitState, saveFitState, recordObservation, recommendFit, FIT_LEVELS } from './lib/fit-engine.mjs';
 
@@ -4221,6 +4221,18 @@ async function handle(req, res) {
       const client = new McpClient({ command, args, env });
       try {
         await client.connect();
+        // The agent loop offers MCP tools as mcp_<client>_<tool>; two servers
+        // offering the same tool name would shadow each other — refuse early.
+        const candidateNames = new Set(client.tools.map((t) => sanitizeMcpToolName(clientId, t.name)));
+        for (const [otherId, other] of mcpClients) {
+          for (const t of other.tools) {
+            if (candidateNames.has(sanitizeMcpToolName(otherId, t.name))) {
+              try { await client.close(); } catch {}
+              mcpAudit('register_refused', { command, reason: 'tool_name_collision', id: clientId, conflicts_with: otherId });
+              return sendJSON(res, 409, { error: 'MCP tool name collision: tool "' + t.name + '" is already offered by server "' + otherId + '". Rename one of them and try again.' });
+            }
+          }
+        }
         mcpClients.set(clientId, client);
         mcpAudit('register', { id: clientId, command, server: client.serverInfo?.name || '', tools: client.tools.length });
         return sendJSON(res, 200, { id: clientId, serverInfo: client.serverInfo, tools: client.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) });
@@ -4417,6 +4429,27 @@ async function handle(req, res) {
         memorySearch: async (query, opts) => (await memorySearch(query, opts)).results,
       };
 
+      // MCP bridge: every registered server offers tools to the model as
+      // mcp_<client>_<tool>; each call routes through mcpAttach so a crashed
+      // server revives transparently, and each call is journaled as an
+      // 'agent'-visiting call in the MCP audit log.
+      const mcpToolset = buildMcpToolset([...mcpClients].map(([id, client]) => ({ id, tools: client.tools })));
+      if (mcpToolset.error) return sendJSON(res, 409, { error: mcpToolset.error });
+      agentHooks.mcpMap = mcpToolset.map;
+      agentHooks.mcpCall = async (target, toolArgs) => {
+        const entry = await mcpAttach(target.client);
+        if (!entry) return { error: 'MCP server "' + target.client + '" was unregistered mid-run' };
+        if (entry.error) return { error: 'MCP server "' + target.client + '" failed to restart: ' + entry.error.message };
+        try {
+          const result = await entry.client.callTool(target.tool, toolArgs);
+          mcpAudit('call', { id: target.client, tool: target.tool, via: 'agent', ok: true, bytes: JSON.stringify(toolArgs).length });
+          return result;
+        } catch (e) {
+          mcpAudit('call', { id: target.client, tool: target.tool, via: 'agent', ok: false, error: e.message });
+          return { error: e.message };
+        }
+      };
+
       // Per-chat conversational memory: continue the saved thread, or seed from
       // recent chat history when this chat has no saved agent context yet.
       const chatId = agentThreadKey(payload.chat_id);
@@ -4511,6 +4544,7 @@ async function handle(req, res) {
           task, model, workspaceRoot: __dirname, autonomy, skillPrompt, readonly,
           initialMessages: savedThread, onEvent, llmCall, signal: controller.signal,
           supportsTools, norms, critic, hooks: agentHooks, memoryNote,
+          mcpTools: mcpToolset.tools,
         });
         loopResult = result;
         if (chatId && Array.isArray(loopResult.thread)) saveAgentThread(chatId, loopResult.thread);

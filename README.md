@@ -275,6 +275,14 @@ MCP registrations are governed because they start real processes:
   and every register/call/unregister/restart is journaled to
   `data/agent/mcp.log`.
 
+**The agent can use them too.** Registered tools appear to the model as
+`mcp_<server>_<tool>` in Build and Code modes; each tool call pauses on an
+approval card showing the server and the raw arguments before anything runs,
+and rejections are explained to the model instead of crashing the run. Plan
+mode never offers them, and a crashed server revives silently before the call
+fails. Two servers that export the same tool name are refused at registration
+with a `409` naming the clash, so the model's tool table never shadows.
+
 Offline behavior packs live inside Agent Mode. Choose **Choose a skill** or use
 `/skills`; the selected pack updates the current chat's system prompt. Skills
 no longer occupy a separate Capsule sidebar entry.
