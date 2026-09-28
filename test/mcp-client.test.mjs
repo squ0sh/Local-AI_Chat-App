@@ -44,53 +44,46 @@ test('McpClient callTool rejects after close', async () => {
   await assert.rejects(() => client.callTool('echo', { text: 'x' }), /closed/i);
 });
 
-test('McpClient does not inherit application secrets', async () => {
-  const path = join(dir, 'mcp-env.cjs');
-  writeFileSync(path, `
-const keepAlive = setInterval(() => {}, 1000);
-let buffer = '';
-process.stdin.setEncoding('utf8');
-process.stdin.on('data', chunk => {
-  buffer += chunk;
-  let index;
-  while ((index = buffer.indexOf('\\n')) !== -1) {
-    const line = buffer.slice(0, index); buffer = buffer.slice(index + 1);
-    if (!line.trim()) continue;
-    const message = JSON.parse(line);
-    if (message.id == null) continue;
-    const result = message.method === 'initialize'
-      ? { protocolVersion: '2024-11-05', capabilities: {}, serverInfo: { name: 'env-check' } }
-      : {};
-    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }) + '\\n');
-  }
-});
-`);
-  const previous = process.env.AUTH_TOKEN;
-  process.env.AUTH_TOKEN = 'must-not-reach-mcp';
-  const client = new McpClient({ command: process.execPath, args: [path], timeout: 500 });
+test('McpClient hardening: child env stays hermetic even if legacy inherit is requested', () => {
+  process.env.LOCAL_AI_TEST_SECRET = 'exists-on-host-only';
   try {
-    await client.connect();
-    assert.equal(client.env.AUTH_TOKEN, undefined);
+    const sealed = new McpClient({ command: 'node', env: { MY_FLAG: '1' } });
+    assert.equal(sealed.env.LOCAL_AI_TEST_SECRET, undefined, 'host env must not leak into MCP children by default');
+    assert.equal(sealed.env.MY_FLAG, '1', 'caller env passes through');
+    assert.ok(sealed.env.PATH, 'PATH survives for command resolution');
+    process.env.CAPSULE_MCP_INHERIT_ENV = '1';
+    const inherited = new McpClient({ command: 'node' });
+    assert.equal(inherited.env.LOCAL_AI_TEST_SECRET, undefined, 'legacy inherit flag cannot expose host secrets');
   } finally {
-    await client.close();
-    if (previous === undefined) delete process.env.AUTH_TOKEN;
-    else process.env.AUTH_TOKEN = previous;
+    delete process.env.CAPSULE_MCP_INHERIT_ENV;
+    delete process.env.LOCAL_AI_TEST_SECRET;
   }
 });
 
-test('McpClient terminates oversized unframed stdout', async () => {
-  const path = join(dir, 'mcp-overflow.cjs');
-  writeFileSync(path, `process.stdout.write('x'.repeat(1_100_000)); setInterval(() => {}, 1000);`);
-  const client = new McpClient({ command: process.execPath, args: [path], timeout: 1000 });
-  await assert.rejects(() => client.connect(), /1 MB|exceeded/i);
+test('McpClient cuts off a server that floods stdout', async () => {
+  const client = new McpClient({ command: process.execPath, args: [serverPath] });
+  await client.connect();
+  const flood = await client.callTool('__flood', {});
+  assert.equal(flood.content[0].text, 'flooding');
+  await assert.rejects(() => client.callTool('echo', { text: 'still there?' }), /flooded stdout past 8 MB/);
+  assert.equal(client._closed, true);
+});
+
+test('McpClient refuses tool results larger than 1 MB', async () => {
+  const client = new McpClient({ command: process.execPath, args: [serverPath] });
+  await client.connect();
+  await assert.rejects(() => client.callTool('__big', {}), /1 MB cap/);
   await client.close();
 });
 
-test('McpClient times out and clears a pending request', async () => {
-  const path = join(dir, 'mcp-timeout.cjs');
-  writeFileSync(path, `process.stdin.resume(); setInterval(() => {}, 1000);`);
-  const client = new McpClient({ command: process.execPath, args: [path], timeout: 50 });
-  await assert.rejects(() => client.connect(), /timeout/i);
-  assert.equal(client.pending.size, 0);
-  await client.close();
+test('McpClient respawns a dead server with the same spec', async () => {
+  const client = new McpClient({ command: process.execPath, args: [serverPath] });
+  await client.connect();
+  await assert.rejects(() => client.callTool('__crash', {}), /exited/i);
+  assert.equal(client._closed, true);
+  const revived = await client.respawn();
+  assert.equal(revived._closed, false);
+  const result = await revived.callTool('echo', { text: 'back again' });
+  assert.equal(result.content[0].text, 'back again');
+  await revived.close();
 });

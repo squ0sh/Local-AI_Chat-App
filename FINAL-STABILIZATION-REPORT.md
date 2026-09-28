@@ -102,8 +102,9 @@ release artifacts remain recommended for stronger provenance.
   oversized arguments, malformed IDs, and wrong methods are rejected.
 - MCP children receive a small environment allowlist instead of the complete
   server environment and API/auth secrets.
-- Request timeouts clear pending state; malformed JSON or more than 1 MiB of
-  unframed stdout terminates the child; close/exit cleanup is deterministic.
+- Request timeouts clear pending state; malformed JSON or more than 8 MiB of
+  unframed stdout terminates the child, while parsed tool results are capped at
+  1 MiB; close/exit cleanup is deterministic.
 
 ### Other failure behavior
 
@@ -165,6 +166,12 @@ Added or expanded tests cover:
 Static syntax checks, whitespace checks, the complete Node test suite, signed
 manifest verification, launcher syntax, and local browser/API smoke checks are
 the release gate for this branch.
+
+The stabilization commit was reconciled with the subsequently published
+v1.15 feature line before merge. The combined release manifest covers 109
+files, and the expanded suite contains 226 tests spanning the original
+stabilization cases plus transport, recovery, telemetry, voice, USB, memory,
+MCP bridge, HTTP security, and service-installation workflows.
 
 ## Known limitations and deferred work
 

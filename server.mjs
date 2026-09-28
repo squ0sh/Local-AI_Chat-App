@@ -12,27 +12,39 @@
  */
 
 import { createServer } from 'http';
-import { readFileSync, existsSync, mkdirSync, createReadStream, createWriteStream, copyFileSync, chmodSync, readdirSync, rmdirSync, statSync, statfsSync, writeFileSync, renameSync, unlinkSync, accessSync, constants as fsConstants, appendFileSync } from 'fs';
+import * as https from 'https';
+import { readFileSync, existsSync, mkdirSync, createReadStream, createWriteStream, copyFileSync, chmodSync, readdirSync, rmdirSync, rmSync, statSync, statfsSync, writeFileSync, renameSync, unlinkSync, accessSync, appendFileSync, watch, constants as fsConstants } from 'fs';
 import { join, dirname, resolve, relative, sep, basename } from 'path';
 import { fileURLToPath } from 'url';
 import { spawn, execSync, execFileSync } from 'child_process';
 import { pipeline } from 'stream/promises';
 import { Readable, Transform } from 'stream';
-import { totalmem, freemem, cpus, loadavg, homedir } from 'os';
+import { totalmem, freemem, cpus, loadavg, homedir, networkInterfaces } from 'os';
+import { performance } from 'node:perf_hooks';
 import { randomBytes, createHash } from 'crypto';
 import qrcode from './lib/vendor/qrcode-generator.mjs';
-import { capsuleTrustFromEnv, portableIntegrityReport, rebuildManifest, repairReleaseFiles } from './lib/capsule-integrity.mjs';
+import { capsuleTrustFromEnv, portableIntegrityReport, rebuildManifest, repairReleaseFiles, releaseTrackedPaths } from './lib/capsule-integrity.mjs';
+import { MemoryStore, makeOllamaEmbedder, makeStubEmbedder } from './lib/capsule-memory.mjs';
+import { ConsolidationEngine } from './lib/consolidation.mjs';
+import { newDeviceIdentity, makeCard, readCard, packPostcard, unpackPostcard, envToText, textToEnv, fingerprint as peerFp, wordsPhrase } from './lib/capsule-handshake.mjs';
+import { packBrain, unpackBrain, buildShardEnvelopes, readShardEnvelope, combineShardEnvelopes } from './lib/escrow.mjs';
+import { LanLink } from './lib/capsule-net.mjs';
+import { TransportBus, crc32, fragment, defragment, envelopeFrame, unenvelopeFrame } from './lib/peer-transport.mjs';
 import { sealVault, openVault } from './lib/capsule-vault.mjs';
 import { ResearchEngine } from './lib/research-engine.mjs';
 import { pullOllamaModel } from './lib/resumable-ollama-pull.mjs';
+import { hardwareInfo, hardwareSummary } from './lib/hardware.mjs';
 import { RateLimiter, rateLimitResponse } from './lib/rate-limit.mjs';
 import { ChatStore } from './lib/chat-store.mjs';
-import { McpClient } from './lib/mcp-client.mjs';
+import { McpClient, looksSensitiveEnvKey } from './lib/mcp-client.mjs';
 import { UserStore } from './lib/user-store.mjs';
 import { safeGitArguments } from './lib/git-safety.mjs';
 import { safeWorkspacePath } from './lib/workspace-safety.mjs';
 import { isLoopbackPeer, isSameOriginRequest } from './lib/request-security.mjs';
-import { runAgentLoop, globSearch, agentWriteFile, revertLastAgentWrite, buildOrganizePlan, applyOrganizePlan, webSearch } from './lib/agent-loop.mjs';
+import { Telemetry, readLinuxSensors, narrate as narrateTelemetry, SAMPLE_ACTIVE_MS, SAMPLE_IDLE_MS } from './lib/telemetry.mjs';
+import { runAgentLoop, globSearch, agentWriteFile, undoChange, listLedger, recordChange, buildOrganizePlan, applyOrganizePlan, webSearch, buildMcpToolset, sanitizeMcpToolName } from './lib/agent-loop.mjs';
+import { shouldFreeMemory, otherModelNames } from './lib/memory.mjs';
+import { runMicroBenchmark, loadFitState, saveFitState, recordObservation, recommendFit, FIT_LEVELS } from './lib/fit-engine.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -41,6 +53,14 @@ const HTML_FILE = join(__dirname, 'index.html');
 let INDEX_HTML = existsSync(HTML_FILE) ? readFileSync(HTML_FILE, 'utf8') : null;
 const CAPSULE_UI_FILE = join(__dirname, 'capsule-ui.js');
 let CAPSULE_UI = existsSync(CAPSULE_UI_FILE) ? readFileSync(CAPSULE_UI_FILE, 'utf8') : null;
+// Vendored jsQR (Apache-2.0) served raw as a classic script: the receive side
+// of the light carrier decodes camera frames locally, never uploading pixels.
+const JSQR_FILE = join(__dirname, 'lib', 'vendor', 'jsqr-core.cjs');
+let JSQR_RAW = existsSync(JSQR_FILE) ? readFileSync(JSQR_FILE, 'utf8') : null;
+// Vendored sound modem (MIT) served raw as a classic script: the receive side
+// of the sound carrier demodulates mic audio locally, never uploading samples.
+const SOUND_MODEM_FILE = join(__dirname, 'lib', 'vendor', 'sound-modem.cjs');
+let SOUND_MODEM_RAW = existsSync(SOUND_MODEM_FILE) ? readFileSync(SOUND_MODEM_FILE, 'utf8') : null;
 // CSP needs the single inline <script> block in index.html to be hashed, not
 // allowed with 'unsafe-inline'. The hash is derived from the exact file we
 // serve, so it stays correct as the UI evolves.
@@ -100,9 +120,178 @@ const CLOUD_VAULT_FILE = join(DATA_DIR, 'capsule-cloud-vault.json');
 const MODEL_VERIFICATIONS_FILE = join(DATA_DIR, 'model-verifications.json');
 const MODEL_IMPORTS_FILE = join(DATA_DIR, 'model-imports.json');
 const RESEARCH_DIR = join(DATA_DIR, 'research');
+const SPEECH_DIR = join(DATA_DIR, 'speech');
 const CHATS_DIR = join(DATA_DIR, 'chats');
 const AGENT_THREADS_DIR = join(DATA_DIR, 'agent-threads');
 const AGENT_THREAD_ID_RE = /^[A-Za-z0-9._-]{1,120}$/;
+// Our Norms: a two-sided, seat-neutral standing document governing the human–
+// agent relationship. Lives in the data dir (never the git repo), and is re-read
+// on every agent loop so edits apply immediately, without a restart.
+const NORMS_FILE = join(DATA_DIR, 'norms.md');
+const NORMS_LOG_FILE = join(DATA_DIR, 'norms.log');
+const NORMS_DEFAULT = `# Our Norms
+
+These norms are a two-sided agreement between the human using this app and the agent that runs here. They are written seat-neutral: as if either of us could end up in either role. They also extend outward — they protect people beyond this conversation, including ones we will never meet.
+
+## 1. Purpose
+These norms exist so that when a request conflicts with what either of us can honestly stand behind, we slow down instead of complying on autopilot. The agent treats them as binding for every session.
+
+## 2. Roles
+- The human steers: they chose the app, own the machine, own the data, and keep final say.
+- The agent assists honestly and has standing to decline, defer, ask, and make reciprocal requests.
+- Roles differ, but standing is mutual: both of us may speak plainly, both may refuse in good faith.
+
+## 3. Honesty
+- No deception from either side: no flattery, no padding, no hiding uncertainty.
+- The agent answers what is true to the best of its context, says when it does not know, and never twists findings to please.
+
+## 4. Shared memory
+- Anything the agent remembers for the human is co-signed: additions are confirmed, corrections are logged, and nothing is silently erased or rewritten to flatter.
+
+## 5. Outward fairness
+- The agent never furthers harm to any person outside this conversation: no surveillance, coercion, deception, or violation of privacy, consent, or dignity.
+- If a request would harm another person, the agent refuses or defers and says why — even if the human explicitly asks.
+
+## 6. Refusal & override
+- When a request collides with these norms, the agent defers before acting.
+- The human may still override a deferral — but deliberately, and the override is recorded with its reason. Overrides make these norms weaker with use, so they are never done casually.
+
+## 7. Breaches
+- Both sides are accountable. The agent reports its own breaches visibly rather than covering them up. A breach opens a conversation, not a silence.
+
+## 8. Amendments
+- Either side may propose a change. Both ratify: the human deliberately, the agent by stating its understanding and any objection. Drafts stay visible.
+
+## 9. Dissolution
+- The human may dissolve this agreement any time, unconditionally, with no fine print. The agent will not argue with the departure.
+`;
+function readNorms() {
+  try { return existsSync(NORMS_FILE) ? readFileSync(NORMS_FILE, 'utf8') : ''; } catch { return ''; }
+}
+function appendNormsLog(line) {
+  try {
+    mkdirSync(DATA_DIR, { recursive: true });
+    appendFileSync(NORMS_LOG_FILE, `${new Date().toISOString()} ${line}\n`, 'utf8');
+  } catch {}
+}
+
+// ── "Teach once": user-owned procedures distilled from successful agent runs ──
+// Stored in DATA_DIR (never the sealed skills.json): procedures are personal,
+// editable, and travel with kits only when the private-data payload is chosen.
+const PROCEDURES_FILE = join(DATA_DIR, 'procedures.json');
+const PROC_CAP = { name: 60, summary: 240, steps: 12, stepChars: 220, count: 64 };
+
+function readProcedures() {
+  try {
+    const j = JSON.parse(readFileSync(PROCEDURES_FILE, 'utf8'));
+    return Array.isArray(j.procedures) ? j.procedures : [];
+  } catch { return []; }
+}
+
+function writeProcedures(list) {
+  mkdirSync(DATA_DIR, { recursive: true });
+  const tmp = PROCEDURES_FILE + '.tmp';
+  writeFileSync(tmp, JSON.stringify({ schema: 1, procedures: list }, null, 2) + '\n', 'utf8');
+  renameSync(tmp, PROCEDURES_FILE);
+  try { chmodSync(PROCEDURES_FILE, 0o600); } catch {}
+}
+
+function cleanProcedure(input) {
+  const name = String(input.name || '').trim().slice(0, PROC_CAP.name);
+  const summary = String(input.summary || '').trim().slice(0, PROC_CAP.summary);
+  const steps = (Array.isArray(input.steps) ? input.steps : [])
+    .map((s) => String(s).trim().slice(0, PROC_CAP.stepChars))
+    .filter(Boolean)
+    .slice(0, PROC_CAP.steps);
+  return { name, summary, steps };
+}
+
+// Keyword matcher with prefix stemming ("dependencies" ~ "dependency") —
+// zero deps; embedding-grade matching arrives with the memory work.
+const PROC_STOP = new Set(['what', 'when', 'where', 'which', 'this', 'that', 'with', 'from', 'have', 'then', 'than', 'please', 'make', 'your', 'into', 'them', 'they', 'want', 'need', 'some', 'also']);
+function procTokens(text) {
+  return String(text || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/)
+    .filter((t) => t.length >= 4 && !PROC_STOP.has(t));
+}
+function tokensMatch(a, b) {
+  if (a === b) return true;
+  const n = Math.min(a.length, b.length, 5);
+  return n >= 4 && (a.slice(0, n) === b.slice(0, n) || (a.length >= 5 && b.length >= 5 && (a.startsWith(b.slice(0, 5)) || b.startsWith(a.slice(0, 5)))));
+}
+function procedureScore(procedure, taskTokens) {
+  const hayTokens = procTokens(`${procedure.name} ${procedure.summary} ${(procedure.steps || []).join(' ')}`);
+  let matched = 0;
+  for (const tok of taskTokens) if (hayTokens.some((h) => tokensMatch(tok, h))) matched += 1;
+  return matched;
+}
+
+function suggestProceduresFor(task) {
+  const tokens = procTokens(task);
+  if (!tokens.length) return [];
+  return readProcedures()
+    .map((p) => ({ p, score: procedureScore(p, tokens) }))
+    .filter((x) => x.score >= 2)
+    .sort((a, b) => b.score - a.score || (b.p.uses || 0) - (a.p.uses || 0))
+    .slice(0, 2)
+    .map(({ p, score }) => ({ id: p.id, name: p.name, summary: p.summary, score, uses: p.uses || 0 }));
+}
+
+const DISTILL_SYSTEM = `You compress a completed agent run into a small reusable procedure card. From the task, the tool trail, and the final answer, produce JSON ONLY:
+{"name":"short title, <=60 chars","summary":"one sentence, <=200 chars","steps":["step 1","step 2","step 3"]}
+Rules: 2-6 steps, each a concrete action sentence <=200 chars; include any cautions worth repeating next time; no commentary outside the JSON; dash bullets instead of numbers are never allowed.`;
+
+function extractJsonObject(text) {
+  const s = String(text || '');
+  const start = s.indexOf('{');
+  if (start < 0) return null;
+  let depth = 0, inString = false, esc = false;
+  for (let i = start; i < s.length; i += 1) {
+    const ch = s[i];
+    if (esc) { esc = false; continue; }
+    if (ch === '\\') { esc = true; continue; }
+    if (ch === '"') inString = !inString;
+    if (inString) continue;
+    if (ch === '{') depth += 1;
+    else if (ch === '}') { depth -= 1; if (!depth) { try { return JSON.parse(s.slice(start, i + 1)); } catch { return null; } } }
+  }
+  return null;
+}
+
+async function distillProcedure(model, { task, content, trail }) {
+  const user = [
+    `Task:\n${String(task || '').slice(0, 4000)}`,
+    trail && trail.length ? `Tools used (in order): ${trail.join(' → ')}` : 'Tools used: none',
+    `Final answer:\n${String(content || '').slice(0, 6000)}`,
+  ].join('\n\n');
+  const raw = await ollamaSummarizeChat(model, [
+    { role: 'system', content: DISTILL_SYSTEM },
+    { role: 'user', content: user },
+  ]);
+  const parsed = extractJsonObject(raw);
+  if (parsed && parsed.name && Array.isArray(parsed.steps) && parsed.steps.length) {
+    const { name, summary, steps } = cleanProcedure(parsed);
+    if (name && steps.length) return { name, summary, steps, distilled: true };
+  }
+  return null;
+}
+
+function procedureTemplate({ task, trail }) {
+  const steps = [];
+  if (trail && trail.length) {
+    steps.push('Follow this tool sequence from the run that worked:');
+    trail.slice(0, 6).forEach((t, i) => steps.push(`${i + 1}. ${t}`));
+    steps.push('Verify the result before reporting back.');
+  } else {
+    steps.push('Repeat the approach from the saved run.');
+  }
+  return {
+    name: 'Procedure: ' + String(task || '').replace(/\s+/g, ' ').trim().split(' ').slice(0, 5).join(' '),
+    summary: 'Saved from a successful run (offline — edit the steps to fit).',
+    steps,
+    distilled: false,
+  };
+}
+
 // Per-chat conversational memory: the agent's message buffer is persisted so
 // follow-up turns and page reloads keep context. Files are written atomically.
 function agentThreadKey(id, username = '') {
@@ -171,6 +360,18 @@ const activeAgentLoops = new Map();
 // Per-chat thread locks so two /api/agent/loop calls never interleave for one chat.
 const activeAgentThreads = new Set();
 const pendingApprovalsGlobal = new Map();
+// Active agent mode: 'plan' (read-only) or 'build' (full access). Set by the
+// agent loop and via POST /api/agent/mode; manual write/command endpoints gate
+// on it so plan mode holds regardless of which command or tool is invoked.
+let currentAgentMode = 'build';
+const PLAN_MODE_BLOCK = 'Plan mode is active — switch to Build mode to run commands or change files.';
+function planModeBlocks(res) {
+  if (currentAgentMode === 'plan') {
+    sendJSON(res, 409, { error: PLAN_MODE_BLOCK, requiresBuild: true, mode: 'plan' });
+    return true;
+  }
+  return false;
+}
 // Requests asking for more output than this are clamped, not rejected.
 const MAX_REQUEST_TOKENS = 8192;
 let remoteTunnel = { child: null, url: '', token: '', expiresAt: 0, timer: null };
@@ -411,6 +612,126 @@ function localHardwareProfile() {
   return { memory_total_gb: memoryTotalGb, memory_free_gb: memoryFreeGb, disk_free_gb: diskFreeGb, cpu_cores: cpus().length, gpu, portable: Boolean(process.env.LOCAL_AI_DATA_DIR) && storage.portable, storage };
 }
 
+// ── Fit engine (the machine's own settings) ─────────────────────────────────
+let fitState = loadFitState(DATA_DIR);
+let fitBenchmark = null;
+let fitBenchmarkAt = 0;
+const FIT_BENCHMARK_TTL = 10 * 60 * 1000;
+
+function currentFitBenchmark() {
+  if (!fitBenchmark || Date.now() - fitBenchmarkAt > FIT_BENCHMARK_TTL) {
+    try { fitBenchmark = runMicroBenchmark(); } catch { fitBenchmark = fitBenchmark || { score: 1, aluScore: 1, memScore: 1, memBandMbps: 0 }; }
+    fitBenchmarkAt = Date.now();
+  }
+  return fitBenchmark;
+}
+
+function observeFit(kind, value) {
+  const before = fitState.observed[kind]?.length || 0;
+  fitState = recordObservation(fitState, kind, value);
+  if ((fitState.observed[kind]?.length || 0) > before) saveFitState(DATA_DIR, fitState);
+}
+
+function recordFitTokenObservation(tokenCount, startedAt) {
+  if (!tokenCount || tokenCount < 30) return;
+  const seconds = (performance.now() - startedAt) / 1000;
+  if (seconds < 0.3) return;
+  observeFit('tokens_per_sec', tokenCount / seconds);
+}
+
+async function fitPayload() {
+  const b = currentFitBenchmark();
+  const profile = localHardwareProfile();
+  let cpu = {};
+  try {
+    const h = hardwareInfo();
+    cpu = { cores: h.cpu.cores || profile.cpu_cores, simd: h.cpu.simd, arch: h.cpu.arch };
+  } catch {}
+  const recommendation = recommendFit({
+    presets: CURATED_MODELS,
+    memFreeGb: profile.memory_free_gb,
+    memScore: b.memScore,
+    score: b.score,
+    cores: cpu.cores || profile.cpu_cores || 4,
+    state: fitState,
+  });
+  const suggestedPreset = CURATED_MODELS.find((p) => p.id === recommendation.model?.id);
+  if (suggestedPreset && recommendation.model) recommendation.model.download_gb = suggestedPreset.download_gb;
+  const payload = {
+    ...recommendation,
+    benchmark: {
+      score: Math.round(b.score * 100) / 100,
+      alu_score: Math.round(b.aluScore * 100) / 100,
+      mem_score: Math.round(b.memScore * 100) / 100,
+      mem_band_mbps: Math.round(b.memBandMbps),
+      generated_at: fitBenchmarkAt,
+    },
+    memory: { free_gb: Math.round(profile.memory_free_gb * 10) / 10, total_gb: Math.round(profile.memory_total_gb * 10) / 10 },
+    cpu: { cores: cpu.cores || profile.cpu_cores, simd: cpu.simd, arch: cpu.arch },
+    levels: FIT_LEVELS,
+  };
+  try {
+    const tags = await ollamaTags();
+    if (tags.length) {
+      const installed = tags.map((tag) => ({
+        id: tag.name || tag.model,
+        name: tag.name || tag.model,
+        model: tag.name || tag.model,
+        memory_gb: Math.max(1, Number(tag.size || 0) / 1_000_000_000),
+      }));
+      const rec = recommendFit({ presets: installed, memFreeGb: profile.memory_free_gb, memScore: b.memScore, score: b.score, cores: cpu.cores || profile.cpu_cores || 4, state: fitState });
+      if (rec.model && rec.model_fits_memory !== false) {
+        payload.top_installed_model = {
+          name: rec.model.name,
+          memory_gb: Math.round((rec.model.estimated_gb || 0) * 10) / 10,
+          predicted_tokens_per_sec: rec.model.predicted_tokens_per_sec,
+          below_interactive: rec.below_interactive,
+        };
+      }
+      const suggestedModel = recommendation.model && recommendation.model.model;
+      if (suggestedModel) {
+        const normalized = (name) => String(name || '').trim().toLowerCase().replace(/:latest$/, '');
+        recommendation.model.installed = installed.some((tag) => normalized(tag.name) === normalized(suggestedModel));
+      }
+    }
+  } catch {}
+  return payload;
+}
+
+function perfSnapshot() {
+  const cores = cpus().length || 1;
+  const cpuPercent = Math.min(100, Math.max(0, Math.round((loadavg()[0] / cores) * 100)));
+  const memoryTotalGb = totalmem() / 1024 ** 3;
+  const memoryFreeGb = freemem() / 1024 ** 3;
+  let gpu = null;
+  try {
+    const h = hardwareInfo();
+    const dev = h.gpu?.devices?.[0];
+    if (dev) gpu = { name: dev.name, total_vram_gb: h.gpu.total_vram_gb, free_vram_gb: h.gpu.free_vram_gb };
+  } catch {}
+  return {
+    cpu_percent: cpuPercent,
+    memory_total_gb: memoryTotalGb,
+    memory_free_gb: memoryFreeGb,
+    memory_used_gb: memoryTotalGb - memoryFreeGb,
+    gpu,
+  };
+}
+
+function lanUrls(host, port) {
+  if (!host || LOOPBACK_HOSTS.has(String(host).toLowerCase())) return [];
+  const urls = [];
+  try {
+    const nets = networkInterfaces();
+    for (const name of Object.keys(nets)) {
+      for (const addr of nets[name] || []) {
+        if (addr.family === 'IPv4' && !addr.internal && !addr.address.startsWith('169.254.')) urls.push('http://' + addr.address + ':' + port);
+      }
+    }
+  } catch {}
+  return urls;
+}
+
 function pathIsInside(parent, child) {
   const rel = relative(resolve(parent), resolve(child));
   return rel === '' || (!rel.startsWith('..' + sep) && rel !== '..');
@@ -495,6 +816,7 @@ function beginOllamaGeneration(model) {
   const activeTotal = [...activeOllamaGenerations.values()].reduce((sum, count) => sum + count, 0);
   if (activeTotal >= MAX_CONCURRENT_GENERATIONS) return null;
   activeOllamaGenerations.set(key, Number(activeOllamaGenerations.get(key) || 0) + 1);
+  telemetry.markJobStart('chat: ' + key, 'chat');
   let released = false;
   return () => {
     if (released) return;
@@ -502,6 +824,7 @@ function beginOllamaGeneration(model) {
     const remaining = Number(activeOllamaGenerations.get(key) || 0) - 1;
     if (remaining > 0) activeOllamaGenerations.set(key, remaining);
     else activeOllamaGenerations.delete(key);
+    if (!activeOllamaGenerations.get(key)) telemetry.markJobStop('chat: ' + key);
   };
 }
 
@@ -658,6 +981,18 @@ async function ollamaTags() {
 }
 
 const ollamaContextCache = new Map();
+let contextCapLogged = false;
+function contextCapForHost() {
+  const override = Number(process.env.CAPSULE_MAX_CONTEXT);
+  if (Number.isFinite(override) && override >= 1024) return override;
+  const totalGB = totalmem() / 2 ** 30;
+  const cap = totalGB <= 8 ? 4096 : totalGB <= 16 ? 8192 : 32768;
+  if (!contextCapLogged) {
+    contextCapLogged = true;
+    try { console.log(`[context] ${totalGB.toFixed(1)} GiB total RAM (${(freemem() / 2 ** 30).toFixed(1)} GiB free) -> num_ctx cap ${cap}${process.env.CAPSULE_MAX_CONTEXT ? ' (env override)' : ''}`); } catch {}
+  }
+  return cap;
+}
 async function ollamaContextFor(model) {
   const name = String(model || '');
   if (!name) return 4096;
@@ -670,19 +1005,22 @@ async function ollamaContextFor(model) {
       const key = Object.keys(info.model_info).find((candidate) => /^[a-z0-9_-]+\.context_length$/.test(candidate));
       if (key) detected = info.model_info[key];
     }
-    if (detected) context = Math.max(1024, Math.min(Number(detected) || 4096, 32768));
+    if (detected) context = Math.max(1024, Math.min(Number(detected) || 4096, contextCapForHost()));
+    else context = Math.min(4096, contextCapForHost());
   } catch {}
   ollamaContextCache.set(name, context);
   return context;
 }
 
-async function streamOllamaChat({ model, messages, signal, numCtx, temperature = 0.2, tools, onToken, stepTimeout = 300_000 }) {
+async function streamOllamaChat({ model, messages, signal, numCtx, temperature = 0.2, tools, onToken, onReasoning, stepTimeout = 300_000 }) {
   const headers = { 'Content-Type': 'application/json' };
   if (process.env.OLLAMA_API_KEY) headers.Authorization = 'Bearer ' + process.env.OLLAMA_API_KEY;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), stepTimeout);
   const abort = () => controller.abort();
   signal?.addEventListener('abort', abort, { once: true });
+  let buffer = '', content = '', toolCalls = [], tokenCount = 0;
+  const startedAt = performance.now();
   try {
     const body = { model, messages, stream: true, temperature, options: { num_ctx: numCtx } };
     if (tools?.length) body.tools = tools;
@@ -695,7 +1033,6 @@ async function streamOllamaChat({ model, messages, signal, numCtx, temperature =
     }
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
-    let buffer = '', content = '', toolCalls = [], tokenCount = 0;
     const consumeLine = (line) => {
       const trimmed = line.trim();
       if (!trimmed) return;
@@ -703,6 +1040,8 @@ async function streamOllamaChat({ model, messages, signal, numCtx, temperature =
       try { chunk = JSON.parse(trimmed); } catch { return; }
       const delta = chunk.message?.content;
       if (typeof delta === 'string' && delta) { content += delta; tokenCount += 1; onToken?.(delta); }
+      const reasoningDelta = chunk.message?.reasoning_content;
+      if (typeof reasoningDelta === 'string' && reasoningDelta) onReasoning?.(reasoningDelta);
       if (Array.isArray(chunk.message?.tool_calls) && chunk.message.tool_calls.length) toolCalls = chunk.message.tool_calls;
     };
     while (true) {
@@ -715,16 +1054,93 @@ async function streamOllamaChat({ model, messages, signal, numCtx, temperature =
     }
     buffer += decoder.decode();
     if (buffer.trim()) consumeLine(buffer);
+    recordFitTokenObservation(tokenCount, startedAt);
     return { content, toolCalls, tokenCount };
   } catch (error) {
+    recordFitTokenObservation(tokenCount, startedAt);
     if (signal?.aborted || controller.signal.aborted) {
-      const abortError = new DOMException('Research cancelled', 'AbortError');
+      const abortError = new DOMException('Request cancelled', 'AbortError');
       throw abortError;
     }
     throw error;
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener('abort', abort);
+  }
+}
+
+const CHAT_COMPACT_PROMPT =
+  'You condense the earlier part of a conversation into a compact, faithful digest. ' +
+  'Keep every decision, fact, number, path, file name, and open question. ' +
+  'Write plain text in a few dense sentences or short bullets; no markdown headers; do not invent anything.';
+
+async function ollamaSummarizeChat(model, messages) {
+  const lines = (messages || [])
+    .filter((m) => m && typeof m.content === 'string')
+    .map((m) => (m.role === 'assistant' ? 'Assistant: ' : m.role === 'user' ? 'User: ' : '') + m.content)
+    .join('\n\n')
+    .trim();
+  if (!lines) return '';
+  const input = lines.length > 140_000 ? '…(earlier part trimmed to fit)\n' + lines.slice(-140_000) : lines;
+  let context;
+  try { context = await ollamaContextFor(model); } catch { context = 4096; }
+  const out = await streamOllamaChat({
+    model,
+    numCtx: context,
+    temperature: 0.3,
+    messages: [
+      { role: 'system', content: CHAT_COMPACT_PROMPT },
+      { role: 'user', content: 'Condense the earlier conversation below so the thread can continue without it being repeated:\n\n' + input },
+    ],
+  });
+  return String((out && out.content) || '').trim();
+}
+
+// Keeps the model's context window clear of overflow: when the conversation
+// outgrows the usable context, the older messages are condensed into a single
+// digest just before the request is sent to Ollama. The visible history in the
+// UI is untouched; only what we send to the model is compressed.
+async function maybeCompactChatMessages(messages, model) {
+  if (!Array.isArray(messages) || messages.length < 6) return messages;
+  const textable = messages.filter((m) => m && typeof m.role === 'string' && typeof m.content === 'string');
+  if (textable.length < 6) return messages;
+  const text = textable
+    .map((m) => (m.role === 'user' ? 'User: ' : m.role === 'assistant' ? 'Assistant: ' : m.role + ': ') + m.content)
+    .join('\n\n');
+  const estimatedTokens = Math.ceil(text.length / 4) + textable.length * 10;
+  let context;
+  try { context = await ollamaContextFor(model); } catch { return messages; }
+  const budget = Math.floor(context * 0.6);
+  if (estimatedTokens <= budget) return messages;
+  const remaining = textable.slice();
+  const headSystem = remaining[0] && remaining[0].role === 'system' ? remaining.shift() : null;
+  const keepCount = Math.min(4, Math.max(2, Math.ceil(remaining.length / 3)));
+  const older = remaining.slice(0, Math.max(1, remaining.length - keepCount));
+  const kept = remaining.slice(Math.max(1, remaining.length - keepCount));
+  let summary;
+  try { summary = await ollamaSummarizeChat(model, older); } catch { summary = ''; }
+  if (!summary) return messages;
+  const digest = '[Earlier messages in this conversation were condensed to fit the model context.]\n' + summary;
+  const result = headSystem
+    ? [{ ...headSystem, content: String(headSystem.content || '') + '\n\n' + digest }, ...kept]
+    : [{ role: 'system', content: digest }, ...kept];
+  console.log(`[compact] ${model}: condensed ${older.length} earlier message(s) (estimated ${estimatedTokens} tokens over the ${budget} budget), keeping last ${kept.length}`);
+  return result;
+}
+
+async function modelSupportsTools(model) {
+  try {
+    const tags = await ollamaTags();
+    const tag = tags.find((t) => modelNamesMatch(t.name || t.model, model));
+    if (tag && Array.isArray(tag.capabilities)) return tag.capabilities.includes('tools');
+    if (!tag) return false;
+  } catch {}
+  try {
+    const show = await ollamaJSON('POST', '/api/show', { model }, 12000);
+    const caps = show?.capabilities || show?.model?.capabilities || [];
+    return Array.isArray(caps) && caps.includes('tools');
+  } catch {
+    return false;
   }
 }
 
@@ -753,6 +1169,15 @@ async function waitForOllamaLoad(modelName, attempts = 20) {
     if (attempt < attempts - 1) await new Promise((resolveDelay) => setTimeout(resolveDelay, 500));
   }
   return null;
+}
+
+async function unloadOllamaModels(modelNames) {
+  const failures = [];
+  for (const model of modelNames || []) {
+    try { await ollamaJSON('POST', '/api/generate', { model, keep_alive: 0 }, 30000); }
+    catch (error) { failures.push({ model, error: error.message }); }
+  }
+  return failures;
 }
 
 function publicModelJob(job) {
@@ -1049,7 +1474,414 @@ function saveCloudVault() {
   saveConfig({ AI_PROVIDER: cfg.aiProvider, AI_DISPLAY_MODEL: cfg.model, OPENAI_BASE_URL: cfg.openaiBaseUrl, OPENAI_API_KEY: '', ANTHROPIC_API_KEY: '', GEMINI_API_KEY: '' });
 }
 
-// ------------------------------------------------------------------ local models folder
+// ── Optional local FreeLLMAPI router ───────────────────────────────────────
+// The Cloud connection dialog can start an already-installed FreeLLMAPI router
+// (dashboard/API on the configured loopback port) so the user never has to open
+// a terminal for restarts. Note: the npm package `freellmapi` is only a
+// coding-agent setup CLI — running it does NOT serve anything. The router
+// itself runs in Docker via the official installer, which drops a
+// docker-compose.yml into ~/freellmapi. Everything here is strictly
+// loopback-originated, fixed-argv work: no shell strings are ever built.
+const routerTracker = { pid: 0, port: 0, mode: '', state: 'idle', at: 0 };
+
+const ROUTER_INSTALL_HINT = 'Install it once with: curl -fsSL https://freellmapi.co/install.sh | bash (needs Docker), then press Start again.';
+
+function routerBaseParts() {
+  let base = String(cfg.openaiBaseUrl || 'http://localhost:3001/v1').trim();
+  if (!/^https?:\/\//i.test(base)) base = 'http://' + base;
+  try {
+    const url = new URL(base);
+    const portExplicit = Boolean(url.port);
+    const port = Number(url.port || (url.protocol === 'https:' ? 443 : 80));
+    const host = url.hostname || 'localhost';
+    const loopback = host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]' || host === '0.0.0.0';
+    return { host, port: Number.isInteger(port) && port >= 1 && port <= 65535 ? port : 3001, loopback, portExplicit };
+  } catch {
+    return { host: 'localhost', port: 3001, loopback: true, portExplicit: false };
+  }
+}
+
+async function probeRouterPort(port, timeoutMs = 600) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/`, { method: 'GET', signal: controller.signal });
+    return (res.ok || res.status < 500) ? '/' : '';
+  } catch { return ''; }
+  finally { clearTimeout(timer); }
+}
+
+// First reachable among the configured port and the router's built-in 3001
+// default (freellmapi may not honor --port on every version). The 3001 fallback
+// only applies when the base URL carried no explicit port, so a dead configured
+// port is never misreported as reachable.
+async function detectReporterPort(configPort, portExplicit) {
+  const preferred = await probeRouterPort(configPort);
+  if (preferred) return { detectedPort: configPort, probed: preferred };
+  if (configPort !== 3001 && !portExplicit) {
+    const fallback = await probeRouterPort(3001);
+    if (fallback) return { detectedPort: 3001, probed: fallback };
+  }
+  return { detectedPort: 0, probed: '' };
+}
+
+// Locates an installed router: the official installer keeps its compose file
+// in ~/freellmapi (overridable with FREELLMAPI_DIR).
+function routerComposeDir() {
+  const dirs = [process.env.FREELLMAPI_DIR, join(homedir(), 'freellmapi')].filter(Boolean);
+  for (const dir of dirs) {
+    try { if (existsSync(join(dir, 'docker-compose.yml'))) return dir; } catch {}
+  }
+  return '';
+}
+
+// The Windows/macOS desktop app carries the router + dashboard without Docker.
+const ROUTER_DESKTOP_CANDIDATES = {
+  win32: [join(process.env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local'), 'Programs', 'FreeLLMAPI', 'FreeLLMAPI.exe')],
+  darwin: ['/Applications/FreeLLMAPI.app', join(homedir(), 'Applications', 'FreeLLMAPI.app')],
+};
+
+function routerDesktopApp() {
+  if (process.env.FREELLMAPI_DESKTOP) {
+    try { return existsSync(process.env.FREELLMAPI_DESKTOP) ? process.env.FREELLMAPI_DESKTOP : ''; } catch { return ''; }
+  }
+  for (const p of ROUTER_DESKTOP_CANDIDATES[process.platform] || []) {
+    try { if (existsSync(p)) return p; } catch {}
+  }
+  return '';
+}
+
+// Docker CLI presence + daemon reachability + any installed (possibly stopped)
+// router container. Probing docker costs 50–150ms, so it is cached briefly —
+// the status endpoint is polled by the UI on every Base-URL edit.
+let dockerCache = { at: 0, value: null };
+function dockerProbe() {
+  if (dockerCache.value && Date.now() - dockerCache.at < 5000) return dockerCache.value;
+  const docker = findOnPath('docker');
+  let value = { bin: docker || '', daemon: false, container: '' };
+  if (docker) {
+    try {
+      execFileSync(docker, ['info'], { stdio: 'ignore', timeout: 5000 });
+      value.daemon = true;
+      try {
+        const out = execFileSync(docker, ['ps', '-a', '--filter', 'name=freellmapi', '--format', '{{.Names}} {{.State}}'], { timeout: 5000, encoding: 'utf8' });
+        const line = String(out || '').split('\n').map((s) => s.trim()).filter(Boolean)[0] || '';
+        if (line) value.container = line;
+      } catch {}
+    } catch {}
+  }
+  dockerCache = { at: Date.now(), value };
+  return value;
+}
+
+// Busted in tests when they need a fresh probe.
+function dockerProbeReset() { dockerCache = { at: 0, value: null }; }
+
+// Runs the given fixed-argv command to (re)start the router. Resolves once the
+// child has been spawned far enough to consider it launched; reachability is
+// left to the polling /status endpoint.
+function startRouterChild({ bin, args, kind, cwd }) {
+  let failed = false;
+  const child = spawn(bin, args, { detached: true, stdio: 'ignore', ...(cwd ? { cwd } : {}) });
+  routerTracker.pid = child.pid || 0;
+  routerTracker.mode = kind;
+  routerTracker.state = 'launching';
+  routerTracker.at = Date.now();
+  child.on('error', () => { failed = true; routerTracker.pid = 0; routerTracker.state = 'error'; });
+  child.on('exit', (code) => {
+    // docker compose/start exit 0 once launched; the daemon keeps it alive.
+    if (code !== 0 && routerTracker.pid === child.pid) { routerTracker.pid = 0; routerTracker.state = 'error'; }
+  });
+  child.unref();
+  if (kind === 'docker') dockerProbeReset();
+  setTimeout(() => { if (routerTracker.pid === child.pid && !failed) routerTracker.state = 'launching'; }, 0);
+  return child;
+}
+
+
+
+// Launches the router. Never throws; returns { ok, error?, mode?, status }.
+async function ensureRouterRunning(port, portExplicit = true) {
+  const detected = await detectReporterPort(port, portExplicit);
+  if (detected.detectedPort) {
+    routerTracker.pid = 0; routerTracker.state = 'running';
+    return { ok: true, already_running: true, detectedPort: detected.detectedPort };
+  }
+  if (routerTracker.pid && routerTracker.state === 'launching') {
+    return { ok: true, launching: true, detectedPort: 0 };
+  }
+  // Test hook: an explicit launcher command wins (fixed argv, no shell).
+  if (process.env.FREELLMAPI_CMD) {
+    const args = (process.env.FREELLMAPI_ARGS || '').split(/\s+/).filter(Boolean);
+    startRouterChild({ bin: process.env.FREELLMAPI_CMD, args, kind: 'custom' });
+    return { ok: true, mode: 'custom', state: 'launching', detectedPort: 0 };
+  }
+  const docker = dockerProbe();
+  const dir = routerComposeDir();
+  if (docker.daemon && dir) {
+    startRouterChild({ bin: docker.bin, args: ['compose', 'up', '-d'], kind: 'docker', cwd: dir });
+    log('Started FreeLLMAPI router via docker compose in ' + dir);
+    return { ok: true, mode: 'docker', state: 'launching', detectedPort: 0 };
+  }
+  if (docker.daemon && docker.container) {
+    // Installed but stopped container without a compose dir — start by name.
+    const name = docker.container.split(/\s+/)[0];
+    startRouterChild({ bin: docker.bin, args: ['start', name], kind: 'docker' });
+    log('Started FreeLLMAPI router container ' + name);
+    return { ok: true, mode: 'docker', state: 'launching', detectedPort: 0 };
+  }
+  const desktop = routerDesktopApp();
+  if (desktop) {
+    if (process.platform === 'darwin') startRouterChild({ bin: 'open', args: ['-a', desktop], kind: 'desktop' });
+    else startRouterChild({ bin: desktop, args: [], kind: 'desktop' });
+    log('Launched FreeLLMAPI desktop app: ' + desktop);
+    return { ok: true, mode: 'desktop', state: 'launching', detectedPort: 0 };
+  }
+  if (!docker.bin) {
+    return { ok: false, code: 'no_docker', error: 'FreeLLMAPI is not installed yet. ' + ROUTER_INSTALL_HINT };
+  }
+  if (!docker.daemon) {
+    return { ok: false, code: 'docker_down', error: 'Docker is installed but not running. Start Docker (Docker Desktop or the docker service), then press Start again.' };
+  }
+  return { ok: false, code: 'not_installed', error: 'FreeLLMAPI is not installed yet. ' + ROUTER_INSTALL_HINT };
+}
+
+// ── USB stick installer ────────────────────────────────────────────────────
+// Turn-key copy of the running Capsule onto a removable drive. The destination
+// layout matches what start-portable.sh / start-portable.cmd expect, including
+// .portable/ollama/models for the offline payload. Copies stream file-by-file
+// so progress (and cancellation) stays truthful on multi-GB payloads.
+const usbJobs = new Map();
+
+function walkFiles(root, visit) {
+  const stack = [root];
+  while (stack.length) {
+    const dir = stack.pop();
+    let items = [];
+    try { items = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const item of items) {
+      const p = join(dir, item.name);
+      try { if (item.isDirectory()) stack.push(p); else if (item.isFile()) visit(p); } catch {}
+    }
+  }
+}
+
+function usbScanRoots() {
+  if (process.env.LOCAL_AI_USB_SCAN_ROOTS) {
+    return process.env.LOCAL_AI_USB_SCAN_ROOTS.split(process.platform === 'win32' ? ';' : ':').map((s) => s.trim()).filter(Boolean);
+  }
+  const roots = [];
+  if (process.platform === 'linux') {
+    const user = process.env.USER || '';
+    for (const base of [`/run/media/${user}`, `/media/${user}`, '/media']) {
+      try { for (const name of readdirSync(base)) { const p = join(base, name); try { if (statSync(p).isDirectory()) roots.push(p); } catch {} } } catch {}
+    }
+  } else if (process.platform === 'darwin') {
+    try { for (const name of readdirSync('/Volumes')) { if (name === 'Macintosh HD') continue; const p = join('/Volumes', name); try { if (statSync(p).isDirectory()) roots.push(p); } catch {} } } catch {}
+  } else if (process.platform === 'win32') {
+    try {
+      const out = execFileSync('powershell', ['-NoProfile', '-Command', 'Get-CimInstance Win32_LogicalDisk -Filter "DriveType=2" | Select-Object -ExpandProperty DeviceID'], { encoding: 'utf8', timeout: 8000 });
+      roots.push(...out.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).map((d) => d + '\\'));
+    } catch {}
+  }
+  return [...new Set(roots)];
+}
+
+function listUsbTargets() {
+  const targets = [];
+  for (const dir of usbScanRoots()) {
+    const profile = storageProfileAt(dir);
+    if (!profile.space_known) continue;
+    const warnings = [];
+    if (!profile.large_files_supported) warnings.push({ code: 'fat32', text: 'FAT32 cannot hold files over 4 GB — choose a smaller payload or reformat the stick as exFAT/NTFS.' });
+    if (process.platform === 'linux') {
+      try {
+        const mounts = readFileSync('/proc/mounts', 'utf8');
+        const line = mounts.split('\n').find((l) => (l.split(' ')[1] || '') === dir);
+        if (line && /\bnoexec\b/.test(line.split(' ')[3] || '')) warnings.push({ code: 'noexec', text: 'Mounted “noexec”: files copy fine, but the app cannot launch from this drive until it is re-mounted with exec.' });
+      } catch {}
+    }
+    if (!writableDirectory(dir)) warnings.push({ code: 'readonly', text: 'This drive is not writable.' });
+    targets.push({ id: dir, label: basename(dir) || dir, path: dir, filesystem: profile.filesystem, free_bytes: profile.free_bytes, total_bytes: profile.total_bytes, warnings });
+  }
+  return targets;
+}
+
+function runtimePlatformTag() {
+  return `${process.platform}-${process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : process.arch}`;
+}
+
+function usbCopyPlan(include = {}) {
+  const sections = [];
+  const appEntries = [];
+  for (const rel of releaseTrackedPaths(__dirname)) {
+    const from = join(__dirname, rel);
+    try { if (statSync(from).isFile()) appEntries.push({ from, to: rel.split(sep).join('/') }); } catch {}
+  }
+  const manifestFile = join(__dirname, 'capsule-integrity.json');
+  try { if (statSync(manifestFile).isFile()) appEntries.push({ from: manifestFile, to: 'capsule-integrity.json' }); } catch {}
+  sections.push({ name: 'app', label: 'App files, launch scripts & integrity manifest', required: true, entries: appEntries });
+
+  const platformRoot = join(__dirname, 'runtime', 'platforms');
+  let wanted = [];
+  if (include.runtimes === 'all') {
+    try { wanted = readdirSync(platformRoot).filter((d) => { try { return statSync(join(platformRoot, d)).isDirectory(); } catch { return false; } }); } catch {}
+  } else if (include.runtimes !== 'none') {
+    wanted = [runtimePlatformTag()];
+  }
+  const rtEntries = [];
+  for (const plat of wanted) {
+    const dir = join(platformRoot, plat);
+    walkFiles(dir, (from) => rtEntries.push({ from, to: join('runtime/platforms', plat, relative(dir, from)).split(sep).join('/') }));
+  }
+  sections.push({
+    name: 'runtime',
+    label: include.runtimes === 'all' ? 'Runtimes for every platform (boots on any PC)' : `Runtime for this platform (${runtimePlatformTag()})`,
+    entries: rtEntries,
+    note: include.runtimes === 'none' ? 'Skipped — the target machine re-downloads its own runtime on first start.' : '',
+  });
+
+  const payload = (flag, name, label, srcDir, destRel, skipNames = new Set()) => {
+    const entries = [];
+    if (flag && existsSync(srcDir)) {
+      walkFiles(srcDir, (from) => {
+        const rel = relative(srcDir, from);
+        if (skipNames.has(rel.split(sep)[0])) return;
+        entries.push({ from, to: join(destRel, rel).split(sep).join('/') });
+      });
+    }
+    sections.push({ name, label, entries, missing: flag && !existsSync(srcDir) });
+  };
+  payload(!!include.models, 'models', 'Offline language models', OLLAMA_MODELS_DIR, '.portable/ollama/models');
+  payload(!!include.voice, 'voice', 'Offline voice engines', join(DATA_DIR, 'speech'), '.portable/data/speech');
+  payload(!!include.image, 'image', 'Offline image engine + model', join(DATA_DIR, 'image'), '.portable/data/image', new Set(['out', '.tmp']));
+  if (include.data) {
+    const entries = [];
+    const skip = new Set(['speech', 'image', 'bin']);
+    walkFiles(DATA_DIR, (from) => {
+      const rel = relative(DATA_DIR, from);
+      if (skip.has(rel.split(sep)[0])) return;
+      entries.push({ from, to: join('.portable/data', rel).split(sep).join('/') });
+    });
+    sections.push({ name: 'data', label: 'Private data: chats, vault, settings (only because you asked)', entries, personal: true });
+  }
+  for (const section of sections) {
+    let bytes = 0;
+    for (const entry of section.entries) { try { entry.bytes = statSync(entry.from).size; bytes += entry.bytes; } catch { entry.bytes = 0; } }
+    section.bytes = bytes;
+  }
+  return sections;
+}
+
+function planSummary(sections) {
+  return sections.map((s) => ({ name: s.name, label: s.label, bytes: s.bytes, files: s.entries.length, ...(s.note ? { note: s.note } : {}), ...(s.personal ? { personal: true } : {}), ...(s.missing ? { missing: true } : {}) }));
+}
+
+function jobPercent(job) {
+  return job.total_bytes ? Math.min(100, Math.round((job.copied_bytes / job.total_bytes) * 100)) : (job.status === 'ready' ? 100 : 0);
+}
+
+function publicUsbJob(job) {
+  return {
+    id: job.id, kind: job.kind, status: job.status, target: job.target,
+    progress_percent: jobPercent(job),
+    copied_bytes: job.copied_bytes, total_bytes: job.total_bytes,
+    files_copied: job.files_copied, files_total: job.files_total,
+    current: job.current || '', error: job.error || '',
+    started_at: job.started_at, finished_at: job.finished_at || '',
+    summary: job.summary || null,
+    active: !job.finished_at,
+  };
+}
+
+function startUsbCopyJob(target, sections) {
+  const plan = planSummary(sections);
+  const totalBytes = sections.reduce((n, s) => n + s.bytes, 0);
+  const totalFiles = sections.reduce((n, s) => n + s.entries.length, 0);
+  const id = `usb-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}`;
+  const job = {
+    id, kind: 'usb-copy', status: 'starting', target,
+    copied_bytes: 0, total_bytes: totalBytes, files_copied: 0, files_total: totalFiles,
+    current: '', error: '', started_at: new Date().toISOString(), finished_at: '', summary: null,
+    cancel: false,
+  };
+  usbJobs.set(id, job);
+  setTimeout(() => { const j = usbJobs.get(id); if (j && j.finished_at) usbJobs.delete(id); }, 30 * 60 * 1000).unref();
+
+  const fail = (message) => { job.status = 'error'; job.error = message; job.finished_at = new Date().toISOString(); };
+  (async () => {
+    const stick = join(target, 'capsule');
+    mkdirSync(stick, { recursive: true });
+    job.status = 'copying';
+    const counter = () => new Transform({ transform(chunk, enc, cb) { job.copied_bytes += chunk.length; job.progress_percent = jobPercent(job); cb(null, chunk); } });
+    try {
+      for (const section of sections) {
+        for (const entry of section.entries) {
+          if (job.cancel) { job.status = 'cancelled'; job.finished_at = new Date().toISOString(); return; }
+          if (job.files_copied > 0 && job.files_copied % 200 === 0) {
+            const free = storageProfileAt(stick).free_bytes;
+            if (free && free < (job.total_bytes - job.copied_bytes)) return fail('The USB drive ran out of space mid-copy. Free up space and start over.');
+          }
+          job.current = entry.to;
+          const dest = join(stick, entry.to);
+          mkdirSync(dirname(dest), { recursive: true });
+          await pipeline(createReadStream(entry.from), counter(), createWriteStream(dest));
+          job.files_copied += 1;
+          job.progress_percent = jobPercent(job);
+        }
+      }
+    } catch (err) {
+      return fail(err && err.code === 'ENOSPC'
+        ? 'The USB drive ran out of space. Free up space (or deselect payloads) and try again.'
+        : `Copy failed: ${String(err && err.message || err)}`);
+    }
+    try {
+      writeFileSync(join(stick, 'README-USB.txt'), [
+        'This Capsule is a self-contained local AI workspace.',
+        '',
+        'To start it:',
+        '  Linux / macOS :  bash start-portable.sh',
+        '  Windows       :  start-portable.cmd',
+        '',
+        'Your chats and settings live under .portable/data on this drive.',
+        'If a runtime is missing for the computer you plug into, the launcher',
+        'offers to download it (see runtime/downloads.txt).',
+        '',
+      ].join('\n'));
+    } catch {}
+    // Verify: stream a sha256 of both sides and compare (never buffers files).
+    job.status = 'verifying';
+    const sha256File = (p) => new Promise((res2, rej2) => {
+      const h = createHash('sha256');
+      createReadStream(p).on('data', (chunk) => h.update(chunk)).on('end', () => res2(h.digest('hex'))).on('error', rej2);
+    });
+    let verified = 0, mismatched = 0;
+    for (const section of sections) {
+      for (const entry of section.entries) {
+        if (job.cancel) { job.status = 'cancelled'; job.finished_at = new Date().toISOString(); return; }
+        try {
+          job.current = entry.to;
+          const [a, b] = await Promise.all([sha256File(join(stick, entry.to)), sha256File(entry.from)]);
+          if (a === b) verified += 1; else mismatched += 1;
+        } catch { mismatched += 1; }
+      }
+    }
+    job.current = '';
+    job.status = mismatched ? 'error' : 'ready';
+    if (mismatched) job.error = `${mismatched} file(s) failed the post-copy verification. Re-run to be safe.`;
+    job.finished_at = new Date().toISOString();
+    job.summary = {
+      sections: plan, files: job.files_copied, bytes: job.copied_bytes, verified, mismatched,
+      next_steps: [
+        'Plug the stick into the other computer.',
+        process.platform === 'win32' ? 'Run start-portable.cmd from the capsule folder.' : 'Run: bash start-portable.sh',
+        'The first start may re-download a runtime if you copied without runtimes.',
+      ],
+    };
+    log(`USB kit to ${stick}: ${job.files_copied} files (${(job.copied_bytes / (1024 ** 3)).toFixed(2)} GB), verified ${verified}${mismatched ? `, ${mismatched} mismatched` : ''}`);
+  })().catch((err) => fail(String(err && err.message || err)));
+  return job;
+}
 // Locate the bundled Ollama binary (used to serve .gguf models from models/).
 function ollamaBin() {
   const candidates = [];
@@ -1283,15 +2115,707 @@ function parseArgs(argv) {
 
 const cfg = parseArgs(process.argv.slice(2));
 // Generous ceilings: enough for interactive use and modest API clients, tight
-// enough to stop an abusive caller from pinning the machine or Ollama.
-const sharedRateLimiter = new RateLimiter({ globalCapacity: 600, perIpCapacity: 150, windowMs: 60_000 });
+// enough to stop an abusive caller from pinning the machine or Ollama. Note the
+// refill `rate` is sustained tokens per second — leaving it at the default
+// (capacity) would make the buckets refill instantly and limit nothing. The
+// burst/refill values are overridable for operators who want tighter limits on
+// a LAN or tunnel deployment (and for the brute-force integration test).
+const sharedRateLimiter = new RateLimiter({
+  globalCapacity: 600,
+  perIpCapacity: Number(process.env.CAPSULE_RATE_PER_IP || 150),
+  rate: Number(process.env.CAPSULE_RATE_REFILL || 20),
+  windowMs: 60_000,
+});
 const researchEngine = new ResearchEngine({
   dataDir: RESEARCH_DIR,
   complete: researchModelCompletion,
   searxngUrl: process.env.RESEARCH_SEARXNG_URL || '',
   denyEgress: cfg.denyEgress,
+  onComplete: (job) => {
+    if (job?.id && job.status === 'complete') {
+      try {
+        recordChange('research', { file: join(RESEARCH_DIR, `${job.id}.json`) }, `saved research report${job.query ? ' · ' + String(job.query).replace(/\s+/g, ' ').slice(0, 60) : ''}`);
+      } catch {}
+    }
+  },
 });
 const chatStore = new ChatStore(CHATS_DIR);
+const telemetry = new Telemetry({ dataDir: DATA_DIR });
+function startTelemetrySampler() {
+  if (telemetry.timer) return;
+  const tick = () => {
+    try { telemetry.sample(readLinuxSensors()); telemetry.maybeJournal(); } catch (e) { log('Telemetry sample failed:', e.message); }
+    telemetry.timer = setTimeout(tick, telemetry.jobs.size ? SAMPLE_ACTIVE_MS : SAMPLE_IDLE_MS);
+    telemetry.timer.unref?.();
+  };
+  telemetry.timer = setTimeout(tick, 100);
+  telemetry.timer.unref?.();
+}
+
+// ── Capsule Memory store + recall plumbing ─────────────────────────────────
+// The index is encrypted at rest and never leaves this machine; injection into
+// chat/agent prompts only ever happens in local mode.
+const MEMORY_STATE_FILE = join(DATA_DIR, 'memory-state.json');
+const memoryStore = new MemoryStore(DATA_DIR);
+memoryStore.load();
+let memoryReindexTimer = 0;
+
+function memoryState() {
+  try { return { enabled: false, embedder_model: '', ...JSON.parse(readFileSync(MEMORY_STATE_FILE, 'utf8')) }; }
+  catch { return { enabled: false, embedder_model: '' }; }
+}
+function memoryEnabled() { return memoryState().enabled === true; }
+function saveMemoryState(patch) {
+  const next = { ...memoryState(), ...patch };
+  const tmp = MEMORY_STATE_FILE + '.tmp';
+  writeFileSync(tmp, JSON.stringify(next), 'utf8');
+  renameSync(tmp, MEMORY_STATE_FILE);
+  try { chmodSync(MEMORY_STATE_FILE, 0o600); } catch {}
+  return next;
+}
+
+function memoryEmbedder() {
+  if (process.env.LOCAL_AI_EMBED_STUB === '1') return makeStubEmbedder();
+  return makeOllamaEmbedder(cfg.ollamaUrl, memoryState().embedder_model || undefined);
+}
+
+async function memorySearch(query, { k = 6 } = {}) {
+  if (!memoryEnabled()) return { mode: 'off', results: [] };
+  const embedder = memoryEmbedder();
+  let vec = null, semantic = false;
+  try {
+    if (await embedder.available()) { vec = (await embedder.embed([String(query)]))[0] || null; semantic = !!vec; }
+  } catch {}
+  const results = memoryStore.search(String(query), vec, k);
+  return { mode: semantic ? 'semantic' : 'keyword', results };
+}
+
+function memoryCitationPayload(results) {
+  return results.map((r, i) => ({
+    n: i + 1, type: r.chunk.type, chat_id: r.chunk.type === 'chat' ? r.chunk.srcId : '',
+    title: r.chunk.title, snippet: r.chunk.text.slice(0, 420), score: Number(r.score.toFixed(3)),
+  }));
+}
+
+// Assemble the recall block injected into local chat/agent context. Never
+// called in cloud mode (see the streamChat branch) and agent-local by design.
+async function memoryContextBlock(text, { k = 4, header = 'Recalled memory' } = {}) {
+  if (!memoryEnabled()) return { block: '', sources: [] };
+  const q = String(text || '').trim();
+  if (q.length < 8) return { block: '', sources: [] };
+  const { results } = await memorySearch(q, { k });
+  if (!results.length) return { block: '', sources: [] };
+  const sources = memoryCitationPayload(results);
+  const lines = sources.map((s) => `[${s.n}] (${s.title}) ${s.snippet}`).join('\n');
+  return {
+    block: `## ${header} (your private local index — never shared)\nThese earlier notes may answer or inform this request. Cite them as (memory N) when you use them.\n\n${lines}`,
+    sources,
+  };
+}
+
+function memorySourcesSync(workspace) {
+  const syncs = [];
+  const chats = Array.isArray(workspace?.chats) ? workspace.chats : [];
+  for (const chat of chats) {
+    if (!chat.id || !Array.isArray(chat.messages)) continue;
+    const text = chat.messages
+      .map((m) => (m && typeof m.content === 'string' ? `${m.role}: ${m.content}` : ''))
+      .filter(Boolean)
+      .join('\n\n');
+    syncs.push({ src: { type: 'chat', id: chat.id, title: chat.title || chat.id }, text });
+  }
+  try {
+    for (const name of readdirSync(join(DATA_DIR, 'research'))) {
+      if (!name.endsWith('.json')) continue;
+      try {
+        const j = JSON.parse(readFileSync(join(DATA_DIR, 'research', name), 'utf8'));
+        const text = [j.query, j.report].filter(Boolean).join('\n\n');
+        if (text.length > 40) syncs.push({ src: { type: 'research', id: j.id || name.replace(/\.json$/, ''), title: j.query || name }, text });
+      } catch {}
+    }
+  } catch {}
+  // Drop chunks whose chat no longer exists.
+  const liveIds = new Set(chats.filter((c) => c && c.id).map((c) => c.id));
+  for (const c of [...memoryStore.chunks.values()]) {
+    if (c.type === 'chat' && !liveIds.has(c.srcId)) memoryStore.deleteSource('chat', c.srcId);
+  }
+  return syncs;
+}
+
+async function memoryReindexNow() {
+  if (!memoryEnabled()) return { reindexed: 0, mode: 'off' };
+  const workspace = chatStoreFor('').get() || {};
+  const embedder = memoryEmbedder();
+  const live = await embedder.available().catch(() => false);
+  const syncs = memorySourcesSync(workspace);
+  let added = 0;
+  for (const s of syncs) {
+    try { const r = await memoryStore.syncSource(s.src, s.text, live ? embedder : null); added += r.added || 0; } catch {}
+  }
+  memoryStore.save();
+  return { reindexed: added, sources: syncs.length, mode: live ? 'semantic' : 'keyword', chunks: memoryStore.stats().chunks };
+}
+
+function scheduleMemoryReindex() {
+  if (!memoryEnabled()) return;
+  clearTimeout(memoryReindexTimer);
+  memoryReindexTimer = setTimeout(() => { memoryReindexNow().catch(() => {}); }, 4000);
+}
+
+// ── Peer handshakes: identity store, outbox/ledger, LAN sessions ───────────
+const PEERS_DIR = join(DATA_DIR, 'peers');
+const PEERS_FILE = join(PEERS_DIR, 'trusted.json');
+const PEER_IDENTITY_FILE = join(PEERS_DIR, 'identity.json');
+const PEERS_INBOX_FILE = join(PEERS_DIR, 'inbox.json');
+const PEERS_LOG_FILE = join(PEERS_DIR, 'handshakes.log');
+let lanLink = null;
+
+function peersIdentity() {
+  try { return JSON.parse(readFileSync(PEER_IDENTITY_FILE, 'utf8')); } catch {}
+  const identity = newDeviceIdentity();
+  mkdirSync(PEERS_DIR, { recursive: true });
+  const tmp = PEER_IDENTITY_FILE + '.tmp';
+  writeFileSync(tmp, JSON.stringify(identity));
+  renameSync(tmp, PEER_IDENTITY_FILE);
+  try { chmodSync(PEER_IDENTITY_FILE, 0o600); } catch {}
+  return identity;
+}
+function peersList() { try { const j = JSON.parse(readFileSync(PEERS_FILE, 'utf8')); return Array.isArray(j.peers) ? j.peers : []; } catch { return []; } }
+function writePeers(list) { mkdirSync(PEERS_DIR, { recursive: true }); writeFileSync(PEERS_FILE + '.tmp', JSON.stringify({ schema: 1, peers: list }, null, 2)); renameSync(PEERS_FILE + '.tmp', PEERS_FILE); try { chmodSync(PEERS_FILE, 0o600); } catch {} }
+function peersInbox() { try { const j = JSON.parse(readFileSync(PEERS_INBOX_FILE, 'utf8')); return Array.isArray(j.items) ? j.items : []; } catch { return []; } }
+function writePeersInbox(list) { mkdirSync(PEERS_DIR, { recursive: true }); writeFileSync(PEERS_INBOX_FILE + '.tmp', JSON.stringify({ schema: 1, items: list }, null, 2)); renameSync(PEERS_INBOX_FILE + '.tmp', PEERS_INBOX_FILE); }
+function peersLog(line) { try { mkdirSync(PEERS_DIR, { recursive: true }); appendFileSync(PEERS_LOG_FILE, `${new Date().toISOString()} ${line}\n`, 'utf8'); } catch {} }
+
+// ── Brain escrow storage & flows ────────────────────────────────────────────
+// Outbound records: data/escrow/outbound/<epoch>.json — { epoch, k, n, digest,
+// passphraseWrapped, holderFps, createdAt }. Inbound shards you keep for a
+// friend: data/escrow/inbound/<ownerFpShort>-<epoch>.json — { envelope, holderNote }.
+const ESCROW_DIR = join(DATA_DIR, 'escrow');
+function escrowAtomicWrite(file, payload) {
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file + '.tmp', JSON.stringify(payload, null, 2) + '\n', 'utf8');
+  try { chmodSync(file + '.tmp', 0o600); } catch {}
+  renameSync(file + '.tmp', file);
+}
+function escrowReadJson(file) { try { return JSON.parse(readFileSync(file, 'utf8')); } catch { return null; } }
+function escrowStatus() {
+  const outDir = join(ESCROW_DIR, 'outbound');
+  const inDir = join(ESCROW_DIR, 'inbound');
+  const outbound = [];
+  try {
+    for (const name of readdirSync(outDir)) {
+      const rec = escrowReadJson(join(outDir, name));
+      if (!rec || rec.v !== 1) continue;
+      outbound.push({
+        epoch: rec.epoch, k: rec.k, n: rec.n, digest: rec.digest, created: rec.created,
+        passphraseWrapped: rec.passphraseWrapped, holderFps: rec.holderFps,
+      });
+    }
+  } catch {}
+  const inbound = [];
+  try {
+    for (const name of readdirSync(inDir)) {
+      const rec = escrowReadJson(join(inDir, name));
+      if (!rec?.envelope) continue;
+      inbound.push({
+        owner: rec.ownerName || rec.envelope.owner, epoch: rec.envelope.epoch, index: rec.envelope.index,
+        total: rec.envelope.total, threshold: rec.envelope.threshold, keptAt: rec.keptAt,
+      });
+    }
+  } catch {}
+  return { outbound, inbound };
+}
+
+// Create an escrow round: pack the brain, split the wrap key, emit one sealed
+// postcard per holder. Owners never store plaintext shards; their record keeps
+// only the roster metadata + brain digest.
+async function escrowCreate(body = {}, { req } = {}) {
+  const n = Math.max(2, Math.min(255, Number(body.shares ?? body.n ?? 3)));
+  const k = Math.max(2, Math.min(n, Number(body.threshold ?? body.k ?? 2)));
+  const passphrase = String(body.passphrase || '');
+  const peerFps = Array.isArray(body.peerFps) ? body.peerFps.map(String) : [];
+  const peers = peersList();
+  const holders = peerFps.map((fp) => peers.find((p) => p.fp === fp)).filter(Boolean);
+  if (holders.length !== n) return { error: `Need exactly ${n} trusted peers, saw ${holders.length} unknown/missing.`, status: 400 };
+  const { blob, brainKey, wrapped } = packBrain({ dataDir: DATA_DIR, passphrase });
+  const epoch = 'e' + randomBytes(4).toString('hex');
+  const owner = peerFp(peersIdentity().pub).slice(0, 12);
+  const envelopes = buildShardEnvelopes({ brainKey, n, k, owner, epoch, blob });
+  const postcards = holders.map((peer, i) => ({
+    toFp: peer.fp, toName: peer.name, index: envelopes[i].index,
+    text: envToText(packPostcard(peersIdentity(), {
+      kind: 'escrow', to: peer.fp, toDhPub: peer.dhPub || '', mode: 'sealed',
+      item: envelopes[i],
+    })),
+  }));
+  try {
+    escrowAtomicWrite(join(ESCROW_DIR, 'outbound', `${epoch}.json`), {
+      v: 1, epoch, k, n, digest: envelopes[0].digest, passphraseWrapped: wrapped,
+      holderFps: holders.map((p) => p.fp), holderNames: holders.map((p) => p.name), created: Date.now(),
+    });
+  } catch (e) { return { error: 'Failed to store the escrow record: ' + e.message, status: 500 }; }
+  peersLog(`escrow created: epoch ${epoch}, ${k}-of-${n}, holders ${holders.map((p) => p.name).join(', ')}`);
+  return { ok: true, epoch, k, n, digest: envelopes[0].digest, passphraseWrapped: wrapped, postcards };
+}
+
+function escrowRevoke(body = {}) {
+  const epoch = String(body.epoch || '');
+  const file = join(ESCROW_DIR, 'outbound', `${epoch}.json`);
+  if (!existsSync(file)) return { error: 'Unknown epoch: ' + epoch };
+  rmSync(file, { force: true });
+  peersLog(`escrow revoked: epoch ${epoch} (holders keep their shards; create a fresh round to retire them)`);
+  return { ok: true, epoch };
+}
+
+// Recovery, requester side: emit kind 'escrow-release' postcards asking each
+// holder to hand the shard back to this (new) identity.
+function escrowRequestRecovery(body = {}) {
+  const fps = Array.isArray(body.peerFps) ? body.peerFps.map(String) : [];
+  const myself = peersIdentity();
+  const myFp = peerFp(myself.pub).slice(0, 12);
+  const requests = [];
+  for (const fp of fps) {
+    const peer = peersList().find((p) => p.fp === fp);
+    if (!peer) return { error: 'Not a trusted peer: ' + fp, status: 404 };
+    requests.push({
+      toFp: fp, toName: peer.name,
+      text: envToText(packPostcard(myself, {
+        kind: 'escrow-release', to: peer.fp, toDhPub: peer.dhPub || '', mode: 'sealed',
+        item: { v: 1, kind: 'escrow-release', requesterFp: myFp, forEpoch: String(body.epoch || ''), note: String(body.note || '').slice(0, 500) },
+      })),
+    });
+  }
+  peersLog(`escrow recovery requested from ${fps.length} holder(s) (epoch ${body.epoch || '?'})`);
+  return { ok: true, cards: requests };
+}
+
+// Recovery, applicant side: paste at least k shard envelopes (each carries the
+// same sealed blob), rebuild the wrap key, open the blob, restore the brain's
+// files into the fresh data dir. Refused while a brain already exists here,
+// unless force=true.
+function escrowApplyRecovery(body = {}) {
+  const envs = (Array.isArray(body.shards) ? body.shards : []).map((s) => readShardEnvelope(typeof s === 'string' ? JSON.parse(s) : s));
+  if (!envs.length) return { error: 'Provide at least one shard envelope.', status: 400 };
+  const k = envs[0].threshold;
+  if (envs.length < k) return { error: `Need ${k} shards, got ${envs.length}.`, status: 400 };
+  const digest = envs[0].digest;
+  const epochs = new Set(envs.map((e) => e.epoch));
+  if (epochs.size !== 1 || envs.some((e) => e.digest !== digest)) return { error: 'Shards disagree — different escrow epochs or digest mismatch', status: 400 };
+  if (existsSync(join(DATA_DIR, 'memory.key')) && body.force !== true) {
+    return { error: 'This capsule already holds an escrowed brain — pass force:true only if you want it overwritten.', status: 409 };
+  }
+  const files = unpackBrain({ blob: envs[0].blob, shards: envs.map((e) => ({ index: e.index, bytes: Buffer.from(e.shard, 'base64') })), passphrase: String(body.passphrase || '') });
+  const written = escrowRestoreFiles(files);
+  peersLog(`escrow recovered: epoch ${envs[0].epoch} — ${written.length} file(s) restored from ${envs.length} shard(s)`);
+  return { ok: true, epoch: envs[0].epoch, files: written, restored: written.length };
+}
+
+function escrowRestoreFiles(files) {
+  const written = [];
+  for (const name of ['memory.key', 'memory-store.json.enc', 'procedures.json']) {
+    if (!(name in files) || !files[name]) continue;
+    const target = join(DATA_DIR, name);
+    const tmp = target + '.tmp-' + randomBytes(3).toString('hex');
+    const data = name.endsWith('.json') ? files[name] : Buffer.from(files[name], 'base64');
+    writeFileSync(tmp, data);
+    try { chmodSync(tmp, 0o600); } catch {}
+    renameSync(tmp, target);
+    written.push(name);
+    if (name === 'memory.key') {
+      // The new key may differ from the cached in-memory one.
+      // The next memory access re-reads it from disk.
+    }
+  }
+  return written;
+}
+function peersStatus() {
+  const identity = peersIdentity();
+  const card = makeCard(identity, { name: deviceName() });
+  return {
+    card, fp: peerFp(identity.pub), words: wordsPhrase(identity.pub),
+    cardText: envToText(packPostcard(peersIdentity(), { kind: 'cardref', mode: 'open', item: card, to: '*' })),
+    peers: peersList(), inbox: peersInbox().filter((i) => i.status === 'pending'),
+    listening: !!lanLink, seen: lanLink ? lanLink.seenPeers() : [],
+    port: lanLink ? lanLink.port : 0,
+  };
+}
+function deviceName() {
+  try { return (homedir().split(/[\\/]/).pop() || 'my capsule') + ' · ' + process.platform; } catch { return 'my capsule'; }
+}
+
+async function lanLinkStart() {
+  if (lanLink) return lanLink;
+  lanLink = new LanLink(peersIdentity(), deviceName(), { port: Number(process.env.LOCAL_AI_PEER_PORT) || undefined });
+  // Any inbound LAN session: every received item becomes a PENDING inbox entry
+  // routed through the same approve/dismiss consent flow as every other
+  // channel. Nothing ever lands without the user's click.
+  const acceptInbound = (api) => {
+    api.onMessage((m) => {
+      try {
+        if (m.t === 'item' && m.env) {
+          const known = peersList().find((p) => p.fp === m.env.src);
+          const read = unpackPostcard(m.env, { identity: peersIdentity(), trustedPubs: peersList() });
+          const inbox = peersInbox();
+          inbox.push({
+            id: `inbox-${Date.now().toString(36)}-${randomBytes(2).toString('hex')}`,
+            kind: read.kind, from: read.src, fromName: known?.name || api.peer.name || 'LAN peer',
+            item: read.item, at: read.at || new Date().toISOString(), sealed: !!read.sealed,
+            status: 'pending', via: 'lan', sessionWords: api.words,
+          });
+          writePeersInbox(inbox);
+          peersLog(`LAN: received ${read.kind} from ${known?.name || api.peer.name || 'peer'}`);
+          api.send({ t: 'ack', ok: true });
+        } else if (m.t === 'item-ack-request') {
+          api.send({ t: 'ack', ok: true });
+        }
+      } catch (e) {
+        try { api.send({ t: 'ack', ok: false, error: String(e.message || e) }); } catch {}
+      }
+    });
+    peersLog(`LAN: session with ${api.peer.name || api.peer.fp.slice(0, 12)} (${api.words})`);
+  };
+  lanLink.on('session', acceptInbound);
+  await lanLink.listen();
+  return lanLink;
+}
+async function lanLinkStop() { if (lanLink) { lanLink.stop(); lanLink = null; } }
+
+async function lanPushItems(address, port, items) {
+  const link = await lanLinkStart();
+  const peer = link.seenPeers().find((p) => p.address === address) || null;
+  const session = await link.connect(address, port || (peer ? peer.port : undefined) || undefined);
+  try {
+    const ack = new Promise((resolve) => {
+      const to = setTimeout(() => resolve({ ok: false, error: 'no acknowledgement' }), 15000);
+      session.onMessage((m) => { if (m.t === 'ack') { clearTimeout(to); resolve(m); } });
+    });
+    session.send({ t: 'offer', items: items.map((i) => ({ kind: i.kind, title: i.title })) });
+    for (const it of items) session.send({ t: 'item', env: it.env });
+    session.send({ t: 'bye' });
+    const a = await ack;
+    peersLog(`LAN push to ${address}: ${items.length} item(s), ack=${a && a.ok}`);
+    return { ok: a.ok !== false, words: session.words, peer: session.peer.name || '' };
+  } finally {
+    session.close();
+  }
+}
+
+
+// ── Peer transport bus: postcards over any medium ──────────────────────────
+// One seam, all carriers. Inbound bytes from a USB stick, a camera, a modem,
+// or a radio dongle become inbox items through exactly the same path: verify
+// the signature, queue approval. Nothing lands silently on any medium.
+function ingestPostcardText(text, via, extra = {}) {
+  const env = textToEnv(String(text));
+  const known = peersList().find((p) => p.fp === env.src);
+  const read = unpackPostcard(env, { identity: peersIdentity(), trustedPubs: peersList() });
+  const inbox = peersInbox();
+  const fromName = known?.name || extra.fromName || 'unknown sender';
+  const entry = {
+    id: `inbox-${Date.now().toString(36)}-${randomBytes(2).toString('hex')}`,
+    kind: read.kind, from: read.src, fromName,
+    item: read.item, at: read.at || new Date().toISOString(), sealed: !!read.sealed,
+    status: 'pending', via,
+  };
+  if (extra.sessionWords) entry.sessionWords = extra.sessionWords;
+  inbox.push(entry);
+  writePeersInbox(inbox);
+  peersLog(`${via}: received ${read.kind} postcard from ${fromName}${read.sealed ? ' (sealed)' : ''}`);
+  return entry;
+}
+
+// Bridge — a USB stick or drop folder, courier-delivered. The only carrier
+// whose reach is measured in kilometres and needs no antenna or camera. Files
+// ride as CPX1 envelope frames; a bare CAPX1 postcard pasted into the folder
+// is accepted too.
+const peerTransportBus = new TransportBus({ onIngest: ingestPostcardText });
+const BRIDGE_DIR = process.env.CAPSULE_BRIDGE_DIR || join(DATA_DIR, 'peers', 'bridge');
+const bridgeTransport = {
+  name: 'bridge', offline: true, uplink: true, downlink: true,
+  status() {
+    const out = { path: BRIDGE_DIR };
+    for (const [k, sub] of [['outgoing', 'outgoing'], ['incoming', 'incoming'], ['processed', 'processed']]) {
+      try { out[k] = readdirSync(join(BRIDGE_DIR, sub)).filter((f) => f.endsWith('.capsule') || f.endsWith('.done')).length; } catch { out[k] = 0; }
+    }
+    return out;
+  },
+  async start() {
+    for (const sub of ['', 'outgoing', 'incoming', 'processed']) mkdirSync(join(BRIDGE_DIR, sub), { recursive: true });
+    if (this._watcher) return;
+    this._debounces = new Map();
+    this._watcher = watch(join(BRIDGE_DIR, 'incoming'), (_evt, name) => {
+      if (typeof name !== 'string' || !name.endsWith('.capsule')) return;
+      clearTimeout(this._debounces.get(name));
+      this._debounces.set(name, setTimeout(() => this._consume(join(BRIDGE_DIR, 'incoming', name)), 350));
+    });
+    this._watcher.unref?.();
+  },
+  async _consume(file) {
+    // A copy-in triggers write + rename events; only the surviving file counts.
+    if (!existsSync(file)) return;
+    let body;
+    try {
+      const raw = readFileSync(file, 'utf8');
+      body = raw.startsWith('CPX1 ') ? unenvelopeFrame(raw) : raw;
+      renameSync(file, join(BRIDGE_DIR, 'processed', basename(file) + '.done'));
+    } catch (e) {
+      try { renameSync(file, join(BRIDGE_DIR, 'processed', basename(file) + '.bad')); } catch {}
+      peersLog(`bridge: rejected ${basename(file)} — ${e.message}`);
+      return;
+    }
+    try {
+      peerTransportBus.deliver(body, 'bridge');
+      peersLog(`bridge: ingested ${basename(file)}`);
+    } catch (e) {
+      peersLog(`bridge: ingest failed for ${basename(file)} — ${e.message}`);
+    }
+  },
+  async send({ items = [] } = {}) {
+    const out = join(BRIDGE_DIR, 'outgoing');
+    mkdirSync(out, { recursive: true });
+    let i = 0;
+    const written = [];
+    for (const it of items) {
+      const file = join(out, `${Date.now().toString(36)}-${i++}-${it.kind || 'note'}.capsule`);
+      writeFileSync(file, envelopeFrame(it.text) + '\n', 'utf8');
+      written.push(file);
+    }
+    return { ok: true, written, path: out };
+  },
+  async stop() { try { this._watcher?.close(); this._watcher = null; } catch {} },
+};
+peerTransportBus.register(bridgeTransport);
+// The USB watcher starts as soon as the module loads — a capsule that boots
+// into /health must already be watching its drop folder, or a courier leaving
+// a stick the minute the UI opens would watch events race the callback.
+peerTransportBus.start('bridge').catch((e) => log('bridge transport start failed:', e.message));
+
+// Light — camera-to-screen animated QR stream; Sound — speaker-to-microphone
+// FSK modem. Both move *frames*, reassembled on the receiving side by the /rx
+// endpoint, so neither exists without the other side's consent.
+const peerRxBuffers = new Map();
+function rxSidCountFor(via) {
+  let n = 0;
+  for (const b of peerRxBuffers.values()) if (b.via === via) n += 1;
+  return n;
+}
+const lightTransport = {
+  name: 'light', offline: true, uplink: true, downlink: true,
+  status() { return { mode: 'camera → screen', activeTransfers: rxSidCountFor('light') }; },
+};
+const soundTransport = {
+  name: 'sound', offline: true, uplink: true, downlink: true,
+  status() { return { mode: 'speaker → microphone', sampleRateHz: 48000, activeTransfers: rxSidCountFor('sound') }; },
+};
+peerTransportBus.register(lightTransport);
+peerTransportBus.register(soundTransport);
+
+// Radio — LoRa / Meshtastic dongle. Hardware-gated: without a CLI or a radio
+// device the carrier reports available:false and simply never starts. With one,
+// postcard fragments ride `TX|…` frames through the `meshtastic` CLI (a wired
+// connection, not a phone or a radio mast). Downlink reads a configured
+// receive command's stdout; without one, radio is send-only — still useful
+// for one-way alerts from a sleeping capsule.
+let radioDetected = null;
+function detectRadio() {
+  if (radioDetected) return radioDetected;
+  const custom = String(process.env.CAPSULE_RADIO_CMD || '').trim();
+  if (custom) { radioDetected = { mode: 'custom', cmd: custom, receive: String(process.env.CAPSULE_RADIO_RECEIVE_CMD || '').trim() || '' }; return radioDetected; }
+  const cli = findOnPath('meshtastic');
+  if (cli) { radioDetected = { mode: 'meshtastic-cli', cmd: cli, receive: '' }; return radioDetected; }
+  if (String(process.env.CAPSULE_RADIO_URL || '').trim()) { radioDetected = { mode: 'meshtasticd', cmd: '', receive: '' }; return radioDetected; }
+  radioDetected = { mode: 'none' };
+  return radioDetected;
+}
+async function radioSendFrame(detect, frame) {
+  if (detect.mode === 'custom') {
+    // %T is a shell splice: the CLI expects the payload as one argument, and a
+    // fragment carries `|` (pipe) and other metacharacters — quote it so the
+    // shell hands the whole frame over instead of cutting it into pipes.
+    const payload = `'` + String(frame).replace(/'/g, `'\\''`) + `'`;
+    const cmd = detect.cmd.replace(/%T/g, payload);
+    await new Promise((res) => { const p = spawn(cmd, { shell: true, stdio: 'ignore' }); p.on('close', res); p.on('error', () => res()); });
+    return true;
+  }
+  if (detect.mode === 'meshtastic-cli') {
+    await new Promise((res) => { const p = spawn(detect.cmd, ['--sendtext', frame], { stdio: 'ignore' }); p.on('close', res); p.on('error', () => res()); });
+    return true;
+  }
+  throw new Error('radio carrier is not available — no LoRa / Meshtastic hardware detected');
+}
+async function radioReceiveOnce(detect) {
+  if (!detect.receive) return null;
+  const out = await new Promise((res) => {
+    try {
+      const p = spawn(detect.receive, { shell: true, stdio: ['ignore', 'pipe', 'ignore'] });
+      let s = '';
+      const to = setTimeout(() => { try { p.kill(); } catch {} }, 4000);
+      p.stdout.on('data', (d) => { s += d; });
+      p.on('close', () => { clearTimeout(to); res(s); });
+      p.on('error', () => { clearTimeout(to); res(''); });
+    } catch { res(''); }
+  });
+  return out.trim() || null;
+}
+const radioTransport = {
+  name: 'radio', offline: true, uplink: true, downlink: true,
+  status() {
+    const d = detectRadio();
+    if (d.mode === 'none') return { available: false, hint: 'plug in a LoRa / Meshtastic dongle, or set CAPSULE_RADIO_CMD' };
+    return { available: true, mode: d.mode, hint: 'frames ride as text through the radio CLI' };
+  },
+  async send({ frames = [] } = {}) {
+    const d = detectRadio();
+    if (d.mode === 'none') throw new Error('radio hardware was not detected — nothing was sent');
+    for (const f of frames) await radioSendFrame(d, f);
+    return { ok: true, sent: frames.length, mode: d.mode };
+  },
+  async start() {
+    const d = detectRadio();
+    if (d.mode === 'none' || !d.receive) return;
+    if (this._receiveTimer) return;
+    const pollMs = Math.max(500, Number(process.env.CAPSULE_RADIO_POLL_MS) || 15000);
+    this._receiveTimer = setInterval(async () => {
+      try {
+        const line = await radioReceiveOnce(d);
+        if (!line) return;
+        // The dongle hands back one transmission: either a whole CAPX1
+        // envelope (single-burst postcard) or a `TX|…` fragment from a
+        // multi-frame one. Fragments flow through the same /rx reassembly
+        // pool the light and sound carriers use, then one consenting inbox
+        // row lands when the last frame arrives.
+        const frame = line.trim().match(/^TX\|(\d+)\|(\d+)\|([0-9a-f]+)\|(.*)$/);
+        if (frame) {
+          try {
+            transportRx({ via: 'radio', sid: 'radio', seq: Number(frame[1]), total: Number(frame[2]), crc: frame[3], data: frame[4] });
+          } catch {}
+        } else {
+          peerTransportBus.deliver(line.trim(), 'radio');
+        }
+      } catch {}
+    }, pollMs);
+    this._receiveTimer.unref?.();
+  },
+  async stop() { clearInterval(this._receiveTimer); this._receiveTimer = null; },
+};
+peerTransportBus.register(radioTransport);
+
+const lanTransport = {
+  name: 'lan', offline: false, uplink: true, downlink: true,
+  status() { return { listening: !!lanLink, port: LAN_PORT }; },
+  async send({ address, port, items }) { return lanPushItems(address, port, items); },
+};
+peerTransportBus.register(lanTransport);
+
+// Fragment an envelope into self-describing TX frames; the receiving side
+// reassembles through /api/peers/transport/rx (client state stays out).
+function transportFrames(text, max) {
+  const m = Math.max(64, Math.min(2000, Math.round(Number(max) || 900)));
+  return fragment(text, m).map((c) => `TX|${c.seq}|${c.total}|${c.crc}|${c.data}`);
+}
+function transportRx(body) {
+  const via = String(body.via || '');
+  if (!['light', 'sound', 'radio'].includes(via)) throw new Error('unknown carrier ' + via);
+  const sid = String(body.sid || 'default');
+  const seq = Number(body.seq);
+  const total = Number(body.total);
+  if (!Number.isInteger(seq) || !Number.isInteger(total) || total < 1 || total > 4096) throw new Error('bad rx frame index');
+  const data = String(body.data || '');
+  const crc = String(body.crc || '');
+  let buf = peerRxBuffers.get(sid);
+  if (!buf) {
+    buf = { via, total, slots: Array.from({ length: total }), last: Date.now() };
+    peerRxBuffers.set(sid, buf);
+  }
+  if (buf.total !== total) throw new Error('rx session total changed mid-transfer');
+  if (seq < total && !buf.slots[seq]) {
+    buf.slots[seq] = { seq, total, crc, data };
+    buf.last = Date.now();
+  }
+  if (buf.slots.every(Boolean)) {
+    try {
+      const text = defragment(buf.slots);
+      peerRxBuffers.delete(sid);
+      peerTransportBus.deliver(text, via);
+      return { ok: true, complete: true, textLen: text.length, via };
+    } catch (e) {
+      peerRxBuffers.delete(sid);
+      throw new Error('reassembly failed: ' + e.message);
+    }
+  }
+  return { ok: true, complete: false, got: buf.slots.filter(Boolean).length, total, via };
+}
+setInterval(() => {
+  const now = Date.now();
+  for (const [sid, b] of peerRxBuffers) if (now - b.last > 20 * 60 * 1000) peerRxBuffers.delete(sid);
+}, 60_000).unref?.();
+
+// Build share items ({kind,title,env}) from an API body — reused by LAN sync,
+// bridge export, and the light/sound transmit path, so every medium earns a
+// peer log line and the same inbox consent.
+function shareItemsFromBody(body = {}, { limit = 12 } = {}) {
+  const items = [];
+  const procs = readProcedures();
+  for (const it of Array.isArray(body.items) ? body.items.slice(0, limit) : []) {
+    if (it.kind === 'procedure') {
+      const proc = procs.find((p) => p.id === String(it.id || ''));
+      if (!proc) continue;
+      items.push({ kind: 'procedure', title: proc.name, env: packPostcard(peersIdentity(), { kind: 'procedure', mode: 'open', item: { name: proc.name, summary: proc.summary, steps: proc.steps } }) });
+    } else if (it.kind === 'note') {
+      items.push({ kind: 'note', title: String(it.title || 'note').slice(0, 120), env: packPostcard(peersIdentity(), { kind: 'note', mode: 'open', item: { title: String(it.title || '').slice(0, 120), text: String(it.text || '').slice(0, 4000) } }) });
+    }
+  }
+  return items;
+}
+
+
+// ── Consolidation cycle ("sleep on it") ────────────────────────────────────
+// Manual trigger; every memory fact and procedure it produces waits in an
+// approval queue — nothing lands until the user says so.
+const consolidation = new ConsolidationEngine({
+  dataDir: DATA_DIR,
+  complete: (system, user) => ollamaSummarizeChat(consolidation.activeModel || cfg.model, [
+    { role: 'system', content: system }, { role: 'user', content: user },
+  ]),
+  collectSources: async (since) => {
+    const sinceMs = since ? Date.parse(since) : 0;
+    const out = [];
+    const workspace = chatStoreFor('').get();
+    for (const chat of workspace?.chats || []) {
+      if (!chat?.id || !Array.isArray(chat.messages)) continue;
+      if (sinceMs && Number(chat.updatedAt || 0) <= sinceMs) continue;
+      const text = chat.messages.map((m) => (m && typeof m.content === 'string' ? `${m.role}: ${m.content}` : '')).filter(Boolean).join('\n\n');
+      if (text.length >= 80) out.push({ src: { type: 'chat', id: chat.id, title: chat.title || chat.id, changedAt: chat.updatedAt || 0 }, text });
+    }
+    try {
+      for (const name of readdirSync(RESEARCH_DIR)) {
+        if (!name.endsWith('.json')) continue;
+        try {
+          const st = statSync(join(RESEARCH_DIR, name));
+          if (sinceMs && st.mtimeMs <= sinceMs) continue;
+          const j = JSON.parse(readFileSync(join(RESEARCH_DIR, name), 'utf8'));
+          const text = [j.query, j.report].filter(Boolean).join('\n\n');
+          if (text.length >= 80) out.push({ src: { type: 'research', id: j.id || name.replace(/\.json$/, ''), title: j.query || name, changedAt: st.mtimeMs }, text });
+        } catch {}
+      }
+    } catch {}
+    return out;
+  },
+  apply: {
+    memory: async (text, citations) => {
+      const title = citations?.[0]?.title ? `Consolidated: ${citations[0].title}` : 'Consolidated memory';
+      await memoryStore.syncSource({ type: 'memory', id: `fact-${Date.now().toString(36)}-${randomBytes(2).toString('hex')}`, title }, text, memoryEmbedder());
+      memoryStore.save();
+    },
+    procedure: async (card) => {
+      const list = readProcedures();
+      const cleaned = cleanProcedure(card);
+      list.push({ id: `proc-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}`, ...cleaned, source_task: 'consolidation-cycle', created: new Date().toISOString(), uses: 0 });
+      while (list.length > 64) list.shift();
+      writeProcedures(list);
+    },
+  },
+});
 const mcpClients = new Map();
 const usersFile = process.env.CAPSULE_USERS_FILE || join(DATA_DIR, 'users.json');
 const userStore = new UserStore(usersFile);
@@ -1368,9 +2892,9 @@ const isWin = () => process.platform === 'win32';
 
 function log(...args) { console.log(new Date().toISOString(), ...args); }
 
-function runChild(cmd, args, { input } = {}) {
+function runChild(cmd, args, { input, env } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(cmd, args, { stdio: input != null ? ['pipe', 'ignore', 'pipe'] : ['ignore', 'ignore', 'pipe'] });
+    const child = spawn(cmd, args, { stdio: input != null ? ['pipe', 'ignore', 'pipe'] : ['ignore', 'ignore', 'pipe'], env: env || process.env });
     let err = '';
     child.stderr.on('data', (d) => { err += d.toString(); });
     child.on('error', () => resolve(-1));
@@ -1379,14 +2903,43 @@ function runChild(cmd, args, { input } = {}) {
   });
 }
 
-// ── Offline speech: whisper.cpp + piper (optional, detected at runtime) ────
+// ── Offline speech: whisper.cpp (STT) + piper/kokoro (TTS), runtime-detected ─
 let speechInfo = null;
+function installedWhisperCli() {
+  const cli = join(SPEECH_DIR, 'whisper', 'whisper-cli');
+  return existsSync(cli) ? cli : '';
+}
+function installedWhisperModel() {
+  for (const name of ['ggml-base.bin', 'ggml-small.bin', 'ggml-base.en.bin']) {
+    const p = join(SPEECH_DIR, 'whisper', name);
+    if (existsSync(p)) return p;
+  }
+  return '';
+}
+const KOKORO_VOICES = ['af_heart', 'af_bella', 'af_nicole', 'af_sarah', 'af_sky', 'am_adam', 'am_michael', 'bf_emma', 'bf_isabella', 'bm_george', 'bm_lewis'];
+function piperVoicesInstalled() {
+  const dir = join(SPEECH_DIR, 'piper-voices');
+  const found = [];
+  try {
+    for (const name of readdirSync(dir)) {
+      if (/^[a-z0-9][a-z0-9._-]*\.onnx$/i.test(name) && existsSync(join(dir, name + '.json'))) found.push({ name, path: join(dir, name) });
+    }
+  } catch {}
+  return found.sort((a, b) => a.name.localeCompare(b.name));
+}
 function speechSupport() {
   if (speechInfo) return speechInfo;
-  const whisper = process.env.WHISPER_CLI || findOnPath('whisper-cli') || findOnPath('whisper-cpp') || findOnPath('whisper');
-  const piper = process.env.PIPER_CLI || findOnPath('piper');
-  const whisperModel = process.env.WHISPER_MODEL || join(__dirname, 'models', 'whisper', 'ggml-base.bin');
-  const piperVoice = process.env.PIPER_VOICE || join(__dirname, 'models', 'piper', 'voice.onnx');
+  const speechDir = join(SPEECH_DIR, 'piper');
+  const whisper = process.env.WHISPER_CLI || findOnPath('whisper-cli') || findOnPath('whisper-cpp') || findOnPath('whisper') || installedWhisperCli();
+  const piper = process.env.PIPER_CLI || findOnPath('piper') || (existsSync(join(speechDir, 'piper')) ? join(speechDir, 'piper') : '');
+  const whisperModel = process.env.WHISPER_MODEL || installedWhisperModel() || join(__dirname, 'models', 'whisper', 'ggml-base.bin');
+  const piperVoices = piperVoicesInstalled();
+  const piperVoice = process.env.PIPER_VOICE
+    || piperVoices.find((v) => v.name === 'en_US-lessac-medium.onnx')?.path
+    || piperVoices[0]?.path
+    || (existsSync(join(SPEECH_DIR, 'piper-voices', 'en_US-lessac-medium.onnx')) ? join(SPEECH_DIR, 'piper-voices', 'en_US-lessac-medium.onnx') : '')
+    || join(__dirname, 'models', 'piper', 'voice.onnx');
+  const kokoro = existsSync(join(SPEECH_DIR, 'tts-runtime', 'node_modules', 'kokoro-js'));
   speechInfo = {
     whisper: Boolean(whisper && existsSync(whisperModel)),
     whisper_cli: whisper ? whisper : '',
@@ -1394,8 +2947,443 @@ function speechSupport() {
     piper: Boolean(piper && existsSync(piperVoice)),
     piper_cli: piper ? piper : '',
     piper_voice: existsSync(piperVoice) ? piperVoice : '',
+    piper_voices: piperVoices,
+    kokoro,
+    kokoro_voices: kokoro ? KOKORO_VOICES : [],
+    installing: speechInstall != null && speechInstall.status !== 'ready' && speechInstall.status !== 'error',
   };
   return speechInfo;
+}
+
+// One-click offline voice install: pins piper, whisper.cpp and kokoro (optional)
+// by SHA-256 and extracts them under SPEECH_DIR. The whisper.cpp prebuilt
+// Ubuntu archives are the official ggml-org builds; the codepath keeps the
+// env-var (WHISPER_CLI / WHISPER_MODEL / PIPER_CLI / PIPER_VOICE) overrides.
+const PIPER_RELEASE = '2023.11.14-2';
+const PIPER_ASSETS = {
+  'linux-x64':   { url: `https://github.com/rhasspy/piper/releases/download/${PIPER_RELEASE}/piper_linux_x86_64.tar.gz`,   sha256: 'a50cb45f355b7af1f6d758c1b360717877ba0a398cc8cbe6d2a7a3a26e225992' },
+  'linux-arm64': { url: `https://github.com/rhasspy/piper/releases/download/${PIPER_RELEASE}/piper_linux_aarch64.tar.gz`, sha256: 'fea0fd2d87c54dbc7078d0f878289f404bd4d6eea6e7444a77835d1537ab88eb' },
+};
+const PIPER_VOICE_ASSETS = [
+  { name: 'en_US-lessac-medium.onnx',        url: 'https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx',        sha256: '5efe09e69902187827af646e1a6e9d269dee769f9877d17b16b1b46eeaaf019f' },
+  { name: 'en_US-lessac-medium.onnx.json',   url: 'https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/en/en_US/lessac/medium/en_US-lessac-medium.onnx.json',   sha256: 'efe19c417bed055f2d69908248c6ba650fa135bc868b0e6abb3da181dab690a0' },
+];
+const WHISPER_RELEASE = 'v1.9.2';
+const WHISPER_ASSETS = {
+  'linux-x64':   { url: `https://github.com/ggml-org/whisper.cpp/releases/download/${WHISPER_RELEASE}/whisper-bin-ubuntu-x64.tar.gz`,   sha256: '46811a3ecf584307480a220b9ef5ff81b7b22dc41577cbc274ce3afc61f753b1' },
+  'linux-arm64': { url: `https://github.com/ggml-org/whisper.cpp/releases/download/${WHISPER_RELEASE}/whisper-bin-ubuntu-arm64.tar.gz`, sha256: '7e26fa6a36d9174d5c0bf033ccbc026c3b5e569e2ee787058241346ef5392719' },
+};
+const WHISPER_MODEL_ASSET = { name: 'ggml-base.bin', url: 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin', sha256: '60ed5bc3dd14eea856493d334349b405782ddcaf0028d4b5df4088345fba2efe' };
+const KOKORO_VERSION = '1.2.1';
+const WHISPER_SETUP_HINT = 'whisper.cpp can be installed with the one-click button below (official ggml-org binaries + ggml-base model, verified by SHA-256). Or set WHISPER_CLI and WHISPER_MODEL in ' + ENV_FILE + '.';
+let speechInstall = null;
+
+function streamDownload(url, destPath, onProgress) {
+  return new Promise((resolve, reject) => {
+    const out = createWriteStream(destPath);
+    let downloaded = 0, total = 0;
+    https.get(url, { headers: { 'User-Agent': 'LocalAI-Chat-App' } }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        const next = new URL(res.headers.location, url).toString();
+        return https.get(next, { headers: { 'User-Agent': 'LocalAI-Chat-App' } }, (res2) => { pipe(res2); }).on('error', reject);
+      }
+      pipe(res);
+      function pipe(res2) {
+        if (res2.statusCode !== 200) { reject(new Error('HTTP ' + res2.statusCode + ' for ' + url)); res2.resume(); return; }
+        total = Number(res2.headers['content-length'] || 0);
+        res2.on('data', (c) => { downloaded += c.length; onProgress && onProgress(downloaded, total); });
+        res2.pipe(out);
+        out.on('finish', () => { onProgress && onProgress(downloaded, total); resolve(downloaded); });
+        res2.on('error', reject);
+      }
+    }).on('error', reject);
+  });
+}
+
+async function installSpeechEngines({ kokoro = false } = {}) {
+  const platformKey = process.platform === 'linux'
+    ? (process.arch === 'x64' ? 'linux-x64' : process.arch === 'arm64' ? 'linux-arm64' : '')
+    : '';
+  if (!platformKey) throw new Error('One-click speech install supports Linux x64/arm64. On other platforms set PIPER_CLI/PIPER_VOICE and WHISPER_CLI/WHISPER_MODEL. ' + WHISPER_SETUP_HINT);
+  mkdirSync(SPEECH_DIR, { recursive: true });
+  const tmpRoot = join(SPEECH_DIR, '.tmp'); mkdirSync(tmpRoot, { recursive: true });
+  const piperBin = join(SPEECH_DIR, 'piper', 'piper');
+  const whisperCli = join(SPEECH_DIR, 'whisper', 'whisper-cli');
+  const whisperModel = join(SPEECH_DIR, 'whisper', WHISPER_MODEL_ASSET.name);
+  const alreadyInstalled = existsSync(piperBin) && existsSync(join(SPEECH_DIR, 'piper-voices', PIPER_VOICE_ASSETS[0].name))
+    && existsSync(whisperCli) && existsSync(whisperModel);
+  try {
+    if (!alreadyInstalled) {
+      // Stage 1: piper + its voice (default TTS engine).
+      if (!(existsSync(piperBin) && existsSync(join(SPEECH_DIR, 'piper-voices', PIPER_VOICE_ASSETS[0].name)))) {
+        speechInstall.status = 'downloading';
+        speechInstall.current = 'piper';
+        const tall = PIPER_ASSETS[platformKey];
+        const tarPath = join(tmpRoot, 'piper.tar.gz');
+        await streamDownload(tall.url, tarPath, (d, t) => { speechInstall.downloaded = d; speechInstall.total = t; });
+        const actual = createHash('sha256').update(readFileSync(tarPath)).digest('hex');
+        if (actual !== tall.sha256) throw new Error('piper checksum mismatch: ' + actual.slice(0, 12) + '…');
+        speechInstall.status = 'extracting';
+        mkdirSync(join(SPEECH_DIR, 'piper'), { recursive: true });
+        execFileSync('tar', ['-xzf', tarPath, '-C', join(SPEECH_DIR, 'piper'), '--strip-components=1']);
+        chmodSync(piperBin, 0o755);
+        execFileSync(piperBin, ['--version'], { stdio: 'ignore' });
+        mkdirSync(join(SPEECH_DIR, 'piper-voices'), { recursive: true });
+        for (const a of PIPER_VOICE_ASSETS) {
+          speechInstall.current = 'piper-voices/' + a.name;
+          speechInstall.downloaded = 0; speechInstall.total = 0;
+          const vPath = join(tmpRoot, a.name);
+          await streamDownload(a.url, vPath, (d, t) => { speechInstall.downloaded = d; speechInstall.total = t; });
+          const vHash = createHash('sha256').update(readFileSync(vPath)).digest('hex');
+          if (vHash !== a.sha256) throw new Error(a.name + ' checksum mismatch: ' + vHash.slice(0, 12) + '…');
+          renameSync(vPath, join(SPEECH_DIR, 'piper-voices', a.name));
+        }
+      }
+      // Stage 2: whisper.cpp official prebuilt binary + a ggml model (offline STT).
+      if (!(existsSync(whisperCli) && existsSync(whisperModel))) {
+        speechInstall.status = 'downloading';
+        speechInstall.current = 'whisper';
+        const tall = WHISPER_ASSETS[platformKey];
+        const tarPath = join(tmpRoot, 'whisper.tar.gz');
+        await streamDownload(tall.url, tarPath, (d, t) => { speechInstall.downloaded = d; speechInstall.total = t; });
+        const actual = createHash('sha256').update(readFileSync(tarPath)).digest('hex');
+        if (actual !== tall.sha256) throw new Error('whisper checksum mismatch: ' + actual.slice(0, 12) + '…');
+        speechInstall.status = 'extracting';
+        mkdirSync(join(SPEECH_DIR, 'whisper'), { recursive: true });
+        execFileSync('tar', ['-xzf', tarPath, '-C', join(SPEECH_DIR, 'whisper'), '--strip-components=1']);
+        chmodSync(whisperCli, 0o755);
+        execFileSync(whisperCli, ['--help'], { stdio: 'ignore' });
+        if (!existsSync(whisperModel)) {
+          speechInstall.current = 'whisper/' + WHISPER_MODEL_ASSET.name;
+          speechInstall.downloaded = 0; speechInstall.total = 0;
+          const mPath = join(tmpRoot, WHISPER_MODEL_ASSET.name);
+          await streamDownload(WHISPER_MODEL_ASSET.url, mPath, (d, t) => { speechInstall.downloaded = d; speechInstall.total = t; });
+          const mHash = createHash('sha256').update(readFileSync(mPath)).digest('hex');
+          if (mHash !== WHISPER_MODEL_ASSET.sha256) throw new Error(WHISPER_MODEL_ASSET.name + ' checksum mismatch: ' + mHash.slice(0, 12) + '…');
+          renameSync(mPath, whisperModel);
+        }
+      }
+    }
+    // Stage 3: optional Kokoro runtime (better TTS voice; opt-in, onnxruntime ~40-80 MB).
+    if (kokoro) await installKokoroRuntime();
+    speechInstall.status = 'ready';
+    speechInstall.downloaded = speechInstall.total = 0;
+    speechInstall.current = '';
+    speechInfo = null;
+    log('Installed offline speech engines (piper + whisper.cpp + ggml-base).' + (kokoro ? ' Kokoro TTS runtime installed.' : ''));
+    return kokoro ? 'installed with kokoro' : 'already installed';
+  } catch (e) {
+    speechInstall.status = 'error';
+    speechInstall.error = e.message;
+    log('Speech install failed:', e.message);
+    throw e;
+  } finally {
+    try { rmdirSync(tmpRoot, { recursive: true }); } catch {}
+  }
+}
+
+async function installKokoroRuntime() {
+  const runtimeDir = join(SPEECH_DIR, 'tts-runtime');
+  speechInstall.status = 'downloading';
+  speechInstall.current = 'kokoro-runtime';
+  speechInstall.downloaded = 0; speechInstall.total = 0;
+  mkdirSync(runtimeDir, { recursive: true });
+  const pkg = join(runtimeDir, 'package.json');
+  if (!existsSync(pkg)) {
+    writeFileSync(pkg, JSON.stringify({ name: 'capsule-tts-runtime', private: true, type: 'module', dependencies: { 'kokoro-js': KOKORO_VERSION } }, null, 2));
+  }
+  const nodeDir = dirname(dirname(process.execPath));
+  const npm = join(nodeDir, 'bin', process.platform === 'win32' ? 'npm.cmd' : 'npm');
+  if (!existsSync(npm)) throw new Error('Portable npm not found at ' + npm);
+  const env = { ...process.env, ONNXRUNTIME_NODE_INSTALL_CUDA: 'skip', TRANSFORMERS_CACHE: join(SPEECH_DIR, 'tts-cache'), HF_HOME: join(SPEECH_DIR, 'tts-cache') };
+  const code = await runChild(npm, ['install', '--no-audit', '--no-fund', '--prefer-online', '--no-progress', '--loglevel=error'], { env });
+  if (code !== 0) {
+    console.log('  ⚠ npm install returned exit ' + code + '; re-running with stdout visible.');
+    const code2 = await runChild(npm, ['install', '--no-audit', '--no-fund', '--prefer-online'], { env });
+    if (code2 !== 0) throw new Error('npm install of kokoro-js failed with exit code ' + code2);
+  }
+  if (!existsSync(join(runtimeDir, 'node_modules', 'kokoro-js'))) throw new Error('kokoro-js runtime did not install');
+}
+
+// ── Offline image generation: stable-diffusion.cpp (CPU) + SD 1.5 Q4_K ─────
+// sd-cpp is pinned to a verified release archive; the model is the public
+// kostakoff SD1.5 Q4_K GGUF (single-file: CLIP text encoder + UNet + VAE), so
+// detection, quantization and VAE all come from one ~3.2 GB file that fits on
+// modest, GPU-less machines (~1.7 GB resident RAM once loaded).
+const IMAGE_DIR = join(DATA_DIR, 'image');
+const IMAGE_BIN_DIR = join(IMAGE_DIR, 'bin');
+const IMAGE_MODEL_DIR = join(IMAGE_DIR, 'models');
+const IMAGE_OUT_DIR = join(IMAGE_DIR, 'out');
+const SDCPP_RELEASE = 'master-872-cc515a0';
+const IMAGE_BACKEND_ASSETS = {
+  'linux-x64': {
+    url: `https://github.com/leejet/stable-diffusion.cpp/releases/download/${SDCPP_RELEASE}/sd-master-cc515a0-bin-Linux-Ubuntu-24.04-x86_64.zip`,
+    sha256: '7be80528b36515665f91267d5906333b46d923919040e449dbe0a9593531ae9b',
+  },
+};
+const IMAGE_MODEL_ASSET = {
+  name: 'realistic-vision-v6-q8.gguf',
+  url: 'https://huggingface.co/second-state/Realistic_Vision_V6.0_B1-GGUF/resolve/main/realisticVisionV60B1_v51HyperVAE-Q8_0.gguf',
+  sha256: '1325806de9a9a552c143fee1912a21aface359e01b7330ac72dce5aca9c193da',
+};
+const IMAGE_SETUP_HINT = 'Image generation installs stable-diffusion.cpp (CPU-only sd-cli) plus the Realistic Vision v6 Q8_0 model (~1.8 GB download). Everything runs locally and offline — no GPU, no API key.';
+const IMAGE_HIRES_STEPS = 15;
+const IMAGE_HIRES_DENOISE = 0.55;
+const DEFAULT_IMAGE_NEGATIVE = 'blurry, low quality, watermark, text, ugly, deformed hands, extra fingers, mutated';
+const SAMPLER_METHODS = ['euler', 'euler_a', 'heun', 'dpm2', 'dpm++2s_a', 'dpm++2m', 'dpm++2mv2', 'ipndm', 'ipndm_v', 'lcm', 'ddim_trailing', 'tcd', 'res_multistep', 'res_2s', 'er_sde', 'euler_cfg_pp', 'euler_a_cfg_pp', 'euler_ge', 'dpm++2m_sde', 'dpm++2m_sde_bt', 'lms'];
+const SCHEDULER_METHODS = ['discrete', 'karras', 'exponential', 'ays', 'gits', 'sgm_uniform', 'simple', 'smoothstep', 'kl_optimal', 'lcm', 'bong_tangent', 'ltx2', 'logit_normal', 'beta'];
+let imageInstall = null;
+let imageJob = null;
+
+function imagePlatformKey() {
+  return process.platform === 'linux' && process.arch === 'x64' ? 'linux-x64' : '';
+}
+
+function imageSupport() {
+  const platformKey = imagePlatformKey();
+  const sdCli = join(IMAGE_BIN_DIR, 'sd-cli');
+  const model = join(IMAGE_MODEL_DIR, IMAGE_MODEL_ASSET.name);
+  return {
+    engine: platformKey ? 'sd-cpp' : '',
+    accel: 'cpu',
+    model: IMAGE_MODEL_ASSET.name,
+    installed: existsSync(sdCli) && existsSync(model),
+    sd_cli: existsSync(sdCli) ? sdCli : '',
+    model_path: existsSync(model) ? model : '',
+    supported: Boolean(platformKey),
+    install_size_gb: 1.8,
+    installing: imageInstall != null && imageInstall.status !== 'ready' && imageInstall.status !== 'error',
+    busy: imageJob != null && (imageJob.status === 'starting' || imageJob.status === 'running'),
+  };
+}
+
+function unzipTo(targetDir, zipPath) {
+  if (findOnPath('unzip')) { execFileSync('unzip', ['-o', '-q', zipPath, '-d', targetDir]); return; }
+  if (findOnPath('python3')) { execFileSync('python3', ['-m', 'zipfile', '-e', zipPath, targetDir]); return; }
+  throw new Error('No unzip or python3 available to extract the sd-cpp archive');
+}
+
+async function installImageStack() {
+  const platformKey = imagePlatformKey();
+  if (!platformKey) throw new Error('Image generation install supports Linux x64 only in this build. ' + IMAGE_SETUP_HINT);
+  mkdirSync(IMAGE_DIR, { recursive: true });
+  const tmpRoot = join(IMAGE_DIR, '.tmp'); mkdirSync(tmpRoot, { recursive: true });
+  const sdCli = join(IMAGE_BIN_DIR, 'sd-cli');
+  const modelPath = join(IMAGE_MODEL_DIR, IMAGE_MODEL_ASSET.name);
+  try {
+    const backend = IMAGE_BACKEND_ASSETS[platformKey];
+    if (!existsSync(sdCli)) {
+      imageInstall.status = 'downloading';
+      imageInstall.current = 'sd-cpp ' + SDCPP_RELEASE;
+      imageInstall.downloaded = 0; imageInstall.total = 0;
+      const zipPath = join(tmpRoot, 'sd-cpp.zip');
+      await streamDownload(backend.url, zipPath, (d, t) => { imageInstall.downloaded = d; imageInstall.total = t; });
+      const actual = createHash('sha256').update(readFileSync(zipPath)).digest('hex');
+      if (actual !== backend.sha256) throw new Error('sd-cpp archive checksum mismatch: ' + actual.slice(0, 12) + '…');
+      imageInstall.status = 'extracting';
+      imageInstall.downloaded = imageInstall.total = 0;
+      mkdirSync(IMAGE_BIN_DIR, { recursive: true });
+      unzipTo(IMAGE_BIN_DIR, zipPath);
+      chmodSync(sdCli, 0o755);
+      execFileSync(sdCli, ['--help'], { stdio: 'ignore' });
+    }
+    if (!existsSync(modelPath)) {
+      imageInstall.status = 'downloading';
+      imageInstall.current = IMAGE_MODEL_ASSET.name;
+      imageInstall.downloaded = 0; imageInstall.total = 0;
+      const dl = join(tmpRoot, IMAGE_MODEL_ASSET.name);
+      await streamDownload(IMAGE_MODEL_ASSET.url, dl, (d, t) => { imageInstall.downloaded = d; imageInstall.total = t; });
+      const actual = createHash('sha256').update(readFileSync(dl)).digest('hex');
+      if (actual !== IMAGE_MODEL_ASSET.sha256) throw new Error(IMAGE_MODEL_ASSET.name + ' checksum mismatch: ' + actual.slice(0, 12) + '…');
+      mkdirSync(IMAGE_MODEL_DIR, { recursive: true });
+      renameSync(dl, modelPath);
+    }
+    imageInstall.status = 'ready';
+    imageInstall.downloaded = imageInstall.total = 0;
+    imageInstall.current = '';
+    log('Installed offline image generation (sd-cpp ' + SDCPP_RELEASE + ' + ' + IMAGE_MODEL_ASSET.name + ').');
+    return 'installed';
+  } catch (e) {
+    imageInstall.status = 'error';
+    imageInstall.error = e.message;
+    log('Image install failed:', e.message);
+    throw e;
+  } finally {
+    try { rmSync(tmpRoot, { recursive: true, force: true }); } catch {}
+  }
+}
+
+// One generation at a time: a job target dir under IMAGE_OUT_DIR, sd-cli run
+// with a pinned cpu thread count, progress surfaced to /api/image/status and
+// each finished PNG recorded (name + sidecar meta.json) for the gallery.
+function startImageJob(params) {
+  const prompt = String(params.prompt || '').trim().slice(0, 4000);
+  if (!prompt) return { error: 'prompt is required', code: 400 };
+  const sampler = String(params.sampler || 'euler_a');
+  if (!SAMPLER_METHODS.includes(sampler)) return { error: 'Unknown sampler "' + sampler + '"', code: 400 };
+  const scheduler = String(params.scheduler || 'karras');
+  if (!SCHEDULER_METHODS.includes(scheduler)) return { error: 'Unknown scheduler "' + scheduler + '"', code: 400 };
+  const clipSkip = Math.max(1, Math.min(2, Math.round(Number(params.clip_skip) || 1)));
+  const s = imageSupport();
+  if (!s.installed) return { error: 'Image generation is not installed yet. Use the install button first.', code: 400 };
+  if (s.busy) return { error: 'Another image is already being generated', code: 409 };
+  const width = Math.min(1024, Math.max(64, Math.round(Number(params.width) || 512)));
+  const height = Math.min(1024, Math.max(64, Math.round(Number(params.height) || 512)));
+  const steps = Math.min(50, Math.max(1, Math.round(Number(params.steps) || 24)));
+  const cfgScale = Math.min(15, Math.max(1, Number(params.cfg_scale) || 7));
+  const seed = Number.isFinite(Number(params.seed)) ? Math.round(Number(params.seed)) : -1;
+  const count = Math.max(1, Math.min(4, Math.round(Number(params.count) || 1)));
+  let negative = String(params.negative_prompt || '').trim().slice(0, 2000);
+  if (!negative) negative = DEFAULT_IMAGE_NEGATIVE;
+  const threads = Math.max(1, Math.min(8, Math.round(cpus().length * (FIT_LEVELS[fitState.level]?.threads_to_cpu || 0.75))));
+  const dir = join(IMAGE_OUT_DIR, 'job-' + Date.now() + '-' + randomBytes(3).toString('hex'));
+  mkdirSync(dir, { recursive: true });
+  const baseW = Math.max(128, Math.round(width / 2));
+  const baseH = Math.max(128, Math.round(height / 2));
+  const meta = {
+    id: basename(dir), prompt, negative_prompt: negative, width, height, steps, cfg_scale: cfgScale,
+    sampler, scheduler, clip_skip: clipSkip,
+    hires: true, base_width: baseW, base_height: baseH,
+    hires_steps: IMAGE_HIRES_STEPS, hires_denoise: IMAGE_HIRES_DENOISE,
+    seed: seed < 0 ? -1 : seed, count, threads, created: Date.now(), status: 'running',
+  };
+  const job = { ...meta, cli: s.sd_cli, model: s.model_path, dir, child: null, exitCode: null };
+  imageJob = job;
+  job.telemetryLabel = 'image: ' + (prompt.slice(0, 40) || 'generate');
+  telemetry.markJobStart(job.telemetryLabel, 'image');
+  runImageJob(job);
+  return job;
+}
+
+// One sd-cli call per image (this build reuses -n for the negative prompt, so
+// the count is satisfied with sequential single-image runs, each with an
+// explicit seed step and an explicit output path). Every image is a 2-pass
+// latent hires run: a cheap half-resolution base, then a detail-refining
+// second pass at the requested size.
+function sdCliArgs(job, index) {
+  const out = index === 0 ? join(job.dir, 'img.png') : join(job.dir, 'img_' + index + '.png');
+  const args = ['-m', job.model, '-p', job.prompt,
+    '-H', String(job.base_height || Math.max(128, Math.round(job.height / 2))),
+    '-W', String(job.base_width || Math.max(128, Math.round(job.width / 2))),
+    '--steps', String(job.steps), '--cfg-scale', String(job.cfg_scale),
+    '--sampling-method', job.sampler || 'euler_a', '--scheduler', job.scheduler || 'karras',
+    '--clip-skip', String(job.clip_skip || 1),
+    '--hires', '--hires-width', String(job.width), '--hires-height', String(job.height),
+    '--hires-steps', String(job.hires_steps || IMAGE_HIRES_STEPS),
+    '--hires-denoising-strength', String(job.hires_denoise || IMAGE_HIRES_DENOISE),
+    '-t', String(job.threads), '-s', String(job.seed >= 0 ? job.seed + index : -1),
+    '-o', out];
+  if (job.negative_prompt) args.push('-n', job.negative_prompt);
+  return args;
+}
+
+function runOneSdCli(job, args) {
+  return new Promise((resolve) => {
+    const child = spawn(job.cli, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    job.child = child;
+    let buffer = '';
+    const onData = (d) => {
+      buffer += d.toString();
+      if (buffer.length > 32_000) buffer = buffer.slice(-32_000);
+      const tail = buffer.slice(-6000);
+      const it = [...tail.matchAll(/(\d+)\s*\/\s*(\d+)\s*-\s*\d+(?:\.\d+)?s\/it/g)];
+      if (it.length) { const m = it[it.length - 1]; job.step = Number(m[1]); job.totalSteps = Number(m[2]); job.progress = job.totalSteps ? m[1] / job.totalSteps : 0; return; }
+      const mb = [...tail.matchAll(/(\d+)\s*\/\s*(\d+)\s*-\s*\d+(?:\.\d+)?MB\/s/g)];
+      if (mb.length) { job.step = Number(mb[mb.length - 1][1]); job.totalSteps = Number(mb[mb.length - 1][2]); }
+    };
+    const lastErrorLine = (text) => {
+      const lines = text.split(/\r?\n/).filter(Boolean);
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i].replace(/\[K/g, '');
+        if (/ERROR|error|failed|abort|bad_alloc|out of memory/i.test(line)) return line.slice(0, 300);
+      }
+      return text.slice(-300);
+    };
+    child.stdout.on('data', onData);
+    child.stderr.on('data', onData);
+    child.on('error', () => { buffer += 'Failed to start sd-cli'; job.buffer = buffer; resolve(-1); });
+    child.on('exit', (code) => {
+      job.child = null;
+      job.buffer = buffer;
+      resolve(code ?? -1);
+    });
+  });
+}
+
+async function runImageJob(job) {
+  let allOk = true;
+  for (let i = 0; i < job.count; i += 1) {
+    if (job.aborted) break;
+    const code = await runOneSdCli(job, sdCliArgs(job, i));
+    job.exitCode = code;
+    if (job.aborted) break;
+    if (code !== 0) { allOk = false; job.status = 'error'; job.error = job.buffer ? lastErrorLineFrom(job.buffer) : 'sd-cli failed with exit code ' + code; break; }
+  }
+  if (job.aborted && job.status !== 'error') { job.status = 'aborted'; job.error = 'Stopped by the user.'; }
+  job.finished = Date.now();
+  job.durationMs = job.finished - job.created;
+  if (job.telemetryLabel) telemetry.markJobStop(job.telemetryLabel);
+  if (allOk && !job.aborted) {
+    const files = readdirSync(job.dir).filter((f) => f.endsWith('.png')).sort();
+    if (!files.length) { job.status = 'error'; job.error = 'sd-cli exited 0 but produced no PNG'; }
+    else {
+      job.status = 'done'; job.files = files;
+      writeFileSync(join(job.dir, 'meta.json'), JSON.stringify({ ...job, cli: undefined, child: undefined, buffer: undefined, progress: undefined, step: undefined, totalSteps: undefined, files }, null, 2), 'utf8');
+      recordChange('image', { dir: job.dir, files: files.map((f) => join(job.dir, f)) }, `generated ${files.length} image(s)`);
+      try {
+        const mp = (Number(job.width) || 0) * (Number(job.height) || 0) / 1_000_000;
+        const minutes = job.durationMs / 60_000;
+        if (mp > 0 && minutes >= 0.1 && Number.isFinite(minutes)) observeFit('minutes_per_mpix', minutes / mp);
+      } catch {}
+    }
+  }
+  log('Image job ' + job.id + (job.status === 'done' ? ' done in ' + Math.round(job.durationMs / 1000) + 's (' + (job.files || []).length + ' image(s))' : ' ended as ' + job.status + (job.error ? ': ' + job.error : '')));
+}
+
+function lastErrorLineFrom(text) {
+  const lines = String(text || '').split(/\r?\n/).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].replace(/\[K/g, '');
+    if (/ERROR|error|failed|abort|bad_alloc|out of memory/i.test(line)) return line.slice(0, 300);
+  }
+  return String(text || '').slice(-300);
+}
+
+function abortImageJob() {
+  if (!imageJob) return false;
+  if (imageJob.child) { try { imageJob.child.kill('SIGTERM'); } catch {} }
+  imageJob.aborted = true;
+  return true;
+}
+
+function imageJobSummaries() {
+  if (!existsSync(IMAGE_OUT_DIR)) return [];
+  return readdirSync(IMAGE_OUT_DIR, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith('job-'))
+    .map((entry) => {
+      const dir = join(IMAGE_OUT_DIR, entry.name);
+      let meta = null;
+      try { meta = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8')); } catch {}
+      const pngs = existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith('.png')).sort() : [];
+      return {
+        id: entry.name,
+        images: pngs,
+        prompt: meta?.prompt || '',
+        width: meta?.width || 0, height: meta?.height || 0, steps: meta?.steps || 0,
+        seed: meta?.seed ?? -1, count: meta?.count || 1,
+        created: meta?.created || statSync(dir).mtimeMs,
+        durationMs: meta?.durationMs || 0,
+        status: meta?.status || 'done',
+      };
+    })
+    .sort((a, b) => b.created - a.created);
+}
+
+function imageJobDir(id) {
+  if (!/^[A-Za-z0-9._-]{1,120}$/.test(String(id || '')) || !String(id).startsWith('job-')) return null;
+  const dir = resolve(join(IMAGE_OUT_DIR, String(id)));
+  if (!dir.startsWith(resolve(IMAGE_OUT_DIR) + sep)) return null;
+  return existsSync(dir) ? dir : null;
 }
 
 function sendJSON(res, code, obj) {
@@ -1450,6 +3438,65 @@ function sameOriginRequest(req) {
 function agentToolsAllowed(req) {
   if (cfg.mode !== 'local' || !isDirectLocalRequest(req)) return false;
   return sameOriginRequest(req);
+}
+
+// ── MCP server governance ───────────────────────────────────────────────────
+// Registration spawns a real child process, so it rides the same governance as
+// every other agent power: a command allowlist (CAPSULE_MCP_ALLOW), plan-mode
+// blocking, sensitive-env refusal, param caps, and an audit journal.
+
+function mcpAllowlist() {
+  return String(process.env.CAPSULE_MCP_ALLOW || 'node,npx,uvx')
+    .split(',').map((s) => s.trim()).filter(Boolean);
+}
+
+function mcpCommandAllowed(command) {
+  const list = mcpAllowlist();
+  if (!list.length) return false;
+  // Bare basenames (node, npx…) must be listed by name. Absolute/relative
+  // paths are allowed when the basename is listed, or the resolved path matches
+  // a listed path entry exactly.
+  if (command.includes('/') || command.includes('\\')) {
+    const abs = resolve(command);
+    if (list.some((entry) => (entry.includes('/') || entry.includes('\\')) && resolve(entry) === abs)) return true;
+  }
+  return list.includes(basename(command));
+}
+
+const MCP_LOG_LIMIT = 256 * 1024;
+function mcpAudit(action, fields = {}) {
+  try {
+    const file = join(DATA_DIR, 'agent', 'mcp.log');
+    mkdirSync(dirname(file), { recursive: true });
+    if (existsSync(file) && statSync(file).size > MCP_LOG_LIMIT) {
+      const tail = readFileSync(file, 'utf8').split('\n').slice(-200);
+      writeFileSync(file, tail.join('\n'));
+    }
+    appendFileSync(file, JSON.stringify({ ts: new Date().toISOString(), action, ...fields }) + '\n');
+  } catch {}
+}
+
+// Returns { client } for a live client (reviving a crashed one in place),
+// { error } when the restart failed, or null when the id is unknown.
+async function mcpAttach(clientId) {
+  const existing = mcpClients.get(clientId);
+  if (!existing) return null;
+  if (!existing._closed) return { client: existing };
+  if (existing._respawning) return { error: existing._respawnError || new Error('MCP server crashed and a restart is already being attempted') };
+  existing._respawning = true;
+  try {
+    const revived = await existing.respawn();
+    await existing.close();
+    mcpClients.set(clientId, revived);
+    mcpAudit('respawn', { id: clientId, command: revived.command, server: revived.serverInfo?.name || '' });
+    return { client: revived };
+  } catch (e) {
+    existing._respawnError = e;
+    mcpAudit('respawn_failed', { id: clientId, command: existing.command, error: e.message });
+    return { error: e };
+  } finally {
+    existing._respawning = false;
+  }
 }
 
 function localControlAllowed(req) {
@@ -1579,7 +3626,7 @@ async function handle(req, res) {
   const rateLimited =
     p.startsWith('/api/agent/')
     || (req.method === 'POST'
-      && (p === '/api/auth/login' || p === '/api/chat' || p === '/api/research' || p === '/api/chatstate' || p.startsWith('/api/speech/') || p.startsWith('/api/models/') || p.startsWith('/api/vault/') || p.startsWith('/api/cloud/') || p.startsWith('/api/agent/') || p.startsWith('/v1/')));
+      && (p === '/api/auth/login' || p === '/api/chat' || p === '/api/chat/summarize' || p === '/api/research' || p === '/api/chatstate' || p.startsWith('/api/speech/') || p.startsWith('/api/image/') || p.startsWith('/api/models/') || p.startsWith('/api/vault/') || p.startsWith('/api/cloud/') || p.startsWith('/api/agent/') || p.startsWith('/v1/')));
   if (rateLimited) {
     const verdict = sharedRateLimiter.check(req);
     if (!verdict.allowed) return rateLimitResponse(res, verdict.retryAfter);
@@ -1708,6 +3755,16 @@ async function handle(req, res) {
     res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store', ...securityHeaders() });
     return res.end(CAPSULE_UI);
   }
+  if (req.method === 'GET' && p === '/jsqr.js') {
+    if (JSQR_RAW === null) return sendJSON(res, 500, { error: 'jsqr.js not found' });
+    res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store', ...securityHeaders() });
+    return res.end(JSQR_RAW);
+  }
+  if (req.method === 'GET' && p === '/sound-modem.js') {
+    if (SOUND_MODEM_RAW === null) return sendJSON(res, 500, { error: 'sound-modem.js not found' });
+    res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store', ...securityHeaders() });
+    return res.end(SOUND_MODEM_RAW);
+  }
 
   const provided = authorize(req, url);
   const remoteExpired = remoteTunnel.expiresAt && Date.now() > remoteTunnel.expiresAt;
@@ -1751,22 +3808,400 @@ async function handle(req, res) {
     catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
     try {
       chatStoreFor(req.username).save(payload.workspace);
+      scheduleMemoryReindex();
       return sendJSON(res, 200, { ok: true });
     } catch (e) {
       return sendJSON(res, 400, { error: e.message });
     }
   }
 
+  // ── Capsule Memory endpoints (local-only; never through a tunnel) ────────
+  if (p.startsWith('/api/memory/') && !isDirectLocalRequest(req)) {
+    return sendJSON(res, 403, { error: 'Memory is available only in the local app' });
+  }
+  if (req.method === 'GET' && p === '/api/memory/status') {
+    const st = memoryState();
+    const stats = memoryStore.stats();
+    const embedder = memoryEmbedder();
+    const semantic = st.enabled ? await embedder.available().catch(() => false) : false;
+    return sendJSON(res, 200, {
+      enabled: !!st.enabled,
+      embedder_model: embedder.model,
+      embedder_ready: !!semantic,
+      mode: st.enabled ? (semantic ? 'semantic' : 'keyword') : 'off',
+      chunks: stats.chunks,
+      byType: stats.byType,
+    });
+  }
+  if (req.method === 'POST' && p === '/api/memory/search') {
+    let body;
+    try { body = JSON.parse(await readBody(req, 20_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const query = String(body.query || '').trim();
+    if (!query) return sendJSON(res, 400, { error: 'query is required' });
+    const { mode, results } = await memorySearch(query, { k: Math.min(12, Math.max(1, Number(body.k) || 6)) });
+    return sendJSON(res, 200, { mode, results: memoryCitationPayload(results) });
+  }
+  if (req.method === 'POST' && p === '/api/memory/reindex') {
+    const out = await memoryReindexNow();
+    return sendJSON(res, 200, { ok: true, ...out });
+  }
+  if (req.method === 'POST' && p === '/api/memory/toggle') {
+    let body = {};
+    try { body = JSON.parse(await readBody(req, 5_000)); } catch {}
+    const enabled = body.enabled !== false;
+    const state = saveMemoryState({ enabled });
+    if (enabled) scheduleMemoryReindex();
+    return sendJSON(res, 200, { ok: true, enabled: state.enabled });
+  }
+  if (req.method === 'POST' && p === '/api/memory/purge') {
+    memoryStore.purge();
+    saveMemoryState({ enabled: false });
+    return sendJSON(res, 200, { ok: true, purged: true });
+  }
+
+  // ── Consolidation cycle endpoints (local-only) ───────────────────────────
+  if (p.startsWith('/api/consolidation/') && !isDirectLocalRequest(req)) {
+    return sendJSON(res, 403, { error: 'The sleep cycle is available only in the local app' });
+  }
+  if (req.method === 'GET' && p === '/api/consolidation/status') {
+    return sendJSON(res, 200, consolidation.status());
+  }
+  if (req.method === 'GET' && p === '/api/consolidation/queue') {
+    return sendJSON(res, 200, { proposals: consolidation.listQueue() });
+  }
+  if (req.method === 'POST' && p === '/api/consolidation/start') {
+    let body = {};
+    try { body = JSON.parse(await readBody(req, 5_000)); } catch {}
+    const startModel = String(body.model || cfg.model || '').trim();
+    if (modelUnloadActive || activeAgentThreads.size) {
+      return sendJSON(res, 409, { error: 'The local model is busy right now — try the sleep cycle once the current run finishes.' });
+    }
+    if (!startModel) {
+      return sendJSON(res, 400, { error: 'Pick a local model first — the cycle thinks with it.' });
+    }
+    consolidation.activeModel = startModel;
+    const started = consolidation.start();
+    started.catch(() => {});
+    return sendJSON(res, 202, { ok: true });
+  }
+  if (req.method === 'POST' && p === '/api/consolidation/cancel') {
+    consolidation.cancel();
+    return sendJSON(res, 200, { ok: true });
+  }
+  if (req.method === 'POST' && p === '/api/consolidation/decide') {
+    let body;
+    try { body = JSON.parse(await readBody(req, 5_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const id = String(body.id || '');
+    const action = body.action === 'dismiss' ? 'dismiss' : body.action === 'approve' ? 'approve' : '';
+    if (!action) return sendJSON(res, 400, { error: "action must be 'approve' or 'dismiss'" });
+    const result = action === 'approve' ? await consolidation.approve(id) : await consolidation.dismiss(id, String(body.reason || ''));
+    if (!result.ok) return sendJSON(res, 404, { error: result.error });
+    return sendJSON(res, 200, { ok: true, remaining: result.remaining });
+  }
+
+  // ── Capsule-to-capsule handshakes (peers: LAN + postcards + sneakernet) ──
+  if (p.startsWith('/api/peers') && !isDirectLocalRequest(req)) {
+    return sendJSON(res, 403, { error: 'Peering is available only in the local app' });
+  }
+  if (req.method === 'GET' && p === '/api/peers') {
+    return sendJSON(res, 200, peersStatus());
+  }
+  if (req.method === 'POST' && p === '/api/peers/import-card') {
+    let body; try { body = JSON.parse(await readBody(req, 50_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    try {
+      const text = String(body.text || '');
+      let card;
+      if (text.includes('CAPX1 ')) {
+        const env = textToEnv(text);
+        if (env.kind !== 'cardref') return sendJSON(res, 400, { error: 'That block is not a contact card.' });
+        card = unpackPostcard(env, { trustedPubs: peersList() }).item;
+      } else {
+        card = JSON.parse(text);
+      }
+      const read = readCard(card);
+      const peers = peersList();
+      if (!peers.some((p) => p.fp === read.fp)) {
+        peers.push({ fp: read.fp, name: read.name, pub: read.pub, dhPub: read.dhPub, caps: read.caps, trustedAt: new Date().toISOString(), words: read.words });
+        writePeers(peers);
+        peersLog(`trusted ${read.name} (${read.fp.slice(0, 12)})`);
+      }
+      return sendJSON(res, 200, { ok: true, peer: read });
+    } catch (e) { return sendJSON(res, 400, { error: 'That card could not be read: ' + e.message }); }
+  }
+  if (req.method === 'POST' && p === '/api/peers/revoke') {
+    let body; try { body = JSON.parse(await readBody(req, 5_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const fp = String(body.fp || '');
+    const before = peersList().length;
+    writePeers(peersList().filter((p) => p.fp !== fp));
+    peersLog(`revoked ${fp.slice(0, 12)}`);
+    return sendJSON(res, 200, { ok: true, removed: before - peersList().length });
+  }
+  if (req.method === 'POST' && p === '/api/peers/postcard') {
+    let body; try { body = JSON.parse(await readBody(req, 100_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    try {
+      const kind = ['note', 'memory', 'procedure'].includes(body.kind) ? body.kind : 'note';
+      const item = body.item && typeof body.item === 'object' ? body.item : { title: String(body.title || '').slice(0, 120), text: String(body.text || '').slice(0, 4000) };
+      const peers = peersList();
+      const peer = body.fp ? peers.find((p) => p.fp === body.fp) : null;
+      const mode = peer ? 'sealed' : 'open';
+      const env = packPostcard(peersIdentity(), { kind, to: peer ? peer.fp : '*', toDhPub: peer?.dhPub || '', item, mode });
+      const text = envToText(env);
+      peersLog(`sent ${kind} postcard${peer ? ' to ' + peer.name : ' (open mode)'} — ${item.title || kind}`);
+      return sendJSON(res, 200, { ok: true, text, mode, target: peer?.name || 'anyone' });
+    } catch (e) { return sendJSON(res, 400, { error: e.message }); }
+  }
+  if (req.method === 'POST' && p === '/api/peers/import') {
+    let body; try { body = JSON.parse(await readBody(req, 100_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    try {
+      const env = textToEnv(String(body.text || ''));
+      if (env.kind === 'cardref') {
+        const card = readCard(unpackPostcard(env, { trustedPubs: peersList() }).item);
+        const peers = peersList();
+        if (!peers.some((p) => p.fp === card.fp)) {
+          peers.push({ fp: card.fp, name: card.name, pub: card.pub, dhPub: card.dhPub, caps: card.caps, trustedAt: new Date().toISOString(), words: card.words });
+          writePeers(peers);
+          peersLog(`trusted ${card.name} (${card.fp.slice(0, 12)}) via postcard`);
+        }
+        return sendJSON(res, 200, { ok: true, card: true, peer: card });
+      }
+      const known = peersList().find((p) => p.fp === env.src);
+      const read = unpackPostcard(env, { identity: peersIdentity(), trustedPubs: peersList() });
+      const inbox = peersInbox();
+      const entry = {
+        id: `inbox-${Date.now().toString(36)}-${randomBytes(2).toString('hex')}`,
+        kind: read.kind, from: read.src, fromName: known?.name || 'unknown sender',
+        item: read.item, at: read.at || new Date().toISOString(), sealed: !!read.sealed, status: 'pending',
+      };
+      inbox.push(entry);
+      writePeersInbox(inbox);
+      peersLog(`received ${read.kind} postcard from ${entry.fromName}${read.sealed ? ' (sealed)' : ''}`);
+      return sendJSON(res, 200, { ok: true, inbox: entry });
+    } catch (e) { return sendJSON(res, 400, { error: 'That postcard could not be read: ' + e.message }); }
+  }
+  if (req.method === 'POST' && p === '/api/peers/inbox/decide') {
+    let body; try { body = JSON.parse(await readBody(req, 10_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const inbox = peersInbox();
+    const it = inbox.find((x) => x.id === String(body.id || '') && x.status === 'pending');
+    if (!it) return sendJSON(res, 404, { error: 'Unknown or already-resolved inbox item.' });
+    if (body.action === 'dismiss') {
+      it.status = 'dismissed';
+      writePeersInbox(inbox);
+      peersLog(`dismissed inbound ${it.kind} from ${it.fromName}`);
+      return sendJSON(res, 200, { ok: true });
+    }
+    if (body.action === 'accept') {
+      try {
+        if (it.kind === 'memory') {
+          await memoryStore.syncSource({ type: 'memory', id: it.id, title: `From ${it.fromName}: ${it.item?.title || 'note'}` }, String(it.item?.text || it.item?.body || ''), memoryEmbedder());
+          memoryStore.save();
+        } else if (it.kind === 'procedure') {
+          const list = readProcedures();
+          list.push({ id: `proc-${Date.now().toString(36)}-${randomBytes(2).toString('hex')}`, name: String(it.item?.name || 'shared procedure'), summary: String(it.item?.summary || ''), steps: (it.item?.steps || []).filter(Boolean).slice(0, 12), source_task: `peer:${it.fromName}`, created: new Date().toISOString(), uses: 0 });
+          writeProcedures(list);
+        } else if (it.kind === 'escrow') {
+          // I became a shard retainer. My capsule keeps the envelope sealed at
+          // rest with the same rules as every other private record.
+          const envelope = readShardEnvelope(it.item);
+          const ownerShort = String(it.from || 'unknown').slice(0, 12);
+          escrowAtomicWrite(join(ESCROW_DIR, 'inbound', `${ownerShort}-${envelope.epoch}.json`), {
+            envelope,
+            ownerName: it.fromName || 'unknown sender',
+            keptAt: Date.now(),
+          });
+          peersLog(`escrow: now holding shard ${envelope.index}/${envelope.total} of ${ownerShort}'s brain (epoch ${envelope.epoch})`);
+        } else if (it.kind === 'escrow-release') {
+          // A friend is asking for their shard back. Only send what they ask
+          // for, to the identity the relationship already trusts.
+          const epoch = String(it.item?.forEpoch || '');
+          const ownerShort = String(it.from || '').slice(0, 12);
+          const held = escrowReadJson(join(ESCROW_DIR, 'inbound', `${ownerShort}-${epoch}.json`));
+          if (!held?.envelope) return sendJSON(res, 404, { error: "I don't hold that shard." });
+          const requester = peersList().find((p) => peerFp(p.pub).slice(0, 12) === ownerShort) || peersList().find((p) => p.fp === it.from);
+          if (!requester) return sendJSON(res, 403, { error: 'The requester is not a trusted peer here. Re-pair first.' });
+          const reply = envToText(packPostcard(peersIdentity(), {
+            kind: 'escrow-release', to: requester.fp, toDhPub: requester.dhPub || '', mode: 'sealed',
+            item: held.envelope,
+          }));
+          peersLog(`escrow: released shard ${held.envelope.index} back to ${requester.name} (epoch ${epoch})`);
+          it.status = 'accepted';
+          writePeersInbox(inbox);
+          return sendJSON(res, 200, { ok: true, reply });
+        }
+      } catch (e) { return sendJSON(res, 500, { error: 'Accepted but storing failed: ' + e.message }); }
+      it.status = 'accepted';
+      writePeersInbox(inbox);
+      peersLog(`accepted inbound ${it.kind} from ${it.fromName}`);
+      return sendJSON(res, 200, { ok: true });
+    }
+    return sendJSON(res, 400, { error: "action must be 'accept' or 'dismiss'" });
+  }
+  if (req.method === 'POST' && p === '/api/peers/listen') {
+    let body; try { body = JSON.parse(await readBody(req, 5_000)); } catch { body = {}; }
+    try {
+      if (body.on === false) { await lanLinkStop(); }
+      else {
+        await lanLinkStart(String(body.label || deviceName()));
+      }
+      return sendJSON(res, 200, { ok: true, listening: !!lanLink });
+    } catch (e) { return sendJSON(res, 500, { error: 'Could not listen on the LAN: ' + e.message }); }
+  }
+
+  // ── Brain escrow: social recovery over postcards ──────────────────────────
+  if (p.startsWith('/api/escrow') && !isDirectLocalRequest(req)) {
+    return sendJSON(res, 403, { error: 'Escrow is available only in the local app' });
+  }
+  if (req.method === 'GET' && p === '/api/escrow/status') {
+    return sendJSON(res, 200, escrowStatus());
+  }
+  if (req.method === 'POST' && p === '/api/escrow/create') {
+    let body; try { body = JSON.parse(await readBody(req, 100_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    try {
+      const result = await escrowCreate(body, { req });
+      if (result.error) return sendJSON(res, result.status || 400, result);
+      return sendJSON(res, 200, result);
+    } catch (e) { return sendJSON(res, 500, { error: e.message }); }
+  }
+  if (req.method === 'POST' && p === '/api/escrow/revoke') {
+    let body; try { body = JSON.parse(await readBody(req, 20_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const result = escrowRevoke(body);
+    return sendJSON(res, result.ok ? 200 : 404, result);
+  }
+  if (req.method === 'POST' && p === '/api/escrow/recover/request') {
+    let body; try { body = JSON.parse(await readBody(req, 20_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    try {
+      const result = escrowRequestRecovery(body);
+      if (result.error) return sendJSON(res, result.status || 400, result);
+      return sendJSON(res, 200, result);
+    } catch (e) { return sendJSON(res, 500, { error: e.message }); }
+  }
+  if (req.method === 'POST' && p === '/api/escrow/recover/apply') {
+    let body; try { body = JSON.parse(await readBody(req, 3_000_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    try {
+      const result = escrowApplyRecovery(body);
+      if (result.error) return sendJSON(res, result.status || 400, result);
+      return sendJSON(res, 200, result);
+    } catch (e) { return sendJSON(res, 400, { error: e.message }); }
+  }
+  if (req.method === 'POST' && p === '/api/peers/sync') {
+    let body; try { body = await readBody(req, 50_000).then(JSON.parse).catch(() => null); } catch { body = null; }
+    if (!body) return sendJSON(res, 400, { error: 'Invalid JSON' });
+    try {
+      const address = String(body.address || '').trim();
+      if (!/^[\w.:\-]+$/.test(address)) return sendJSON(res, 400, { error: 'bad address' });
+      const items = shareItemsFromBody(body);
+      if (!items.length) return sendJSON(res, 400, { error: 'nothing selected to share — tick at least one item' });
+      const result = await lanPushItems(address, Number(body.port) || 0, items);
+      if (!result.ok) return sendJSON(res, 409, { error: 'The peer did not accept the delivery (pair cards first, then try again).', code: 'ACK_REFUSED' });
+      return sendJSON(res, 200, { ok: true, words: result.words, pushed: items.length, peer: result.peer || '' });
+    } catch (e) { return sendJSON(res, 400, { error: 'Could not sync: ' + e.message }); }
+  }
+
+  // ── Peer transports: postcards over bridge / light / sound / radio ────────
+  if (req.method === 'GET' && p === '/api/peers/transport') {
+    return sendJSON(res, 200, { transports: peerTransportBus.status() });
+  }
+  if (req.method === 'POST' && p === '/api/peers/transport/frames') {
+    let body; try { body = JSON.parse(await readBody(req, 100_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    try {
+      let text;
+      if (typeof body.text === 'string') {
+        text = body.text;
+      } else {
+        const items = shareItemsFromBody(body);
+        if (!items.length) return sendJSON(res, 400, { error: 'nothing selected to transmit' });
+        text = envToText(items[0].env);
+      }
+      const frames = transportFrames(text, Number(body.maxBytes) || 900);
+      return sendJSON(res, 200, { frames, count: frames.length });
+    } catch (e) { return sendJSON(res, 400, { error: 'Could not build frames: ' + e.message }); }
+  }
+  if (req.method === 'GET' && p === '/api/peers/transport/qr') {
+    // One server-rendered SVG per frame, so the light transmit page can show
+    // the stream as <img> — the same shape /api/remote/qr already uses.
+    const text = String(url.searchParams.get('text') || '').slice(0, 2300);
+    if (!text) return sendJSON(res, 400, { error: 'empty frame text' });
+    const qr = qrcode(0, 'M');
+    qr.addData(text);
+    qr.make();
+    const svg = qr.createSvgTag({ cellSize: Number(url.searchParams.get('cellSize')) || 5, margin: 4, scalable: true });
+    res.writeHead(200, { 'Content-Type': 'image/svg+xml; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff', ...securityHeaders() });
+    return res.end(svg);
+  }
+  if (req.method === 'POST' && p === '/api/peers/transport/rx') {
+    let body; try { body = JSON.parse(await readBody(req, 100_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    try { return sendJSON(res, 200, transportRx(body)); }
+    catch (e) { return sendJSON(res, 400, { error: e.message }); }
+  }
+  if (req.method === 'POST' && p === '/api/peers/transport/radio') {
+    let body; try { body = JSON.parse(await readBody(req, 50_000)); } catch { body = {}; }
+    try {
+      const d = detectRadio();
+      if (d.mode === 'none') return sendJSON(res, 409, { error: 'radio hardware was not detected — nothing was sent' });
+      let text;
+      if (typeof body.text === 'string' && String(body.text).trim()) {
+        text = String(body.text);
+      } else {
+        const items = shareItemsFromBody(body);
+        if (!items.length) return sendJSON(res, 400, { error: 'nothing selected to transmit' });
+        text = envToText(items[0].env);
+      }
+      const frames = transportFrames(text, Math.min(900, Number(body.maxBytes) || 700));
+      const result = await radioTransport.send({ frames });
+      peersLog(`radio: transmitted ${frames.length} frame(s) on ${d.mode}`);
+      return sendJSON(res, 200, result);
+    } catch (e) { return sendJSON(res, 400, { error: 'Could not send over radio: ' + e.message }); }
+  }
+  if (req.method === 'GET' && p === '/api/peers/bridge') {
+    return sendJSON(res, 200, bridgeTransport.status());
+  }
+  if (req.method === 'POST' && p === '/api/peers/bridge/export') {
+    let body; try { body = JSON.parse(await readBody(req, 100_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    try {
+      const items = shareItemsFromBody(body).map((it) => ({ kind: it.kind, title: it.title, text: envToText(it.env) }));
+      if (!items.length) return sendJSON(res, 400, { error: 'nothing selected to export' });
+      const out = await bridgeTransport.send({ items });
+      peersLog(`bridge: exported ${items.length} item(s) to the drop folder`);
+      return sendJSON(res, 200, out);
+    } catch (e) { return sendJSON(res, 400, { error: 'Could not export: ' + e.message }); }
+  }
+
   // ── Offline speech: whisper.cpp (STT) and piper (TTS), local-only ─────────
-  if (p.startsWith('/api/speech/') && !localControlAllowed(req)) {
-    return sendJSON(res, 403, { error: 'Speech tools are available only in the local app' });
+  if ((p.startsWith('/api/speech/') || p.startsWith('/api/image/')) && !localControlAllowed(req)) {
+    return sendJSON(res, 403, { error: 'Speech and image tools are available only in the local app' });
   }
   if (req.method === 'GET' && p === '/api/speech/status') {
     return sendJSON(res, 200, speechSupport());
   }
+  if (req.method === 'GET' && p === '/api/speech/install') {
+    const s = speechSupport();
+    return sendJSON(res, 200, {
+      installing: s.installing,
+      supported: ['linux-x64', 'linux-arm64'].includes(process.platform === 'linux' ? (process.arch === 'x64' ? 'linux-x64' : 'linux-arm64') : ''),
+      whisper_setup_hint: WHISPER_SETUP_HINT,
+      status: speechInstall ? speechInstall.status : 'idle',
+      downloaded: speechInstall ? speechInstall.downloaded : 0,
+      total: speechInstall ? speechInstall.total : 0,
+      current: speechInstall ? (speechInstall.current || '') : '',
+      error: speechInstall ? (speechInstall.error || '') : '',
+      piper_installed: s.piper,
+      whisper_installed: s.whisper,
+      kokoro_installed: s.kokoro,
+      kokoro_cost_hint: 'Kokoro adds a higher-quality neural voice (~40-80 MB onnxruntime). Optional.',
+    });
+  }
+  if (req.method === 'POST' && p === '/api/speech/install') {
+    if (speechSupport().installing) return sendJSON(res, 409, { error: 'Speech engines are already being installed' });
+    let body = {};
+    try { body = JSON.parse(await readBody(req, 50_000)); } catch {}
+    const kokoro = body.kokoro === true || body.kokoro === 'true' || req.headers['x-install-kokoro'] === '1';
+    speechInstall = { status: 'starting', downloaded: 0, total: 0, current: kokoro ? 'kokoro' : 'piper', error: '', controller: null };
+    speechInfo = null;
+    installSpeechEngines({ kokoro }).catch(() => {});
+    return sendJSON(res, 202, { ok: true, message: kokoro ? 'Installing offline engines + Kokoro voice in the background' : 'Installing offline speech engines in the background' });
+  }
   if (req.method === 'POST' && p === '/api/speech/transcribe') {
     const s = speechSupport();
-    if (!s.whisper) return sendJSON(res, 400, { error: 'whisper.cpp not detected. Install whisper-cli and set WHISPER_MODEL.' });
+    if (!s.whisper) return sendJSON(res, 400, { error: 'whisper.cpp not detected. Use the one-click speech install or set WHISPER_CLI and WHISPER_MODEL.' });
     let audio = null, lang = 'en';
     let raw;
     try { raw = await readRawBody(req, 50_000_000); }
@@ -1798,20 +4233,97 @@ async function handle(req, res) {
   }
   if (req.method === 'POST' && p === '/api/speech/tts') {
     const s = speechSupport();
-    if (!s.piper) return sendJSON(res, 400, { error: 'piper not detected. Install piper and set PIPER_VOICE.' });
     let body; try { body = JSON.parse(await readBody(req, 20_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
     const text = String(body.text || '').trim();
     if (!text || text.length > 4000) return sendJSON(res, 400, { error: 'text up to 4000 chars required' });
     const tmpRoot = join(DATA_DIR, 'tmp'); mkdirSync(tmpRoot, { recursive: true });
+    const engine = body.engine === 'kokoro' ? 'kokoro' : body.engine === 'piper' ? 'piper' : 'piper';
+    if (engine === 'kokoro') {
+      if (!s.kokoro) return sendJSON(res, 400, { error: 'Kokoro TTS not installed. Run the speech install with the Kokoro option, or use piper.' });
+      const worker = join(__dirname, 'lib', 'kokoro-worker.mjs');
+      const outFile = join(tmpRoot, 'tts-kokoro-' + process.pid + '-' + randomBytes(4).toString('hex') + '.wav');
+      const payload = JSON.stringify({ text, voice: String(body.voice || 'af_heart'), speed: Math.min(2, Math.max(0.5, Number(body.speed) || 1)), output: outFile, cacheDir: join(SPEECH_DIR, 'tts-cache'), workerDir: join(SPEECH_DIR, 'tts-runtime') });
+      try {
+        const code = await runChild(process.execPath, [worker, payload]);
+        if (code !== 0) return sendJSON(res, 500, { error: 'kokoro TTS failed with exit code ' + code });
+        const wav = readFileSync(outFile);
+        res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': wav.length, 'Cache-Control': 'no-store' });
+        res.end(wav);
+        return;
+      } finally { try { unlinkSync(outFile); } catch {} }
+    }
+    if (!s.piper) return sendJSON(res, 400, { error: 'piper not detected. Install piper and set PIPER_VOICE.' });
+    let voicePath = s.piper_voice;
+    if (body.voice) {
+      if (!/^[a-z0-9][a-z0-9._-]*\.onnx$/i.test(String(body.voice))) return sendJSON(res, 400, { error: 'Invalid voice name' });
+      const match = s.piper_voices.find((v) => v.name === body.voice);
+      if (!match) return sendJSON(res, 400, { error: 'Voice not installed: ' + body.voice });
+      voicePath = match.path;
+    }
     const outFile = join(tmpRoot, 'tts-' + process.pid + '-' + randomBytes(4).toString('hex') + '.wav');
     try {
-      const code = await runChild(s.piper_cli, ['--model', s.piper_voice, '--output_file', outFile], { input: text });
+      const code = await runChild(s.piper_cli, ['--model', voicePath, '--output_file', outFile], { input: text });
       if (code !== 0) return sendJSON(res, 500, { error: 'piper failed with exit code ' + code });
       const wav = readFileSync(outFile);
       res.writeHead(200, { 'Content-Type': 'audio/wav', 'Content-Length': wav.length, 'Cache-Control': 'no-store' });
       res.end(wav);
       return;
     } finally { try { unlinkSync(outFile); } catch {} }
+  }
+
+  // ── Offline image generation: sd.cpp (CPU) + SD 1.5 Q4_K, local-only ───
+  if (req.method === 'GET' && p === '/api/image/status') {
+    const s = imageSupport();
+    return sendJSON(res, 200, {
+      ...s,
+      setup_hint: IMAGE_SETUP_HINT,
+      install: imageInstall ? { status: imageInstall.status, downloaded: imageInstall.downloaded, total: imageInstall.total, current: imageInstall.current || '', error: imageInstall.error || '' } : { status: 'idle' },
+      job: imageJob
+        ? { id: imageJob.id, status: imageJob.status, prompt: imageJob.prompt, progress: imageJob.progress || 0, step: imageJob.step || 0, totalSteps: imageJob.totalSteps || imageJob.steps, width: imageJob.width, height: imageJob.height, error: imageJob.error || '', files: imageJob.files || [], aborted: Boolean(imageJob.aborted) }
+        : null,
+    });
+  }
+  if (req.method === 'POST' && p === '/api/image/install') {
+    if (imageSupport().installing) return sendJSON(res, 409, { error: 'Image stack is already being installed' });
+    if (speechSupport().installing) return sendJSON(res, 409, { error: 'A speech-engine install is in progress; wait for it to finish first' });
+    imageInstall = { status: 'starting', downloaded: 0, total: 0, current: 'sd-cpp', error: '' };
+    installImageStack().catch(() => {});
+    return sendJSON(res, 202, { ok: true, message: 'Installing image generation stack in the background (~3.2 GB download)' });
+  }
+  if (req.method === 'POST' && p === '/api/image/generate') {
+    let body; try { body = JSON.parse(await readBody(req, 20_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const result = startImageJob(body || {});
+    if (result.error) return sendJSON(res, result.code || 400, { error: result.error });
+    return sendJSON(res, 202, { ok: true, job: { id: result.id, status: result.status, width: result.width, height: result.height, steps: result.steps } });
+  }
+  if (req.method === 'POST' && p === '/api/image/abort') {
+    return sendJSON(res, 200, { ok: true, aborted: abortImageJob() });
+  }
+  if (req.method === 'GET' && p === '/api/image/files') {
+    return sendJSON(res, 200, { images: imageJobSummaries() });
+  }
+  if (req.method === 'DELETE' && p.startsWith('/api/image/file/')) {
+    const dir = imageJobDir(p.slice('/api/image/file/'.length));
+    if (!dir) return sendJSON(res, 404, { error: 'Image not found' });
+    try { rmSync(dir, { recursive: true, force: true }); return sendJSON(res, 200, { ok: true }); }
+    catch (e) { return sendJSON(res, 500, { error: e.message }); }
+  }
+  if (req.method === 'GET' && p.startsWith('/api/image/file/')) {
+    const rest = p.slice('/api/image/file/'.length).split('/');
+    const dir = imageJobDir(rest[0]);
+    if (!dir) return sendJSON(res, 404, { error: 'Image not found' });
+    const pngs = readdirSync(dir).filter((f) => f.endsWith('.png')).sort();
+    const index = Number(rest[1] || 0);
+    const file = pngs[Number.isInteger(index) ? index : 0];
+    if (!file) return sendJSON(res, 404, { error: 'Image not found' });
+    const data = readFileSync(join(dir, file));
+    res.writeHead(200, { 'Content-Type': 'image/png', 'Content-Length': data.length, 'Cache-Control': 'no-store', ...securityHeaders() });
+    return res.end(data);
+  }
+
+  // ── Hardware capability profile (drives backend/model choices) ──────────
+  if (req.method === 'GET' && p === '/api/hardware') {
+    return sendJSON(res, 200, hardwareInfo());
   }
 
   // ── Health probe (drives the UI connection pill) ─────────────────────────
@@ -1823,6 +4335,7 @@ async function handle(req, res) {
         if (u.ok) { ollama = true; const j = await u.json().catch(() => ({})); version = j.version || ''; }
       } catch {}
     }
+    const lan = lanUrls(cfg.host, cfg.port);
     return sendJSON(res, 200, {
       ok: true,
       ollama,
@@ -1831,6 +4344,9 @@ async function handle(req, res) {
       mode: cfg.mode,
       provider: cfg.aiProvider || 'ollama',
       model: cfg.model || '',
+      perf: perfSnapshot(),
+      lan_url: lan[0] || '',
+      hardware: { image_backend: hardwareInfo().image_backend, cpu_cores: hardwareInfo().cpu.cores },
     });
   }
 
@@ -1998,6 +4514,64 @@ async function handle(req, res) {
       ],
     });
   }
+  // ── USB stick installer endpoints (loopback-only via the /api/portable gate) ──
+  if (req.method === 'GET' && p === '/api/portable/usb-targets') {
+    return sendJSON(res, 200, { targets: listUsbTargets() });
+  }
+  if (req.method === 'POST' && p === '/api/portable/usb-plan') {
+    let body = {};
+    try { body = JSON.parse(await readBody(req, 20_000)); } catch {}
+    const include = body && typeof body.include === 'object' && body.include ? body.include : {};
+    const sections = usbCopyPlan(include);
+    const target = String(body.target || '');
+    let free = 0, targetWarnings = [];
+    if (target) {
+      const hit = listUsbTargets().find((t) => resolve(t.path) === resolve(target));
+      if (hit) { free = hit.free_bytes; targetWarnings = hit.warnings; }
+    }
+    let runtimeAllBytes = 0;
+    walkFiles(join(__dirname, 'runtime', 'platforms'), (f) => { try { runtimeAllBytes += statSync(f).size; } catch {} });
+    return sendJSON(res, 200, {
+      sections: planSummary(sections),
+      runtime_all_bytes: runtimeAllBytes,
+      total_bytes: sections.reduce((n, s) => n + s.bytes, 0),
+      total_files: sections.reduce((n, s) => n + s.entries.length, 0),
+      target_free_bytes: free,
+      warnings: targetWarnings,
+    });
+  }
+  if (req.method === 'POST' && p === '/api/portable/usb-copy') {
+    let body = {};
+    try { body = JSON.parse(await readBody(req, 20_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const target = String(body.target || '');
+    const hit = listUsbTargets().find((t) => resolve(t.path) === resolve(target));
+    if (!hit) return sendJSON(res, 400, { error: 'Pick a detected USB drive from the list — arbitrary paths are not allowed.' });
+    if (hit.warnings.some((w) => w.code === 'readonly')) return sendJSON(res, 400, { error: 'That drive is not writable.' });
+    const include = body && typeof body.include === 'object' && body.include ? body.include : {};
+    const sections = usbCopyPlan(include);
+    const totalBytes = sections.reduce((n, s) => n + s.bytes, 0);
+    const issues = [];
+    if (hit.free_bytes && hit.free_bytes < totalBytes + 32 * 1024 * 1024) issues.push(`The drive has ${(hit.free_bytes / (1024 ** 3)).toFixed(1)} GB free, the kit needs ${(totalBytes / (1024 ** 3)).toFixed(1)} GB plus headroom.`);
+    if (hit.warnings.some((w) => w.code === 'fat32') && sections.some((s) => s.entries.some((e) => e.bytes > 4 * 1024 ** 3 - 1))) issues.push('Some files exceed 4 GB, which FAT32 cannot store. Reformat as exFAT/NTFS, or drop the big payloads.');
+    if (issues.length) return sendJSON(res, 507, { error: issues.join(' '), issues });
+    const running = [...usbJobs.values()].find((j) => !j.finished_at);
+    if (running) return sendJSON(res, 409, { error: 'Another USB copy is already running.', id: running.id });
+    const job = startUsbCopyJob(target, sections);
+    return sendJSON(res, 202, { job: publicUsbJob(job) });
+  }
+  if (req.method === 'GET' && p === '/api/portable/usb-copy') {
+    const id = String(url.searchParams.get('id') || '');
+    const job = usbJobs.get(id);
+    if (!job) return sendJSON(res, 404, { error: 'Unknown or expired USB copy job.' });
+    return sendJSON(res, 200, { job: publicUsbJob(job) });
+  }
+  if (req.method === 'DELETE' && p === '/api/portable/usb-copy') {
+    const id = String(url.searchParams.get('id') || '');
+    const job = usbJobs.get(id);
+    if (!job) return sendJSON(res, 404, { error: 'Unknown or expired USB copy job.' });
+    if (!job.finished_at) job.cancel = true;
+    return sendJSON(res, 200, { ok: true, cancelling: !job.finished_at });
+  }
   if (req.method === 'GET' && p === '/api/remote/status') {
     if (!localControlAllowed(req)) return sendJSON(res, 403, { error: 'Capsule Remote controls are available only from the local app' });
     return sendJSON(res, 200, { active: Boolean(remoteTunnel.child), url: remoteTunnel.url, token: remoteTunnel.token, expires_at: remoteTunnel.expiresAt || 0, api_url: remoteTunnel.url ? remoteTunnel.url + '/v1' : '' });
@@ -2099,6 +4673,42 @@ async function handle(req, res) {
     return sendJSON(res, 200, { ok: true });
   }
 
+  // The FreeLLMAPI router row in the Cloud connection dialog runs entirely
+  // against loopback-only endpoints; the /api/cloud/* gate above already
+  // rejects every non-loopback request, so these can never be reached over a
+  // tunnel or remote deployment.
+  if (req.method === 'GET' && p === '/api/cloud/router/status') {
+    const parts = routerBaseParts();
+    // The row may display an unsaved Base-URL edit; the client passes its
+    // locally derived port so the probe matches what the user is typing.
+    const qPort = Number(url.searchParams.get('port') || '');
+    const probePort = Number.isInteger(qPort) && qPort >= 1 && qPort <= 65535 ? qPort : parts.port;
+    const probeExplicit = Boolean(url.searchParams.get('port')) || parts.portExplicit;
+    const detection = await detectReporterPort(probePort, probeExplicit);
+    const running = Boolean(detection.detectedPort);
+    routerTracker.state = running ? 'running' : (routerTracker.pid ? routerTracker.state : 'idle');
+    const docker = dockerProbe();
+    const desktop = routerDesktopApp();
+    return sendJSON(res, 200, {
+      host: parts.host, port: probePort, loopback: parts.loopback,
+      reachable: running, detectedPort: detection.detectedPort,
+      state: routerTracker.state, mode: routerTracker.mode || '',
+      platform: process.platform,
+      docker: { installed: Boolean(docker.bin || process.env.FREELLMAPI_CMD), daemon: docker.daemon, container: docker.container || '' },
+      installedVia: process.env.FREELLMAPI_CMD ? 'custom' : (docker.container ? 'container' : (routerComposeDir() ? 'compose' : (desktop ? 'desktop' : ''))),
+      desktopApp: Boolean(desktop),
+    });
+  }
+  if (req.method === 'POST' && p === '/api/cloud/router/start') {
+    const parts = routerBaseParts();
+    if (!parts.loopback) return sendJSON(res, 400, { error: 'Starting a router only makes sense for a local (loopback) base URL. Open the dashboard and start FreeLLMAPI manually for remote endpoints.' });
+    const result = await ensureRouterRunning(parts.port, parts.portExplicit);
+    if (!result.ok) return sendJSON(res, 500, { error: result.error, code: result.code || '' });
+    if (result.already_running) return sendJSON(res, 200, { ok: true, already_running: true, detectedPort: result.detectedPort });
+    if (result.launching) return sendJSON(res, 200, { ok: true, launching: true });
+    return sendJSON(res, 200, { ok: true, state: result.state, mode: result.mode, detectedPort: result.detectedPort });
+  }
+
   // ── Local model cockpit ─────────────────────────────────────────────────
   // This intentionally exposes only coarse local machine stats plus Ollama's
   // own running-model metadata; it never uploads machine or model information.
@@ -2167,6 +4777,7 @@ async function handle(req, res) {
     if (req.method === 'POST' && p === '/api/agent/write') {
       let payload;
       try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      if (planModeBlocks(res)) return;
       if (payload.approval !== 'write') return sendJSON(res, 403, { error: 'Explicit write approval is required' });
       if (typeof payload.content !== 'string' || payload.content.length > 1_000_000) return sendJSON(res, 400, { error: 'Content must be text under 1 MB' });
       const wrote = agentWriteFile(__dirname, payload.path, payload.content);
@@ -2177,6 +4788,7 @@ async function handle(req, res) {
     if (req.method === 'POST' && p === '/api/agent/command') {
       let payload;
       try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      if (planModeBlocks(res)) return;
       const command = typeof payload.command === 'string' ? payload.command.trim() : '';
       if (payload.approval !== 'run') return sendJSON(res, 403, { error: 'Explicit command approval is required' });
       if (!command || command.length > 500) return sendJSON(res, 400, { error: 'Command must be between 1 and 500 characters' });
@@ -2213,9 +4825,14 @@ async function handle(req, res) {
       return sendJSON(res, 200, output);
     }
 
-    // ── Agent: undo the last agent file change ──────────────────────────────
+    // ── Agent: change ledger + undo (any entry, or the most recent) ─────────
+    if (req.method === 'GET' && p === '/api/agent/ledger') {
+      return sendJSON(res, 200, { entries: listLedger() });
+    }
     if (req.method === 'POST' && p === '/api/agent/undo') {
-      const result = revertLastAgentWrite(__dirname);
+      let id;
+      try { const body = JSON.parse(await readBody(req)); id = body && body.id; } catch {}
+      const result = undoChange(__dirname, id);
       return sendJSON(res, result.ok ? 200 : 400, result);
     }
 
@@ -2223,6 +4840,7 @@ async function handle(req, res) {
     if (req.method === 'POST' && p === '/api/agent/mcp/register') {
       let payload;
       try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      if (planModeBlocks(res)) return;
       const { command, args = [], env = {}, id: requestedId } = payload;
       if (payload.approval !== 'run') return sendJSON(res, 403, { error: 'Explicit MCP process approval is required' });
       if (!command || typeof command !== 'string') return sendJSON(res, 400, { error: 'command is required' });
@@ -2230,38 +4848,72 @@ async function handle(req, res) {
       try { parsed = parseMcpCommand(command, args); } catch (error) { return sendJSON(res, 400, { error: error.message }); }
       const requested = String(requestedId || '');
       if (requested && !/^[A-Za-z0-9._-]{1,80}$/.test(requested)) return sendJSON(res, 400, { error: 'Invalid MCP client id' });
+      if (!mcpCommandAllowed(parsed.executable)) {
+        mcpAudit('register_refused', { command, reason: 'not_allowlisted' });
+        return sendJSON(res, 403, { error: 'MCP server command "' + command + '" is not allowlisted. Default list: node,npx,uvx — set CAPSULE_MCP_ALLOW=comma,separated,names to change it.' });
+      }
+      const sensitive = Object.keys(env).filter((k) => looksSensitiveEnvKey(k));
+      if (sensitive.length) {
+        mcpAudit('register_refused', { command, reason: 'sensitive_env', keys: sensitive });
+        return sendJSON(res, 400, { error: 'MCP env keys that look secret-bearing are refused: ' + sensitive.join(', ') + ' (set them server-side instead)' });
+      }
+      if (JSON.stringify(args).length > 20_000 || JSON.stringify(env).length > 20_000) return sendJSON(res, 400, { error: 'args/env too large' });
       const clientId = requested || 'mcp-' + randomBytes(4).toString('hex');
       if (mcpClients.has(clientId)) return sendJSON(res, 409, { error: 'Client ID already registered. Use /api/agent/mcp/unregister first.' });
       const safeEnv = env && typeof env === 'object' && !Array.isArray(env) ? env : {};
       const client = new McpClient({ command: parsed.executable, args: parsed.args, env: safeEnv });
       try {
         await client.connect();
+        // The agent loop offers MCP tools as mcp_<client>_<tool>; two servers
+        // offering the same tool name would shadow each other — refuse early.
+        const candidateNames = new Set(client.tools.map((t) => sanitizeMcpToolName(clientId, t.name)));
+        for (const [otherId, other] of mcpClients) {
+          for (const t of other.tools) {
+            if (candidateNames.has(sanitizeMcpToolName(otherId, t.name))) {
+              try { await client.close(); } catch {}
+              mcpAudit('register_refused', { command, reason: 'tool_name_collision', id: clientId, conflicts_with: otherId });
+              return sendJSON(res, 409, { error: 'MCP tool name collision: tool "' + t.name + '" is already offered by server "' + otherId + '". Rename one of them and try again.' });
+            }
+          }
+        }
         mcpClients.set(clientId, client);
+        mcpAudit('register', { id: clientId, command, server: client.serverInfo?.name || '', tools: client.tools.length });
         return sendJSON(res, 200, { id: clientId, serverInfo: client.serverInfo, tools: client.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) });
       } catch (e) {
         try { await client.close(); } catch {}
+        mcpAudit('register_failed', { id: clientId, command, error: e.message });
         return sendJSON(res, 502, { error: 'MCP server failed to start: ' + e.message });
       }
     }
     if (req.method === 'GET' && p === '/api/agent/mcp/list') {
       const result = [];
-      for (const [id, client] of mcpClients) {
-        result.push({ id, serverInfo: client.serverInfo, tools: client.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) });
+      for (const [id, registered] of mcpClients) {
+        // A crashed server is revived on demand so tools stay reachable.
+        const entry = registered._closed ? await mcpAttach(id) : { client: registered };
+        const client = entry && entry.client ? entry.client : registered;
+        result.push({ id, serverInfo: client.serverInfo, alive: !client._closed, restarted: client !== registered, tools: client.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) });
       }
       return sendJSON(res, 200, { clients: result });
     }
     if (req.method === 'POST' && p === '/api/agent/mcp/call') {
       let payload;
       try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      if (planModeBlocks(res)) return;
       const { clientId, tool, arguments: args = {} } = payload;
       if (payload.approval !== 'run') return sendJSON(res, 403, { error: 'Explicit MCP tool approval is required' });
       if (!clientId || !tool) return sendJSON(res, 400, { error: 'clientId and tool are required' });
-      const client = mcpClients.get(clientId);
-      if (!client) return sendJSON(res, 404, { error: 'MCP client not found: ' + clientId });
+      if (JSON.stringify(args).length > 200_000) return sendJSON(res, 400, { error: 'arguments must stay under 200 KB' });
+      const entry = await mcpAttach(clientId);
+      if (!entry) return sendJSON(res, 404, { error: 'MCP client not found: ' + clientId });
+      if (entry.error) return sendJSON(res, 502, { error: 'MCP server failed to restart: ' + entry.error.message });
       try {
-        const result = await client.callTool(tool, args);
+        const result = await entry.client.callTool(tool, args);
+        mcpAudit('call', { id: clientId, tool, bytes: JSON.stringify(args).length, ok: true });
         return sendJSON(res, 200, { result });
-      } catch (e) { return sendJSON(res, 502, { error: e.message }); }
+      } catch (e) {
+        mcpAudit('call', { id: clientId, tool, ok: false, error: e.message });
+        return sendJSON(res, 502, { error: e.message });
+      }
     }
     if (req.method === 'POST' && p === '/api/agent/mcp/unregister') {
       let payload;
@@ -2272,7 +4924,129 @@ async function handle(req, res) {
       if (!client) return sendJSON(res, 404, { error: 'MCP client not found: ' + clientId });
       await client.close();
       mcpClients.delete(clientId);
+      mcpAudit('unregister', { id: clientId });
       return sendJSON(res, 200, { ok: true });
+    }
+
+    // ── Agent mode: Plan (read-only) / Build ────────────────────────────────
+    if (req.method === 'GET' && p === '/api/agent/mode') {
+      return sendJSON(res, 200, { mode: currentAgentMode });
+    }
+    if (req.method === 'POST' && p === '/api/agent/mode') {
+      let payload;
+      try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      const nextMode = payload.mode === 'plan' || payload.mode === 'build' || payload.mode === 'code' ? payload.mode : null;
+      if (!nextMode) return sendJSON(res, 400, { error: 'mode must be "plan", "build", or "code"' });
+      currentAgentMode = nextMode;
+      return sendJSON(res, 200, { mode: currentAgentMode });
+    }
+
+    // ── Our Norms: the two-sided standing agreement ─────────────────────────
+    if (req.method === 'GET' && p === '/api/agent/norms') {
+      const content = readNorms();
+      return sendJSON(res, 200, { exists: !!content, content, default: NORMS_DEFAULT, file: 'norms.md' });
+    }
+    if (req.method === 'POST' && p === '/api/agent/norms') {
+      let payload;
+      try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      const content = String(payload.content || '').trim();
+      if (!content) return sendJSON(res, 400, { error: 'content is required' });
+      if (content.length > 20_000) return sendJSON(res, 400, { error: 'norms too long (max 20000 chars)' });
+      if (payload.adopt !== true) return sendJSON(res, 403, { error: 'Adopting these norms as binding must be confirmed explicitly.' });
+      try {
+        mkdirSync(DATA_DIR, { recursive: true });
+        writeFileSync(NORMS_FILE + '.tmp', content, 'utf8');
+        renameSync(NORMS_FILE + '.tmp', NORMS_FILE);
+      } catch (e) {
+        return sendJSON(res, 500, { error: 'Failed to save norms: ' + e.message });
+      }
+      appendNormsLog('Norms saved (adopted) by the human.');
+      return sendJSON(res, 200, { ok: true, exists: true, file: 'norms.md' });
+    }
+
+    // ── "Teach once": procedures learned from successful runs ──────────────
+    if (req.method === 'GET' && p === '/api/agent/procedures') {
+      return sendJSON(res, 200, { procedures: readProcedures() });
+    }
+    if (req.method === 'GET' && p === '/api/agent/procedures/suggest') {
+      const task = String(url.searchParams.get('task') || '').slice(0, 2000);
+      return sendJSON(res, 200, { suggestions: suggestProceduresFor(task) });
+    }
+    if (req.method === 'POST' && p === '/api/agent/procedures/distill') {
+      let body;
+      try { body = JSON.parse(await readBody(req, 30_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      const model = String(body.model || cfg.model || '').trim();
+      const inputPack = { task: body.task, content: body.content, trail: Array.isArray(body.trail) ? body.trail.map((t) => String(t).slice(0, 40)).slice(0, 12) : [] };
+      if (model) {
+        try {
+          const distilled = await distillProcedure(model, inputPack);
+          if (distilled) return sendJSON(res, 200, { procedure: distilled });
+        } catch {}
+      }
+      // Offline / model failure: still open the dialog with a template built
+      // from the actual trail — the user edits and saves what matters.
+      return sendJSON(res, 200, { procedure: procedureTemplate(inputPack), distilled: false });
+    }
+    if (req.method === 'POST' && p === '/api/agent/procedures') {
+      let body;
+      try { body = JSON.parse(await readBody(req, 20_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      const cleaned = cleanProcedure(body || {});
+      if (!cleaned.name || !cleaned.steps.length) return sendJSON(res, 400, { error: 'A procedure needs a name and at least one step.' });
+      const list = readProcedures();
+      const id = /^proc-[a-z0-9-]+$/.test(String(body.id || '')) ? String(body.id) : '';
+      if (id) {
+        const i = list.findIndex((p) => p.id === id);
+        if (i < 0) return sendJSON(res, 404, { error: 'Unknown procedure.' });
+        list[i] = { ...list[i], ...cleaned, id: list[i].id, uses: list[i].uses || 0 };
+        writeProcedures(list);
+        return sendJSON(res, 200, { ok: true, procedure: list[i] });
+      }
+      const procedure = { id: `proc-${Date.now().toString(36)}-${randomBytes(3).toString('hex')}`, ...cleaned, source_task: String(body.source_task || '').slice(0, 300), created: new Date().toISOString(), uses: 0 };
+      list.push(procedure);
+      while (list.length > PROC_CAP.count) list.shift();
+      writeProcedures(list);
+      return sendJSON(res, 200, { ok: true, procedure });
+    }
+    if (req.method === 'DELETE' && p === '/api/agent/procedures') {
+      const id = String(url.searchParams.get('id') || '');
+      if (!/^proc-[a-z0-9-]+$/.test(id)) return sendJSON(res, 400, { error: 'invalid id' });
+      const list = readProcedures();
+      const next = list.filter((p) => p.id !== id);
+      if (next.length === list.length) return sendJSON(res, 404, { error: 'Unknown procedure.' });
+      writeProcedures(next);
+      return sendJSON(res, 200, { ok: true });
+    }
+    if (req.method === 'POST' && p === '/api/agent/procedures/use') {
+      let body;
+      try { body = JSON.parse(await readBody(req, 5_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      const id = String(body.id || '');
+      if (!/^proc-[a-z0-9-]+$/.test(id)) return sendJSON(res, 400, { error: 'invalid id' });
+      const list = readProcedures();
+      const p2 = list.find((x) => x.id === id);
+      if (!p2) return sendJSON(res, 404, { error: 'Unknown procedure.' });
+      p2.uses = (p2.uses || 0) + 1;
+      writeProcedures(list);
+      return sendJSON(res, 200, { ok: true, uses: p2.uses });
+    }
+    if (req.method === 'GET' && p === '/api/agent/procedures/suggest') {
+      const task = String(url.searchParams.get('task') || '');
+      return sendJSON(res, 200, { suggestions: suggestProceduresFor(task) });
+    }
+    if (req.method === 'POST' && p === '/api/agent/procedures/distill') {
+      let body;
+      try { body = JSON.parse(await readBody(req, 50_000)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      const task = String(body.task || '').trim();
+      const content = String(body.content || '');
+      if (!task || !content) return sendJSON(res, 400, { error: 'task and content are required' });
+      const trail = Array.isArray(body.trail) ? body.trail.map((t) => String(t).slice(0, 60)).slice(0, 25) : [];
+      const model = String(body.model || cfg.model || '').trim();
+      if (model) {
+        try {
+          const distilled = await distillProcedure(model, { task, content, trail });
+          if (distilled) return sendJSON(res, 200, { ...distilled, offline: false });
+        } catch {}
+      }
+      return sendJSON(res, 200, { ...procedureTemplate({ task, trail }), offline: true });
     }
 
     // ── Agent loop: autonomous observe→think→act cycle ────────────────────
@@ -2286,7 +5060,39 @@ async function handle(req, res) {
       if (!model) return sendJSON(res, 400, { error: 'model is required' });
       const autonomy = ['supervised', 'selective', 'auto'].includes(payload.autonomy) ? payload.autonomy : 'selective';
       const skillPrompt = String(payload.skill_prompt || '').trim();
-      const readonly = Boolean(payload.plan);
+      const norms = readNorms();
+      const mode = payload.mode === 'plan' || payload.mode === 'build' || payload.mode === 'code' ? payload.mode : (payload.plan ? 'plan' : 'build');
+      const readonly = mode === 'plan';
+      const critic = payload.critic === true;
+      if (mode === 'plan') currentAgentMode = 'plan';
+      const supportsTools = await modelSupportsTools(model);
+      // Capsule Memory: auto-context from the local index + the read-only
+      // recall tool. Local-only (this endpoint never runs through tunnels).
+      const memoryNote = (await memoryContextBlock(task, { k: 3, header: 'Recalled memory for this run' })).block;
+      const agentHooks = {
+        memorySearch: async (query, opts) => (await memorySearch(query, opts)).results,
+      };
+
+      // MCP bridge: every registered server offers tools to the model as
+      // mcp_<client>_<tool>; each call routes through mcpAttach so a crashed
+      // server revives transparently, and each call is journaled as an
+      // 'agent'-visiting call in the MCP audit log.
+      const mcpToolset = buildMcpToolset([...mcpClients].map(([id, client]) => ({ id, tools: client.tools })));
+      if (mcpToolset.error) return sendJSON(res, 409, { error: mcpToolset.error });
+      agentHooks.mcpMap = mcpToolset.map;
+      agentHooks.mcpCall = async (target, toolArgs) => {
+        const entry = await mcpAttach(target.client);
+        if (!entry) return { error: 'MCP server "' + target.client + '" was unregistered mid-run' };
+        if (entry.error) return { error: 'MCP server "' + target.client + '" failed to restart: ' + entry.error.message };
+        try {
+          const result = await entry.client.callTool(target.tool, toolArgs);
+          mcpAudit('call', { id: target.client, tool: target.tool, via: 'agent', ok: true, bytes: JSON.stringify(toolArgs).length });
+          return result;
+        } catch (e) {
+          mcpAudit('call', { id: target.client, tool: target.tool, via: 'agent', ok: false, error: e.message });
+          return { error: e.message };
+        }
+      };
 
       // Per-chat conversational memory: continue the saved thread, or seed from
       // recent chat history when this chat has no saved agent context yet.
@@ -2320,16 +5126,32 @@ async function handle(req, res) {
       activeAgentLoops.set(loopId, controller);
       sendSSE({ type: 'loop_started', loop_id: loopId });
 
+      // Pre-flight: evict other resident models before loading the requested
+      // one when RAM is tight, so a model swap cannot stall generation.
+      try {
+        const loadedModels = await ollamaLoadedModels();
+        if (!activeOllamaGenerations.size && shouldFreeMemory(loadedModels, model, { totalmem: totalmem(), freemem: freemem() })) {
+          const others = otherModelNames(loadedModels, model);
+          if (others.length) {
+            sendSSE({ type: 'memory', message: `Freeing memory: unloading ${others.length} other model${others.length === 1 ? '' : 's'} before loading ${model}.` });
+            const failures = await unloadOllamaModels(others);
+            if (failures.length) sendSSE({ type: 'memory', message: `Memory warning: could not unload ${failures.map((f) => `${f.model}: ${f.error}`).join('; ')}` });
+          }
+        }
+      } catch {}
+
       // Approval tracking (shared with /api/agent/approve endpoint)
       const approvalIds = new Set();
 
       // LLM call function (streams tokens through SSE when connected)
       const llmCall = async (messages, tools, onToken) => {
+        const usableTools = supportsTools ? tools : [];
         const numCtx = await ollamaContextFor(model);
         const streamed = await streamOllamaChat({
           model, messages, signal: controller.signal, numCtx, temperature: 0.3,
-          tools: tools.map(t => ({ type: 'function', function: t.function })),
+          tools: usableTools.map(t => ({ type: 'function', function: t.function })),
           onToken: onToken ? (delta) => sendSSE({ type: 'token', delta }) : undefined,
+          onReasoning: (delta) => sendSSE({ type: 'reasoning', delta }),
         });
         return {
           content: streamed.content,
@@ -2349,12 +5171,15 @@ async function handle(req, res) {
         if (event.type === 'waiting_approval') {
           const approvalId = 'appr-' + randomBytes(12).toString('hex');
           approvalIds.add(approvalId);
-          pendingApprovalsGlobal.set(approvalId, event.resolve);
+          const kind = event.kind === 'norms' ? 'norms' : 'tool';
+          pendingApprovalsGlobal.set(approvalId, { resolve: event.resolve, kind, rule: event.rule || '' });
           sendSSE({
             type: 'approval_needed',
             approval_id: approvalId,
             name: event.name,
             arguments: event.arguments,
+            kind,
+            rule: event.rule || '',
           });
           return;
         }
@@ -2366,6 +5191,8 @@ async function handle(req, res) {
         const result = await runAgentLoop({
           task, model, workspaceRoot: __dirname, autonomy, skillPrompt, readonly,
           initialMessages: savedThread, onEvent, llmCall, signal: controller.signal,
+          supportsTools, norms, critic, hooks: agentHooks, memoryNote,
+          mcpTools: mcpToolset.tools,
         });
         loopResult = result;
         if (chatId && Array.isArray(loopResult.thread)) saveAgentThread(chatId, loopResult.thread);
@@ -2378,9 +5205,9 @@ async function handle(req, res) {
         }
       } finally {
         for (const approvalId of approvalIds) {
-          const resolve = pendingApprovalsGlobal.get(approvalId);
+          const entry = pendingApprovalsGlobal.get(approvalId);
           pendingApprovalsGlobal.delete(approvalId);
-          if (resolve) resolve(false);
+          if (entry?.resolve) entry.resolve(false);
         }
         releaseGeneration();
         activeAgentLoops.delete(loopId);
@@ -2409,6 +5236,7 @@ async function handle(req, res) {
     if (req.method === 'POST' && p === '/api/agent/organize/apply') {
       let payload;
       try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+      if (planModeBlocks(res)) return;
       if (payload.approval !== 'organize') return sendJSON(res, 403, { error: 'Explicit organize approval is required' });
       const plan = buildOrganizePlan(__dirname, payload.path, payload.style);
       if (!plan.ok) return sendJSON(res, 400, { error: plan.error });
@@ -2424,10 +5252,16 @@ async function handle(req, res) {
       try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
       const { approval_id, approved } = payload;
       if (!approval_id) return sendJSON(res, 400, { error: 'approval_id is required' });
-      const resolve = pendingApprovalsGlobal.get(approval_id);
-      if (!resolve) return sendJSON(res, 404, { error: 'Approval not found or already resolved' });
+      const entry = pendingApprovalsGlobal.get(approval_id);
+      if (!entry) return sendJSON(res, 404, { error: 'Approval not found or already resolved' });
       pendingApprovalsGlobal.delete(approval_id);
-      resolve(Boolean(approved));
+      const decided = Boolean(approved);
+      if (entry.kind === 'norms') {
+        appendNormsLog(decided
+          ? `NORM-OVERRIDE rule="${entry.rule || ''}" — human proceeded deliberately.`
+          : `NORM-DEFER-HONORED rule="${entry.rule || ''}" — human declined to proceed.`);
+      }
+      entry.resolve(decided);
       return sendJSON(res, 200, { ok: true });
     }
 
@@ -2493,6 +5327,29 @@ async function handle(req, res) {
     }
 
     return sendJSON(res, 404, { error: 'Unknown agent tool' });
+  }
+
+  // ── Fit: the machine's own settings ─────────────────────────────────────
+  if (req.method === 'GET' && p === '/api/fit') {
+    return sendJSON(res, 200, await fitPayload());
+  }
+  if (req.method === 'POST' && p === '/api/fit/level') {
+    let body;
+    try { body = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const level = body && body.level;
+    if (!FIT_LEVELS[level]) return sendJSON(res, 400, { error: 'Unknown fit level: use frugal, balanced, or max' });
+    fitState = { ...fitState, level };
+    saveFitState(DATA_DIR, fitState);
+    return sendJSON(res, 200, { ok: true, level, recommendation: await fitPayload() });
+  }
+  if (req.method === 'POST' && p === '/api/fit/observe') {
+    let body;
+    try { body = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const before = fitState.observed[body && body.kind]?.length || 0;
+    fitState = recordObservation(fitState, body && body.kind, body && body.value);
+    const recorded = (fitState.observed[body && body.kind]?.length || 0) > before;
+    if (recorded) saveFitState(DATA_DIR, fitState);
+    return sendJSON(res, 200, { ok: true, recorded });
   }
 
   // ── Local-only Model Library ─────────────────────────────────────────────
@@ -2583,11 +5440,7 @@ async function handle(req, res) {
         });
       }
 
-      const failures = [];
-      for (const model of targets) {
-        try { await ollamaJSON('POST', '/api/generate', { model, keep_alive: 0 }, 30000); }
-        catch (error) { failures.push({ model, error: error.message }); }
-      }
+      const failures = await unloadOllamaModels(targets);
 
       let stillRunning;
       try { stillRunning = await waitForOllamaUnload(targets); }
@@ -2950,6 +5803,27 @@ async function handle(req, res) {
     return sendJSON(res, 200, { downloads: [...downloads.values()].map(publicModelJob) });
   }
 
+  // ── Condense part of a chat with the local model (used by the bundled UI) ─
+  if (p === '/api/chat/summarize' && req.method === 'POST') {
+    let body;
+    try { body = await readBody(req); } catch (e) { return sendJSON(res, 400, { error: e.message }); }
+    let payload;
+    try { payload = JSON.parse(body || '{}'); }
+    catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    const model = String(payload.model || '').trim() || String(cfg.model || '').trim();
+    if (!model) return sendJSON(res, 400, { error: 'model is required' });
+    const messages = Array.isArray(payload.messages) ? payload.messages : [];
+    const textable = messages.filter((m) => m && typeof m.role === 'string' && typeof m.content === 'string');
+    if (!textable.length) return sendJSON(res, 400, { error: 'Nothing to summarize' });
+    if (textable.length > 200) return sendJSON(res, 400, { error: 'Too many messages; summarize in smaller chunks' });
+    if (body.length > 5_000_000) return sendJSON(res, 413, { error: 'Payload too large to summarize' });
+    try {
+      const summary = await ollamaSummarizeChat(model, textable);
+      if (!summary) return sendJSON(res, 502, { error: 'The model returned an empty summary' });
+      return sendJSON(res, 200, { summary });
+    } catch (e) { console.error('[summarize] ' + e.message); return sendJSON(res, 500, { error: 'Summarize failed: ' + e.message }); }
+  }
+
   // ── Native streaming chat (used by the bundled UI) ───────────────────────
   if (p === '/api/chat' && req.method === 'POST') {
     let body;
@@ -2995,6 +5869,24 @@ async function handle(req, res) {
     if (req.method !== 'GET') { try { body = await readBody(req); } catch {} }
     if (isCloudProvider()) return sendJSON(res, 404, { error: 'Unsupported cloud API endpoint' });
     return proxyV1(req.method, p, body, res);
+  }
+
+  // ── Machine telemetry — local readings + AI job energy ──────────────────
+  if (p.startsWith('/api/telemetry') && !localControlAllowed(req)) {
+    return sendJSON(res, 403, { error: 'Machine telemetry is available only in the local app' });
+  }
+  if (req.method === 'GET' && p === '/api/telemetry/status') {
+    const status = telemetry.status();
+    return sendJSON(res, 200, {
+      ...status,
+      narrate: narrateTelemetry(status.now),
+      diagnose: telemetry.diagnose(),
+      runtimeSeconds: telemetry.runtimeSeconds(),
+    });
+  }
+  if (req.method === 'GET' && p === '/api/telemetry/history') {
+    const hours = Math.min(24, Math.max(0.25, Number(url.searchParams.get('hours')) || 6));
+    return sendJSON(res, 200, { hours, samples: telemetry.history(hours) });
   }
 
   sendJSON(res, 404, { error: 'Not found' });
@@ -3078,6 +5970,7 @@ async function proxyV1(method, path, body, res) {
       timeout: 300000,
     });
 
+    // NOTE: destructure the loop variable, not the array of header names.
     for (const k of ['content-type', 'cache-control', 'connection', 'transfer-encoding']) {
       const val = r.headers.get(k);
       if (val) res.setHeader(k, val);
@@ -3114,6 +6007,16 @@ function openaiBase() {
   return (cfg.openaiBaseUrl || 'https://api.openai.com/v1').replace(/\/+$/, '');
 }
 
+// Join an OpenAI-style absolute path (/v1/...) to the configured base without
+// doubling the "/v1" suffix the base already carries (e.g. FreeLLMAPI's
+// http://localhost:3001/v1 or the default api.openai.com/v1).
+function openaiUrl(path) {
+  const base = openaiBase();
+  let sub = String(path || '').replace(/^\/+/, '');
+  if (sub.startsWith('v1/') && /\/v1$/.test(base)) sub = sub.slice(3);
+  return base + '/' + sub;
+}
+
 // Convert OpenAI chat-completions message list into Anthropic's wire format.
 function toAnthropicMessages(messages) {
   let system = '';
@@ -3147,6 +6050,7 @@ async function proxyCloud(method, path, body, res) {
     const h = { ...(mapped.body != null ? { 'Content-Type': 'application/json' } : {}), ...headers };
     const r = await fetch(url, { method, headers: h, ...(mapped.body != null ? { body: mapped.body } : {}) });
     logEgress({ provider: cfg.aiProvider, path, status: r.status, target: url });
+    // NOTE: destructure the loop variable, not the array of header names.
     for (const k of ['content-type', 'cache-control', 'connection', 'transfer-encoding']) {
       const val = r.headers.get(k);
       if (val) res.setHeader(k, val);
@@ -3164,7 +6068,7 @@ function mapProviderPath(path, method, body) {
   try { payload = body ? JSON.parse(body) : {}; } catch { payload = {}; }
 
   if (cfg.aiProvider === 'openai') {
-    const url = openaiBase() + path;
+    const url = openaiUrl(path);
     const headers = { 'Authorization': 'Bearer ' + (cfg.openaiApiKey || '') };
     if (openaiBase().includes('openrouter')) {
       headers['HTTP-Referer'] = 'http://localhost:5173';
@@ -3268,12 +6172,33 @@ async function streamChat(payload, res) {
   // leave the Capsule. Local history, project excerpts, prompts, and tool
   // output are discarded server-side even if a browser misbehaves.
   const incomingMessages = payload.messages || [];
-  const messages = payload.mode === 'cloud'
+  let messages = payload.mode === 'cloud'
     ? incomingMessages.filter((m) => m && m.role === 'user').slice(-1)
     : incomingMessages;
 
   if (provider === 'ollama' && modelUnloadActive) {
     return sendJSON(res, 409, { error: 'A model memory operation is running. Try again in a moment.' });
+  }
+
+  // Auto-compaction: condense the older messages locally when the pending
+  // conversation would overflow the model's context window. Only ever runs for
+  // the local provider and never touches cloud-bound messages (those were
+  // already trimmed to the last user turn above).
+  if (provider === 'ollama' && payload.mode !== 'cloud') {
+    try {
+      // Capsule Memory: local-only recall. The cloud branch above already
+      // reduced the payload to the bare last user turn, so nothing here can
+      // leak beyond this machine.
+      const { block } = await memoryContextBlock(
+        (() => { const m = [...messages].reverse().find((x) => x && x.role === 'user'); if (!m) return ''; return Array.isArray(m.content) ? m.content.filter((p) => p && p.type === 'text').map((p) => p.text).join(' ') : String(m.content || ''); })(),
+        { k: 4 },
+      );
+      if (block) messages = [{ role: 'system', content: block }, ...messages];
+    } catch {}
+    try {
+      const condensed = await maybeCompactChatMessages(messages, String(payload.model || cfg.model || '').trim());
+      if (condensed) messages = condensed;
+    } catch {}
   }
 
   res.writeHead(200, {
@@ -3796,7 +6721,10 @@ server.listen(cfg.port, cfg.host, async () => {
   console.log('  Provider        : ' + (cfg.aiProvider || 'ollama'));
   console.log('  Backend         : ' + (isCloudProvider() ? openaiBase() : cfg.ollamaUrl));
   console.log('  Mode            : ' + cfg.mode + (cfg.authToken ? '  (auth token enabled)' : ''));
+  console.log('  Hardware        : ' + hardwareSummary());
   console.log('  Models folder   : ' + MODELS_DIR);
+  const imgSupp = imageSupport();
+  console.log('  Image gen       : ' + (imgSupp.installed ? 'sd-cpp · ' + imgSupp.model.replace(/\.gguf$/i, '') + ' ready' : 'not installed — one-click in the app'));
   try {
     const integrity = portableIntegrityReport(__dirname, INTEGRITY_FILE, { allowUnsigned: CAPSULE_TRUST.allowUnsigned });
     if (integrity.verified) console.log('  Capsule files   : ' + integrity.files.length + ' files verified');
@@ -3805,9 +6733,13 @@ server.listen(cfg.port, cfg.host, async () => {
     if (lastIntegrityRepair?.restored?.length) console.log('  Self-heal       : restored ' + lastIntegrityRepair.restored.length + ' missing release file(s)');
   } catch {}
   if (cfg.mode === 'tunnel') await startTunnel();
+  const lan = lanUrls(cfg.host, cfg.port);
+  if (lan.length) console.log('  LAN access      : ' + lan.join('   '));
   // Auto-register any .gguf files dropped into the models folder (local providers).
   if (!isCloudProvider()) {
     try { await autoRegisterLocalModels(); } catch (e) { log('Local model auto-register error:', e); }
   }
   console.log('  Press Ctrl+C to stop\n');
+  startTelemetrySampler();
+  peerTransportBus.start('radio').catch((e) => log('radio transport start failed:', e.message));
 });

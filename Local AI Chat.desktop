@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Local AI Chat
+Comment=Private local AI workspace — chat, agent, voice, images
+Keywords=AI;chat;local;capsule;
+Exec=sh -c "cd -- \"\$(dirname -- \"\$1\")\" && exec bash start-portable.sh" -- %k
+Terminal=false
+Categories=Utility;
+StartupNotify=true
