@@ -374,7 +374,7 @@ test('agent mode: plan blocks manual write/command/mcp call, build restores', as
     assert.equal(writeAfter.status, 403, 'build mode lifts the plan gate back to normal approval checks');
     assert.match(writeAfter.body.error, /approval/i);
 
-    const mcpAfter = await call('/api/agent/mcp/call', jsonInit({ clientId: 'nope', tool: 'echo', arguments: {} }));
+    const mcpAfter = await call('/api/agent/mcp/call', jsonInit({ clientId: 'nope', tool: 'echo', arguments: {}, approval: 'run' }));
     assert.equal(mcpAfter.status, 404, 'mcp gate lifted in build mode (fails on missing client, not 409)');
   } finally {
     server.kill('SIGTERM');

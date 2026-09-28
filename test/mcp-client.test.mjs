@@ -44,7 +44,7 @@ test('McpClient callTool rejects after close', async () => {
   await assert.rejects(() => client.callTool('echo', { text: 'x' }), /closed/i);
 });
 
-test('McpClient hardening: hermetic child env by default, opt-in inherit', () => {
+test('McpClient hardening: child env stays hermetic even if legacy inherit is requested', () => {
   process.env.LOCAL_AI_TEST_SECRET = 'exists-on-host-only';
   try {
     const sealed = new McpClient({ command: 'node', env: { MY_FLAG: '1' } });
@@ -53,7 +53,7 @@ test('McpClient hardening: hermetic child env by default, opt-in inherit', () =>
     assert.ok(sealed.env.PATH, 'PATH survives for command resolution');
     process.env.CAPSULE_MCP_INHERIT_ENV = '1';
     const inherited = new McpClient({ command: 'node' });
-    assert.equal(inherited.env.LOCAL_AI_TEST_SECRET, 'exists-on-host-only', 'opt-in restores inheritance');
+    assert.equal(inherited.env.LOCAL_AI_TEST_SECRET, undefined, 'legacy inherit flag cannot expose host secrets');
   } finally {
     delete process.env.CAPSULE_MCP_INHERIT_ENV;
     delete process.env.LOCAL_AI_TEST_SECRET;

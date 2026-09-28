@@ -80,60 +80,64 @@ backup file. No auto-updater — the manifest is the version contract.
 
 ### Capsule integrity
 
-`capsule-integrity.json` pins every release file with a sha256 hash, signed with
-an ed25519 key. Every release file also carries a **compressed canonical copy**
-inside the manifest itself, so the Capsule can repair itself without the
-original file. The launcher and the **Portable readiness** panel verify the
-files at startup, so a corrupt, missing, or modified file is caught immediately.
+`capsule-integrity.json` pins the shipped application, launcher, tool, test,
+cloud, and runtime-metadata files with SHA-256 and an Ed25519 signature.
+Embedded compressed copies allow a missing tracked file to be restored offline,
+but only after the signed manifest validates. A missing/corrupt manifest is
+never recreated automatically, and a changed file is never silently accepted.
 
-Self-healing is **safe by default**: a tracked file that is *missing* is restored
-automatically from its embedded copy in the manifest. A file that is *present but
-different* is never clobbered — the readiness panel lists it and offers **Restore
-file** (write the canonical copy back) or **Regenerate manifest** (accept your
-change as the new release state). Use **Restore missing files** in the panel to
-re-attempt an automatic repair at any time.
+Signed release mode is the default on every consumer computer. It needs only
+`capsule-signing-pub.pem`; it does **not** look for the private release key.
+Startup fails closed when the manifest is missing, unsigned, incorrectly
+signed, incomplete, or does not match the files. The readiness panel may restore
+a file from a valid signed manifest, but it cannot turn current files into a
+trusted release.
 
 Bundled runtimes also self-heal. `runtime/downloads.txt` pins the official
 download URL plus archive and binary SHA-256 hashes for Node and Ollama on every
 supported platform. When a bundled binary is missing or below its size floor, the
 launcher asks once (`LOCAL_AI_AUTO_DOWNLOADS=1` skips the prompt), downloads to
 `.portable/cache/`, verifies the archive hash, and extracts it. Pass
-`--verify-runtimes` to the launchers for a full binary hash check against the
-pins (plus a `--version` smoke check) on every start.
+`--verify-runtimes` to either launcher to hash the existing Node and Ollama
+executables against the release pins and run a `--version` smoke check.
+Ollama support libraries are verified as members of the pinned archive when
+installed, but are not individually re-hashed by that flag.
 
 Anyone can work on the Capsule without the release key:
 
-- Change files freely. At the next start the banner tells you which files differ
-  and what to do.
-- Regenerate the manifest after any tracked change:
+- Explicitly opt into developer mode, regenerate an unsigned developer
+  manifest, and launch with the same opt-in:
 
-  ```
-  npm run integrity
+  ```bash
+  CAPSULE_DEV_MODE=1 npm run integrity
+  CAPSULE_DEV_MODE=1 npm run server
   ```
 
-- On a machine without `~/.capsule-signing/key.pem` the regenerated manifest is
-  unsigned. `start-portable.sh` (and `start-portable.cmd` on Windows) detects
-  the missing key and automatically sets `CAPSULE_ALLOW_UNSIGNED=1`, so the
-  readiness check stays green. The same effect applies when you launch with
-  `node server.mjs` and set the variable yourself.
+  On Windows Command Prompt, use `set CAPSULE_DEV_MODE=1` first. The obsolete
+  `CAPSULE_ALLOW_UNSIGNED` variable is ignored.
 
 Release builds are signed with the private key (`~/.capsule-signing/key.pem`,
 never committed). Keep that key on the release machine only; consumers ship and
-verify against the pinned public key `capsule-signing-pub.pem`.
+verify against the public key. `npm run integrity` is the explicit release
+generation/signing command when that key is available. Runtime code and the web
+UI cannot access or invoke the private signing key.
 
-A versioned pre-commit hook refills the manifest automatically, so a normal
-"edit, commit, push" workflow never leaves the release files and their
-fingerprints out of sync. Enable it once per clone:
+A versioned pre-commit hook can require that an explicitly regenerated manifest
+is staged with guarded changes. It intentionally does not execute signing code:
 
 ```
 npm run hooks:install
 ```
 
-On every commit that touches a guarded file the hook runs `npm run integrity`
-and stages the refreshed manifest; it refuses a commit where a guarded file has
-both staged and unstaged edits, so a refresh never pins half-applied work.
-`npm run integrity:check` compares the pinned files against the manifest without
-writing anything and is part of `npm run ci` for a readable check.
+It also refuses a guarded file with both staged and unstaged edits.
+`npm run integrity:check` validates exact coverage, hashes, and signature
+without writing and is part of `npm run ci`.
+
+The signature detects partial modification after a trusted acquisition. The
+public key, launcher, verifier, and manifest are stored together in the
+Capsule, so a completely replaced package can replace that whole trust set.
+For provenance, compare the public-key fingerprint or release checksum with a
+value published outside the USB/package (for example, a signed release page).
 
 ### Curated local model choices
 
@@ -412,17 +416,17 @@ the app. Requests are queued, and only jobs that complete are presented.
 
 ### Share over the web
 
-For a temporary private link, choose a strong token and run:
+**Capsule Remote** creates a temporary private link and QR code. The complete
+link includes a high-entropy key under `/remote/...`; the bare Cloudflare
+hostname is intentionally incomplete. A guest gets a fresh UI with no owner
+chat history, no model/settings/agent/research/portable controls, and access
+only to local Ollama inference. Owner cloud-provider credentials are never used
+for Remote requests. Stop Remote when sharing is finished; quick-tunnel URLs
+and their keys are temporary.
 
-```bash
-AUTH_TOKEN="a-long-random-secret" npm run tunnel
-```
-
-The app refuses tunnel mode without that token. Send the URL and token through
-separate channels. Quick-tunnel links are temporary; for a stable public site,
-run this app on a small VM/container with Ollama, HTTPS, a persistent Cloudflare
-Tunnel, and real user authentication in front of it. Never put provider API
-keys into a publicly shared browser build.
+Remote is disabled when multi-user accounts are configured. For durable public
+hosting, use a named tunnel or reverse proxy with HTTPS and real authentication
+rather than treating a quick tunnel as a permanent service.
 
 Three tunnel flavors are supported:
 
@@ -542,6 +546,32 @@ Core:
 | `OLLAMA_MODELS`       | *(unset)*                | Override the Ollama model-library location |
 | `AUTH_TOKEN`          | *(unset)*                | Require `Authorization: Bearer` on this server |
 | `RESEARCH_SEARXNG_URL`| *(unset)*                | Optional SearXNG search endpoint; otherwise DuckDuckGo with Bing RSS fallback |
+| `CAPSULE_DEV_MODE`   | *(unset)*                | Explicitly allow an unsigned developer manifest |
+| `CAPSULE_DENY_EGRESS`| *(unset)*                | Block non-loopback cloud/research network egress |
+| `LOCAL_AI_DATA_DIR`  | `./data`                 | Settings, encrypted chat state, users, research, and temporary speech files |
+| `CAPSULE_USERS_FILE` | `<data>/users.json`       | Optional multi-user account store |
+
+## Security and data boundaries
+
+- Local controls trust the actual loopback socket peer, not the HTTP `Host`
+  header. Browser control requests must be same-origin; wildcard CORS is not
+  enabled.
+- Remote guests can chat with local models but cannot read the owner's saved
+  chats, invoke agent/MCP tools, change models, run research, manage the tunnel,
+  or spend owner cloud credentials.
+- Chat state is encrypted at rest with a per-install key. Vault exports use the
+  passphrase-based encrypted vault format. These protect copied storage, not a
+  running unlocked process or an attacker who controls the host and key files.
+- Agent file tools are confined to the project, reject symlinks, and block
+  `.git`, `.portable`, environment, key, and vault paths. Git inspection uses
+  a strict read-only grammar. Approved shell commands and MCP servers still run
+  as the current OS user: approval is a security boundary, not an OS sandbox.
+- MCP child processes receive a small environment allowlist rather than all
+  application/API secrets. Registration and each direct tool call require an
+  explicit UI approval, and malformed/oversized MCP output is terminated.
+- Deep Research and Agent web fetch accept public HTTP(S) targets only, recheck
+  redirects, block local/private/link-local destinations, and cap time/body
+  sizes. Set `CAPSULE_DENY_EGRESS=1` for an offline-only session.
 
 Runtimes and portable data:
 

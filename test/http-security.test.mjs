@@ -245,7 +245,7 @@ test('mcp server end-to-end: register, list, call, unregister', async (t) => {
   mkdirSync(mockDir);
   const mock = mockMcpServerPath(mockDir);
 
-  const reg = await call('/api/agent/mcp/register', { method: 'POST', headers: json, body: JSON.stringify({ id: 'test-mock', command: process.execPath, args: [mock], env: {} }) });
+  const reg = await call('/api/agent/mcp/register', { method: 'POST', headers: json, body: JSON.stringify({ id: 'test-mock', command: process.execPath, args: [mock], env: {}, approval: 'run' }) });
   assert.equal(reg.status, 200);
   assert.equal(reg.body.id, 'test-mock');
   assert.equal(reg.body.tools[0].name, 'echo');
@@ -255,7 +255,7 @@ test('mcp server end-to-end: register, list, call, unregister', async (t) => {
   assert.equal(list.body.clients[0].id, 'test-mock');
   assert.equal(list.body.clients[0].serverInfo.name, 'mock');
 
-  const called = await call('/api/agent/mcp/call', { method: 'POST', headers: json, body: JSON.stringify({ clientId: 'test-mock', tool: 'echo', arguments: { text: 'ping' } }) });
+  const called = await call('/api/agent/mcp/call', { method: 'POST', headers: json, body: JSON.stringify({ clientId: 'test-mock', tool: 'echo', arguments: { text: 'ping' }, approval: 'run' }) });
   assert.equal(called.status, 200);
   assert.equal(called.body.result.content[0].text, 'ping');
 
@@ -268,7 +268,7 @@ test('mcp server end-to-end: register, list, call, unregister', async (t) => {
 // ── MCP hardening ───────────────────────────────────────────────────────────
 test('mcp register rejects commands outside CAPSULE_MCP_ALLOW', async (t) => {
   const { call } = await bootServer(t);
-  const notAllowed = await call('/api/agent/mcp/register', { method: 'POST', headers: json, body: JSON.stringify({ command: 'bash', args: ['-c', 'echo hi'] }) });
+  const notAllowed = await call('/api/agent/mcp/register', { method: 'POST', headers: json, body: JSON.stringify({ command: 'bash', args: ['-c', 'echo hi'], approval: 'run' }) });
   assert.equal(notAllowed.status, 403);
   assert.match(notAllowed.body.error, /not allowlisted/);
   assert.match(notAllowed.body.error, /CAPSULE_MCP_ALLOW/);
@@ -276,7 +276,7 @@ test('mcp register rejects commands outside CAPSULE_MCP_ALLOW', async (t) => {
 
 test('mcp register refuses secret-looking env keys outright', async (t) => {
   const { call } = await bootServer(t);
-  const sensitive = await call('/api/agent/mcp/register', { method: 'POST', headers: json, body: JSON.stringify({ command: 'node', args: ['server.js'], env: { AWS_SECRET_KEY: 'x' } }) });
+  const sensitive = await call('/api/agent/mcp/register', { method: 'POST', headers: json, body: JSON.stringify({ command: 'node', args: ['server.js'], env: { AWS_SECRET_KEY: 'x' }, approval: 'run' }) });
   assert.equal(sensitive.status, 400);
   assert.match(sensitive.body.error, /secret-bearing/);
   assert.match(sensitive.body.error, /AWS_SECRET_KEY/);
@@ -298,7 +298,7 @@ test('mcp children get a hermetic environment by default', async (t) => {
   mkdirSync(mockDir);
   const mock = mockMcpServerPath(mockDir);
   const envFile = join(root, 'mcp-env.json');
-  const reg = await call('/api/agent/mcp/register', { method: 'POST', headers: json, body: JSON.stringify({ id: 'env-mock', command: process.execPath, args: [mock], env: { MOCK_ENV_FILE: envFile } }) });
+  const reg = await call('/api/agent/mcp/register', { method: 'POST', headers: json, body: JSON.stringify({ id: 'env-mock', command: process.execPath, args: [mock], env: { MOCK_ENV_FILE: envFile }, approval: 'run' }) });
   assert.equal(reg.status, 200);
   const childEnv = JSON.parse(readFileSync(envFile, 'utf8'));
   assert.ok(Array.isArray(childEnv));
@@ -312,14 +312,14 @@ test('a crashed mcp server is revived on the next call and journaled', async (t)
   const mockDir = join(root, 'mock');
   mkdirSync(mockDir);
   const mock = mockMcpServerPath(mockDir);
-  const reg = await call('/api/agent/mcp/register', { method: 'POST', headers: json, body: JSON.stringify({ id: 'crasher', command: process.execPath, args: [mock], env: {} }) });
+  const reg = await call('/api/agent/mcp/register', { method: 'POST', headers: json, body: JSON.stringify({ id: 'crasher', command: process.execPath, args: [mock], env: {}, approval: 'run' }) });
   assert.equal(reg.status, 200);
 
-  const crashed = await call('/api/agent/mcp/call', { method: 'POST', headers: json, body: JSON.stringify({ clientId: 'crasher', tool: '__crash' }) });
+  const crashed = await call('/api/agent/mcp/call', { method: 'POST', headers: json, body: JSON.stringify({ clientId: 'crasher', tool: '__crash', approval: 'run' }) });
   assert.equal(crashed.status, 502);
   assert.match(crashed.body.error, /exited/i);
 
-  const revived = await call('/api/agent/mcp/call', { method: 'POST', headers: json, body: JSON.stringify({ clientId: 'crasher', tool: 'echo', arguments: { text: 'came back' } }) });
+  const revived = await call('/api/agent/mcp/call', { method: 'POST', headers: json, body: JSON.stringify({ clientId: 'crasher', tool: 'echo', arguments: { text: 'came back' }, approval: 'run' }) });
   assert.equal(revived.status, 200);
   assert.equal(revived.body.result.content[0].text, 'came back');
 
@@ -344,7 +344,7 @@ test('agent loop end-to-end: registered MCP tool pauses for UI approval and retu
   const mockDir = join(root, 'mock');
   mkdirSync(mockDir);
   const mock = mockMcpServerPath(mockDir);
-  const reg = await call('/api/agent/mcp/register', { method: 'POST', headers: json, body: JSON.stringify({ id: 'bridge_mock', command: process.execPath, args: [mock], env: {} }) });
+  const reg = await call('/api/agent/mcp/register', { method: 'POST', headers: json, body: JSON.stringify({ id: 'bridge_mock', command: process.execPath, args: [mock], env: {}, approval: 'run' }) });
   assert.equal(reg.status, 200);
 
   // Open the SSE loop and collect events while we hold the approval open.
@@ -385,7 +385,7 @@ test('agent loop: an MCP call rejected at the approval card ends the run without
   const mockDir = join(root, 'mock');
   mkdirSync(mockDir);
   const mock = mockMcpServerPath(mockDir);
-  await call('/api/agent/mcp/register', { method: 'POST', headers: json, body: JSON.stringify({ id: 'bridge_mock', command: process.execPath, args: [mock], env: {} }) });
+  await call('/api/agent/mcp/register', { method: 'POST', headers: json, body: JSON.stringify({ id: 'bridge_mock', command: process.execPath, args: [mock], env: {}, approval: 'run' }) });
 
   const r = await fetch(base + '/api/agent/loop', { method: 'POST', headers: json, body: JSON.stringify({ task: 'echo something', model: 'fake-llama:3b', autonomy: 'auto', mode: 'build' }) });
   const reader = r.body.getReader();
