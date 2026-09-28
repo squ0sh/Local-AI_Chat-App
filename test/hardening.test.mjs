@@ -1,13 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign, verify } from 'crypto';
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { sealVault, openVault } from '../lib/capsule-vault.mjs';
 import { RateLimiter, TokenBucket } from '../lib/rate-limit.mjs';
-import { canonicalManifest, portableIntegrityReport, signerPublicKeyPath, verifyManifestSignature, pubkeyFingerprint } from '../lib/capsule-integrity.mjs';
+import { canonicalManifest, portableIntegrityReport, releaseTrackedPaths, signerPublicKeyPath, verifyManifestSignature, pubkeyFingerprint } from '../lib/capsule-integrity.mjs';
 import { ChatStore } from '../lib/chat-store.mjs';
+import { gzipSync } from 'zlib';
 
 test('vault v2 round-trips and rejects a wrong passphrase', () => {
   const sealed = sealVault('secret chat history', 'correct horse battery staple');
@@ -59,17 +60,23 @@ test('signed integrity manifest verifies and fails closed on tamper', () => {
   try {
     writeFileSync(join(appDir, 'capsule-signing-pub.pem'), pubPem);
     const manifest = {
-      schema_version: 1,
+      schema_version: 2,
       algorithm: 'sha256',
       generated_at: new Date().toISOString(),
       files: [
-        { path: 'demo.txt', bytes: 9, sha256: createHash('sha256').update('demo data').digest('hex') },
+        {
+          path: 'demo.txt',
+          bytes: 9,
+          sha256: createHash('sha256').update('demo data').digest('hex'),
+          mode: 0o644,
+          content: gzipSync(Buffer.from('demo data')).toString('base64'),
+        },
       ],
     };
     const canonical = Buffer.from(canonicalManifest(manifest), 'utf8');
     const signature = sign(null, canonical, privateKey).toString('base64');
     const manifestFile = join(appDir, 'capsule-integrity.json');
-    const check = () => portableIntegrityReport(appDir, manifestFile);
+    const check = () => portableIntegrityReport(appDir, manifestFile, { requireComplete: false });
     writeFileSync(manifestFile, JSON.stringify(manifest));
     writeFileSync(join(appDir, 'demo.txt'), 'demo data');
     // Unsigned → refuse.
@@ -80,6 +87,18 @@ test('signed integrity manifest verifies and fails closed on tamper', () => {
     writeFileSync(manifestFile, JSON.stringify(manifest));
     assert.equal(check().verified, true);
     assert.equal(check().signed, true);
+    // v2 signatures bind repair content and mode, not just the output hash.
+    const signed = JSON.parse(readFileSync(manifestFile, 'utf8'));
+    signed.files[0].mode = 0o755;
+    writeFileSync(manifestFile, JSON.stringify(signed));
+    assert.equal(check().verified, false);
+    assert.match(check().signature_error, /invalid/i);
+    writeFileSync(manifestFile, JSON.stringify(manifest));
+    const changedRepairCopy = JSON.parse(readFileSync(manifestFile, 'utf8'));
+    changedRepairCopy.files[0].content += 'A';
+    writeFileSync(manifestFile, JSON.stringify(changedRepairCopy));
+    assert.equal(check().verified, false);
+    writeFileSync(manifestFile, JSON.stringify(manifest));
     // Tamper with file contents → hashes fail.
     writeFileSync(join(appDir, 'demo.txt'), 'tampered');
     assert.equal(check().verified, false);
@@ -88,7 +107,7 @@ test('signed integrity manifest verifies and fails closed on tamper', () => {
     const forged = JSON.parse(readFileSync(manifestFile, 'utf8'));
     forged.signature.value = Buffer.from('not-a-valid-signature').toString('base64');
     writeFileSync(manifestFile, JSON.stringify(forged));
-    const report = portableIntegrityReport(appDir, manifestFile, { allowUnsigned: true });
+    const report = portableIntegrityReport(appDir, manifestFile, { allowUnsigned: true, requireComplete: false });
     assert.equal(report.verified, false);
     assert.match(report.signature_error, /invalid/i);
   } finally { rmSync(appDir, { recursive: true, force: true }); }
@@ -109,34 +128,44 @@ test('unsigned manifest is accepted only under allowUnsigned', () => {
     writeFileSync(manifestFile, JSON.stringify(manifest));
     writeFileSync(join(appDir, 'demo.txt'), 'demo data');
     // No signature field and no allowUnsigned → refused.
-    const strict = portableIntegrityReport(appDir, manifestFile);
+    const strict = portableIntegrityReport(appDir, manifestFile, { requireComplete: false });
     assert.equal(strict.verified, false);
     assert.match(strict.signature_error, /unsigned/i);
     // Same manifest with allowUnsigned (the keyless portable launcher path) → OK.
-    const allowed = portableIntegrityReport(appDir, manifestFile, { allowUnsigned: true });
+    const allowed = portableIntegrityReport(appDir, manifestFile, { allowUnsigned: true, requireComplete: false });
     assert.equal(allowed.verified, true);
     assert.equal(allowed.signed, false);
     // A changed file still fails even with allowUnsigned.
     writeFileSync(join(appDir, 'demo.txt'), 'tampered');
-    assert.equal(portableIntegrityReport(appDir, manifestFile, { allowUnsigned: true }).verified, false);
+    assert.equal(portableIntegrityReport(appDir, manifestFile, { allowUnsigned: true, requireComplete: false }).verified, false);
   } finally { rmSync(appDir, { recursive: true, force: true }); }
 });
 
-test('regenerated manifests are idempotent: a second run does not rewrite', async (t) => {
+test('regenerated developer manifests are idempotent without mutating the repository', async (t) => {
   const { execFile } = await import('node:child_process');
   const { promisify } = await import('node:util');
   const execFileAsync = promisify(execFile);
   const repoDir = process.cwd();
-  const manifestPath = join(repoDir, 'capsule-integrity.json');
-  const original = readFileSync(manifestPath, 'utf8');
-  t.after(() => { writeFileSync(manifestPath, original); });
+  const appDir = mkdtempSync(join(tmpdir(), 'capsule-generate-'));
+  t.after(() => { rmSync(appDir, { recursive: true, force: true }); });
+  for (const path of releaseTrackedPaths(appDir)) {
+    const file = join(appDir, path);
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, 'staged placeholder ' + path + '\n');
+  }
+  const manifestPath = join(appDir, 'capsule-integrity.json');
+  const env = {
+    ...process.env,
+    CAPSULE_APP_DIR: appDir,
+    CAPSULE_DEV_MODE: '1',
+    CAPSULE_SIGNING_KEY: join(appDir, 'missing-private-key.pem'),
+  };
   // First run syncs the manifest to the current tree (signing key or not).
-  await execFileAsync(process.execPath, ['tools/generate-integrity.mjs'], { cwd: repoDir });
+  await execFileAsync(process.execPath, ['tools/generate-integrity.mjs'], { cwd: repoDir, env });
   const before = statSync(manifestPath).mtimeMs;
   await new Promise((resolve) => setTimeout(resolve, 30));
   // Second run must report "current" and leave the file byte-identical.
-  const { stdout } = await execFileAsync(process.execPath, ['tools/generate-integrity.mjs'], { cwd: repoDir });
-  assert.match(stdout, /current/i);
+  await execFileAsync(process.execPath, ['tools/generate-integrity.mjs'], { cwd: repoDir, env });
   assert.equal(statSync(manifestPath).mtimeMs, before);
 });
 

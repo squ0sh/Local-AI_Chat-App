@@ -21,7 +21,7 @@ import { Readable, Transform } from 'stream';
 import { totalmem, freemem, cpus, loadavg, homedir } from 'os';
 import { randomBytes, createHash } from 'crypto';
 import qrcode from './lib/vendor/qrcode-generator.mjs';
-import { portableIntegrityReport, rebuildManifest, repairReleaseFiles } from './lib/capsule-integrity.mjs';
+import { capsuleTrustFromEnv, portableIntegrityReport, rebuildManifest, repairReleaseFiles } from './lib/capsule-integrity.mjs';
 import { sealVault, openVault } from './lib/capsule-vault.mjs';
 import { ResearchEngine } from './lib/research-engine.mjs';
 import { pullOllamaModel } from './lib/resumable-ollama-pull.mjs';
@@ -29,6 +29,9 @@ import { RateLimiter, rateLimitResponse } from './lib/rate-limit.mjs';
 import { ChatStore } from './lib/chat-store.mjs';
 import { McpClient } from './lib/mcp-client.mjs';
 import { UserStore } from './lib/user-store.mjs';
+import { safeGitArguments } from './lib/git-safety.mjs';
+import { safeWorkspacePath } from './lib/workspace-safety.mjs';
+import { isLoopbackPeer, isSameOriginRequest } from './lib/request-security.mjs';
 import { runAgentLoop, globSearch, agentWriteFile, revertLastAgentWrite, buildOrganizePlan, applyOrganizePlan, webSearch } from './lib/agent-loop.mjs';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -49,6 +52,7 @@ let INLINE_SCRIPT_SHA = cspHashFrom(INDEX_HTML);
 const CAPSULE_FILE = join(__dirname, 'capsule.json');
 const SKILLS_FILE = join(__dirname, 'skills.json');
 const INTEGRITY_FILE = join(__dirname, 'capsule-integrity.json');
+const CAPSULE_TRUST = capsuleTrustFromEnv();
 const RUNTIME_INDEX_FILE = join(__dirname, 'runtime', 'index.json');
 
 // Self-healing: tracked release files that are missing are restored from the
@@ -58,7 +62,10 @@ const RUNTIME_INDEX_FILE = join(__dirname, 'runtime', 'index.json');
 // overwritten. User data and models are never touched.
 let lastIntegrityRepair = null;
 try {
-  lastIntegrityRepair = repairReleaseFiles(__dirname, INTEGRITY_FILE, { policy: 'missing', allowUnsigned: process.env.CAPSULE_ALLOW_UNSIGNED === '1' });
+  if (CAPSULE_TRUST.legacyUnsignedIgnored) {
+    console.warn('  Capsule integrity: CAPSULE_ALLOW_UNSIGNED is obsolete and was ignored; use CAPSULE_DEV_MODE=1 only for an intentional developer copy.');
+  }
+  lastIntegrityRepair = repairReleaseFiles(__dirname, INTEGRITY_FILE, { policy: 'missing', allowUnsigned: CAPSULE_TRUST.allowUnsigned });
   const repaired = lastIntegrityRepair.restored || [];
   if (repaired.includes('index.html') && existsSync(HTML_FILE)) {
     INDEX_HTML = readFileSync(HTML_FILE, 'utf8');
@@ -70,6 +77,16 @@ try {
   if (repaired.length) console.log('  Capsule self-heal: restored ' + repaired.join(', '));
 } catch (error) {
   console.warn('  Capsule self-heal: ' + error.message);
+}
+if (!lastIntegrityRepair?.verified) {
+  const reason = lastIntegrityRepair?.signature_error
+    || lastIntegrityRepair?.failed?.[0]?.error
+    || 'one or more release files are missing or modified';
+  console.error('  Capsule integrity check failed: ' + reason);
+  console.error(CAPSULE_TRUST.devMode
+    ? '  Developer mode still requires a current hash manifest. Run: npm run integrity'
+    : '  Refusing to start in signed release mode. Restore a trusted release or explicitly use CAPSULE_DEV_MODE=1 for development.');
+  process.exit(78);
 }
 
 // Set LOCAL_AI_DATA_DIR to make a fully self-contained portable installation.
@@ -88,9 +105,12 @@ const AGENT_THREADS_DIR = join(DATA_DIR, 'agent-threads');
 const AGENT_THREAD_ID_RE = /^[A-Za-z0-9._-]{1,120}$/;
 // Per-chat conversational memory: the agent's message buffer is persisted so
 // follow-up turns and page reloads keep context. Files are written atomically.
-function agentThreadKey(id) {
+function agentThreadKey(id, username = '') {
   const value = String(id || '');
-  return AGENT_THREAD_ID_RE.test(value) ? value : null;
+  if (!AGENT_THREAD_ID_RE.test(value)) return null;
+  if (!username) return value;
+  const namespace = createHash('sha256').update(String(username)).digest('hex').slice(0, 16);
+  return namespace + '--' + value;
 }
 function loadAgentThread(chatId) {
   try {
@@ -676,22 +696,25 @@ async function streamOllamaChat({ model, messages, signal, numCtx, temperature =
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '', content = '', toolCalls = [], tokenCount = 0;
+    const consumeLine = (line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      let chunk;
+      try { chunk = JSON.parse(trimmed); } catch { return; }
+      const delta = chunk.message?.content;
+      if (typeof delta === 'string' && delta) { content += delta; tokenCount += 1; onToken?.(delta); }
+      if (Array.isArray(chunk.message?.tool_calls) && chunk.message.tool_calls.length) toolCalls = chunk.message.tool_calls;
+    };
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines.pop();
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed) continue;
-        let chunk;
-        try { chunk = JSON.parse(trimmed); } catch { continue; }
-        const delta = chunk.message?.content;
-        if (typeof delta === 'string' && delta) { content += delta; tokenCount += 1; onToken?.(delta); }
-        if (Array.isArray(chunk.message?.tool_calls) && chunk.message.tool_calls.length) toolCalls = chunk.message.tool_calls;
-      }
+      for (const line of lines) consumeLine(line);
     }
+    buffer += decoder.decode();
+    if (buffer.trim()) consumeLine(buffer);
     return { content, toolCalls, tokenCount };
   } catch (error) {
     if (signal?.aborted || controller.signal.aborted) {
@@ -1295,12 +1318,7 @@ if (cfg.host && !LOOPBACK_HOSTS.has(String(cfg.host).toLowerCase()) && !cfg.auth
 }
 
 // ------------------------------------------------------------------ utilities
-const CORS = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-};
-const RESP_HEADERS = { 'Content-Type': 'application/json; charset=utf-8', ...CORS };
+const RESP_HEADERS = { 'Content-Type': 'application/json; charset=utf-8' };
 
 // Defense-in-depth response headers applied to every reply, including proxied
 // streams. The UI is fully self-contained, so a strict CSP costs nothing.
@@ -1420,26 +1438,23 @@ function readRawBody(req, maxBytes = 50_000_000) {
 // Remote tunnels arrive with their public hostname. Sensitive controls deliberately
 // require a direct localhost request, even when the caller knows the remote key.
 function isDirectLocalRequest(req) {
-  const host = String(req.headers.host || '').toLowerCase();
-  // Cloudflare adds this header at the edge; its presence always means the
-  // request came through the public tunnel, not from the local browser.
-  if (req.headers['cf-connecting-ip']) return false;
-  return host === 'localhost' || host === '127.0.0.1'
-    || host === `localhost:${cfg.port}` || host === `127.0.0.1:${cfg.port}`;
+  return isLoopbackPeer(req);
+}
+
+function sameOriginRequest(req) {
+  return isSameOriginRequest(req);
 }
 
 // Agent tools are intentionally restricted to this app's own project folder.
 // They are local-only and every write/command request must carry a UI approval.
 function agentToolsAllowed(req) {
   if (cfg.mode !== 'local' || !isDirectLocalRequest(req)) return false;
-  const origin = req.headers.origin || '';
-  return !origin || origin === `http://${req.headers.host}`;
+  return sameOriginRequest(req);
 }
 
 function localControlAllowed(req) {
   if (!isDirectLocalRequest(req)) return false;
-  const origin = String(req.headers.origin || '');
-  return !origin || origin === `http://${req.headers.host}`;
+  return sameOriginRequest(req);
 }
 
 function stopRemote(reason = 'stopped') {
@@ -1460,22 +1475,49 @@ function armRemoteExpiry() {
 }
 
 function agentWorkspacePath(requested = '') {
-  const target = resolve(__dirname, requested || '.');
-  const rel = relative(__dirname, target);
-  if (rel.startsWith('..' + sep) || rel === '..' || rel.startsWith('.git' + sep) || rel === '.git' || rel.startsWith('.portable' + sep) || rel === '.portable') {
-    throw new Error('Path is outside the approved agent workspace');
+  return safeWorkspacePath(__dirname, requested || '.', { allowMissing: false }).path;
+}
+
+function parseMcpCommand(command, suppliedArgs) {
+  const raw = String(command || '').trim();
+  if (!raw || raw.length > 1024 || /[\r\n\0]/.test(raw)) throw new Error('Enter a valid MCP command');
+  if (Array.isArray(suppliedArgs) && suppliedArgs.length) {
+    const args = suppliedArgs.map(String);
+    if (args.length > 64 || args.some((arg) => arg.length > 8192)) throw new Error('MCP arguments are too large');
+    return { executable: raw, args };
   }
-  return target;
+  const parts = [];
+  let current = '', quote = '', escaped = false;
+  for (const char of raw) {
+    if (escaped) { current += char; escaped = false; continue; }
+    if (char === '\\' && quote !== "'") { escaped = true; continue; }
+    if (quote) {
+      if (char === quote) quote = '';
+      else current += char;
+      continue;
+    }
+    if (char === "'" || char === '"') { quote = char; continue; }
+    if (/\s/.test(char)) {
+      if (current) { parts.push(current); current = ''; }
+      continue;
+    }
+    if ('|&;<>'.includes(char) || char.charCodeAt(0) === 96) throw new Error('Shell operators are not allowed in MCP commands');
+    current += char;
+  }
+  if (escaped || quote) throw new Error('MCP command has an incomplete quote or escape');
+  if (current) parts.push(current);
+  if (!parts.length || parts.length > 65) throw new Error('Enter a valid MCP command');
+  return { executable: parts[0], args: parts.slice(1) };
 }
 
 function upstreamRequest(method, path, { body, headers = {}, timeout = 120000 } = {}) {
   const url = cfg.ollamaUrl + path;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeout);
   const h = { 'Content-Type': 'application/json', ...headers };
   if (body != null) h['Content-Length'] = String(Buffer.byteLength(body));
-  return fetch(url, { method, headers: h, body, signal: controller.signal })
-    .finally(() => clearTimeout(timer));
+  // AbortSignal.timeout remains active while callers consume the response
+  // body; clearing a timer as soon as headers arrive leaves stalled streams
+  // hanging forever.
+  return fetch(url, { method, headers: h, body, signal: AbortSignal.timeout(timeout) });
 }
 
 function findOnPath(name) {
@@ -1526,6 +1568,12 @@ async function handle(req, res) {
   const url = new URL(req.url, 'http://localhost');
   const p = url.pathname;
 
+  // The bundled UI is same-origin. Refuse cross-origin browser control instead
+  // of publishing localhost and Remote APIs with wildcard CORS.
+  if (!sameOriginRequest(req)) {
+    return sendJSON(res, 403, { error: 'Cross-origin browser requests are not allowed' });
+  }
+
   // Rate-limit the sensitive surfaces. Local interactive use has generous
   // headroom; shared Remote /v1 access is the main thing we are throttling.
   const rateLimited =
@@ -1537,9 +1585,12 @@ async function handle(req, res) {
     if (!verdict.allowed) return rateLimitResponse(res, verdict.retryAfter);
   }
 
-  // Browsers cannot attach a bearer token to CORS preflight requests.
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, { ...CORS, ...securityHeaders() });
+    res.writeHead(204, {
+      'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      ...securityHeaders(),
+    });
     return res.end();
   }
 
@@ -1676,7 +1727,7 @@ async function handle(req, res) {
   if (p.startsWith('/api/models/') && !localControlAllowed(req)) {
     return sendJSON(res, 403, { error: 'Model management is available only in the local app' });
   }
-  if ((p.startsWith('/api/cloud/') || p.startsWith('/api/vault/') || p.startsWith('/api/portable/') || p.startsWith('/api/research')) && !isDirectLocalRequest(req)) {
+  if ((p.startsWith('/api/cloud/') || p.startsWith('/api/vault/') || p.startsWith('/api/portable/') || p.startsWith('/api/research')) && !localControlAllowed(req)) {
     return sendJSON(res, 403, { error: 'This Capsule control is available only from the local app' });
   }
 
@@ -1717,20 +1768,33 @@ async function handle(req, res) {
     const s = speechSupport();
     if (!s.whisper) return sendJSON(res, 400, { error: 'whisper.cpp not detected. Install whisper-cli and set WHISPER_MODEL.' });
     let audio = null, lang = 'en';
-    const raw = await readRawBody(req, 50_000_000);
-    try { const j = JSON.parse(raw.toString('utf8')); if (j && typeof j === 'object') { audio = j.audioBase64 ? Buffer.from(j.audioBase64, 'base64') : null; lang = j.lang || lang; } } catch {}
+    let raw;
+    try { raw = await readRawBody(req, 50_000_000); }
+    catch (error) { return sendJSON(res, 413, { error: error.message }); }
+    try {
+      const j = JSON.parse(raw.toString('utf8'));
+      if (j && typeof j === 'object') {
+        if (j.audioBase64 && !/^[A-Za-z0-9+/]*={0,2}$/.test(String(j.audioBase64))) return sendJSON(res, 400, { error: 'Invalid base64 audio' });
+        audio = j.audioBase64 ? Buffer.from(j.audioBase64, 'base64') : null;
+        lang = String(j.lang || lang);
+      }
+    } catch {}
     if (!audio) audio = raw;
     if (!audio || !audio.length) return sendJSON(res, 400, { error: 'No audio received' });
+    if (!/^[A-Za-z-]{2,12}$/.test(lang)) return sendJSON(res, 400, { error: 'Invalid speech language code' });
     const tmpRoot = join(DATA_DIR, 'tmp'); mkdirSync(tmpRoot, { recursive: true });
     const inFile = join(tmpRoot, 'speech-in-' + process.pid + '-' + randomBytes(4).toString('hex') + '.wav');
     writeFileSync(inFile, audio);
+    const outFile = join(tmpRoot, 'speech-out-' + process.pid + '-' + randomBytes(4).toString('hex'));
     try {
-      const outFile = join(tmpRoot, 'speech-out-' + process.pid + '-' + randomBytes(4).toString('hex'));
       const code = await runChild(s.whisper_cli, ['-m', s.whisper_model, '-f', inFile, '-l', lang, '-otxt', '-of', outFile]);
       if (code !== 0) return sendJSON(res, 500, { error: 'whisper-cli failed with exit code ' + code });
       const text = readFileSync(outFile + '.txt', 'utf8').trim();
       return sendJSON(res, 200, { text });
-    } finally { try { unlinkSync(inFile); } catch {} }
+    } finally {
+      try { unlinkSync(inFile); } catch {}
+      try { unlinkSync(outFile + '.txt'); } catch {}
+    }
   }
   if (req.method === 'POST' && p === '/api/speech/tts') {
     const s = speechSupport();
@@ -1826,7 +1890,7 @@ async function handle(req, res) {
     const portableModelStorage = Boolean(modelStorage) && pathIsInside(portableModels, modelStorage);
     const storageWritable = writableDirectory(portableRoot) && writableDirectory(DATA_DIR);
     const requiredModels = manifest?.offline_profile?.required_models || 1;
-    const integrity = portableIntegrityReport(__dirname, INTEGRITY_FILE, { platform: runtimeId, allowUnsigned: process.env.CAPSULE_ALLOW_UNSIGNED === '1' });
+    const integrity = portableIntegrityReport(__dirname, INTEGRITY_FILE, { platform: runtimeId, allowUnsigned: CAPSULE_TRUST.allowUnsigned });
     let runtimeIndex = null;
     try { runtimeIndex = JSON.parse(readFileSync(RUNTIME_INDEX_FILE, 'utf8')); } catch {}
     const supportedPlatforms = Array.isArray(runtimeIndex?.platforms) ? runtimeIndex.platforms : [];
@@ -1849,7 +1913,7 @@ async function handle(req, res) {
       { id: 'node_runtime', label: 'Bundled Node runtime', ok: bundledNode.runnable, scope: 'transfer', detail: bundledNode.runnable ? bundledNode.version : bundledNode.present ? bundledNode.error : 'Runtime executable is missing', fix: `Add the ${process.platform}/${process.arch} Node runtime at ${relative(__dirname, nodePath)}.` },
       { id: 'ollama_runtime', label: 'Bundled Ollama runtime', ok: bundledOllama.runnable, scope: 'transfer', detail: bundledOllama.runnable ? bundledOllama.version : bundledOllama.present ? bundledOllama.error : 'Runtime executable is missing', fix: `Add the ${process.platform}/${process.arch} Ollama runtime at ${relative(__dirname, ollamaPath)}.` },
       { id: 'launcher', label: 'Portable launcher', ok: launcherReady, scope: 'transfer', detail: launcherReady ? `${relative(__dirname, launcherPath)} is ready` : `${relative(__dirname, launcherPath)} is missing or not executable`, fix: process.platform === 'win32' ? 'Restore start-portable.cmd.' : 'Restore start-portable.sh and make it executable.' },
-      { id: 'integrity', label: 'Capsule files', ok: integrity.verified, scope: 'transfer', detail: integrity.verified ? `${integrity.files.length} release files verified` : 'Files are missing or changed since the integrity manifest was made', fix: 'Restore missing release files or regenerate the manifest after intentional changes.' },
+      { id: 'integrity', label: 'Capsule files', ok: integrity.verified, scope: 'transfer', detail: integrity.verified ? `${integrity.files.length} release files verified (${integrity.signed ? 'signed release' : 'developer mode'})` : (integrity.signature_error || 'Files are missing or changed since the integrity manifest was made'), fix: CAPSULE_TRUST.devMode ? 'Run npm run integrity after intentional developer changes.' : 'Restore the files from a trusted signed release.' },
     ];
     const worksHere = checks.filter((check) => check.scope === 'here' || check.scope === 'both').every((check) => check.ok);
     const transferReady = worksHere && checks.filter((check) => check.scope === 'transfer' || check.scope === 'both').every((check) => check.ok);
@@ -1878,10 +1942,11 @@ async function handle(req, res) {
       works_here: worksHere,
       transfer_ready: transferReady,
       offline_ready: transferReady,
+      capsule_mode: CAPSULE_TRUST.devMode ? 'developer' : 'release',
     });
   }
   if (req.method === 'GET' && p === '/api/portable/integrity') {
-    const report = portableIntegrityReport(__dirname, INTEGRITY_FILE, { allowUnsigned: process.env.CAPSULE_ALLOW_UNSIGNED === '1' });
+    const report = portableIntegrityReport(__dirname, INTEGRITY_FILE, { allowUnsigned: CAPSULE_TRUST.allowUnsigned });
     const failed = (report.files || []).filter((file) => !file.ok);
     const missing = failed.filter((file) => /no such file|ENOENT|missing/i.test(file.error || '')).map((file) => file.path);
     const changed = failed.filter((file) => !missing.includes(file.path)).map((file) => file.path);
@@ -1896,14 +1961,17 @@ async function handle(req, res) {
     const result = repairReleaseFiles(__dirname, INTEGRITY_FILE, {
       policy: payload.path ? 'all' : (payload.policy === 'all' ? 'all' : 'missing'),
       path: typeof payload.path === 'string' && payload.path ? payload.path : undefined,
-      allowUnsigned: process.env.CAPSULE_ALLOW_UNSIGNED === '1',
+      allowUnsigned: CAPSULE_TRUST.allowUnsigned,
     });
     lastIntegrityRepair = result;
     return sendJSON(res, 200, result);
   }
   if (req.method === 'POST' && p === '/api/portable/integrity/regenerate') {
+    if (!CAPSULE_TRUST.devMode) {
+      return sendJSON(res, 403, { error: 'Manifest regeneration is available only in explicit developer mode. Release manifests must be produced and signed with the maintainer CLI.' });
+    }
     try {
-      const result = rebuildManifest(__dirname);
+      const result = rebuildManifest(__dirname, { sign: false });
       return sendJSON(res, 200, { ok: true, files: result.files, signed: result.signed, signature_error: result.signature_error });
     } catch (error) {
       return sendJSON(res, 400, { error: error.message });
@@ -1931,11 +1999,11 @@ async function handle(req, res) {
     });
   }
   if (req.method === 'GET' && p === '/api/remote/status') {
-    if (!isDirectLocalRequest(req)) return sendJSON(res, 403, { error: 'Capsule Remote controls are available only from the local app' });
+    if (!localControlAllowed(req)) return sendJSON(res, 403, { error: 'Capsule Remote controls are available only from the local app' });
     return sendJSON(res, 200, { active: Boolean(remoteTunnel.child), url: remoteTunnel.url, token: remoteTunnel.token, expires_at: remoteTunnel.expiresAt || 0, api_url: remoteTunnel.url ? remoteTunnel.url + '/v1' : '' });
   }
   if (req.method === 'GET' && p === '/api/remote/qr') {
-    if (!isDirectLocalRequest(req)) return sendJSON(res, 403, { error: 'Capsule Remote controls are available only from the local app' });
+    if (!localControlAllowed(req)) return sendJSON(res, 403, { error: 'Capsule Remote controls are available only from the local app' });
     if (!remoteTunnel.child || !remoteTunnel.url || !remoteTunnel.token) return sendJSON(res, 409, { error: 'Start Remote before requesting its QR code' });
     const qr = qrcode(0, 'M');
     qr.addData(remoteTunnel.url + '/remote/' + encodeURIComponent(remoteTunnel.token));
@@ -1950,7 +2018,7 @@ async function handle(req, res) {
     return res.end(svg);
   }
   if (req.method === 'POST' && p === '/api/remote/start') {
-    if (!isDirectLocalRequest(req)) return sendJSON(res, 403, { error: 'Capsule Remote controls are available only from the local app' });
+    if (!localControlAllowed(req)) return sendJSON(res, 403, { error: 'Capsule Remote controls are available only from the local app' });
     if (cfg.mode !== 'local') return sendJSON(res, 400, { error: 'Capsule Remote starts only from local mode' });
     if (!remoteTunnel.child) {
       remoteTunnel.token = randomBytes(24).toString('base64url');
@@ -1962,7 +2030,7 @@ async function handle(req, res) {
     return sendJSON(res, 200, { active: Boolean(remoteTunnel.child), token: remoteTunnel.token, expires_at: remoteTunnel.expiresAt, url: remoteTunnel.url, api_url: remoteTunnel.url ? remoteTunnel.url + '/v1' : '' });
   }
   if (req.method === 'POST' && p === '/api/remote/stop') {
-    if (!isDirectLocalRequest(req)) return sendJSON(res, 403, { error: 'Capsule Remote controls are available only from the local app' });
+    if (!localControlAllowed(req)) return sendJSON(res, 403, { error: 'Capsule Remote controls are available only from the local app' });
     stopRemote();
     return sendJSON(res, 200, { ok: true });
   }
@@ -2129,14 +2197,11 @@ async function handle(req, res) {
       let payload;
       try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
       const args = Array.isArray(payload.args) ? payload.args.map(String).slice(0, 8) : [];
-      if (!args.length) return sendJSON(res, 400, { error: 'git subcommand required' });
-      const allowed = ['status', 'diff', 'log', 'show', 'branch', 'ls-files', 'rev-parse', 'remote', 'tag'];
-      if (!allowed.includes(args[0])) return sendJSON(res, 403, { error: 'Not allowed. Read-only subcommands: ' + allowed.join(', ') });
-      if (args.some((a) => a === '--hard' || a === '-f' || a === '--force')) return sendJSON(res, 403, { error: 'Destructive git flags are not allowed' });
-      if (args.join(' ').length > 500) return sendJSON(res, 400, { error: 'Arguments too long (max 500 chars)' });
+      const checked = safeGitArguments(args);
+      if (!checked.ok) return sendJSON(res, 403, { error: checked.error });
       const output = await new Promise((resolve) => {
         let proc;
-        try { proc = spawn('git', args, { cwd: __dirname, stdio: ['ignore', 'pipe', 'pipe'] }); }
+        try { proc = spawn('git', checked.args, { cwd: __dirname, stdio: ['ignore', 'pipe', 'pipe'] }); }
         catch (e) { resolve({ ok: false, error: e.message, stdout: '', stderr: '' }); return; }
         let stdout = '', stderr = '', timedOut = false;
         const timer = setTimeout(() => { timedOut = true; try { proc.kill('SIGTERM'); } catch {} }, 15_000);
@@ -2155,14 +2220,20 @@ async function handle(req, res) {
     }
 
     // ── MCP: Model Context Protocol servers (stdio) ──────────────────────
-    if (p === '/api/agent/mcp/register') {
+    if (req.method === 'POST' && p === '/api/agent/mcp/register') {
       let payload;
       try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
       const { command, args = [], env = {}, id: requestedId } = payload;
+      if (payload.approval !== 'run') return sendJSON(res, 403, { error: 'Explicit MCP process approval is required' });
       if (!command || typeof command !== 'string') return sendJSON(res, 400, { error: 'command is required' });
-      const clientId = requestedId || 'mcp-' + randomBytes(4).toString('hex');
+      let parsed;
+      try { parsed = parseMcpCommand(command, args); } catch (error) { return sendJSON(res, 400, { error: error.message }); }
+      const requested = String(requestedId || '');
+      if (requested && !/^[A-Za-z0-9._-]{1,80}$/.test(requested)) return sendJSON(res, 400, { error: 'Invalid MCP client id' });
+      const clientId = requested || 'mcp-' + randomBytes(4).toString('hex');
       if (mcpClients.has(clientId)) return sendJSON(res, 409, { error: 'Client ID already registered. Use /api/agent/mcp/unregister first.' });
-      const client = new McpClient({ command, args, env });
+      const safeEnv = env && typeof env === 'object' && !Array.isArray(env) ? env : {};
+      const client = new McpClient({ command: parsed.executable, args: parsed.args, env: safeEnv });
       try {
         await client.connect();
         mcpClients.set(clientId, client);
@@ -2172,17 +2243,18 @@ async function handle(req, res) {
         return sendJSON(res, 502, { error: 'MCP server failed to start: ' + e.message });
       }
     }
-    if (p === '/api/agent/mcp/list') {
+    if (req.method === 'GET' && p === '/api/agent/mcp/list') {
       const result = [];
       for (const [id, client] of mcpClients) {
         result.push({ id, serverInfo: client.serverInfo, tools: client.tools.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema })) });
       }
       return sendJSON(res, 200, { clients: result });
     }
-    if (p === '/api/agent/mcp/call') {
+    if (req.method === 'POST' && p === '/api/agent/mcp/call') {
       let payload;
       try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
       const { clientId, tool, arguments: args = {} } = payload;
+      if (payload.approval !== 'run') return sendJSON(res, 403, { error: 'Explicit MCP tool approval is required' });
       if (!clientId || !tool) return sendJSON(res, 400, { error: 'clientId and tool are required' });
       const client = mcpClients.get(clientId);
       if (!client) return sendJSON(res, 404, { error: 'MCP client not found: ' + clientId });
@@ -2191,7 +2263,7 @@ async function handle(req, res) {
         return sendJSON(res, 200, { result });
       } catch (e) { return sendJSON(res, 502, { error: e.message }); }
     }
-    if (p === '/api/agent/mcp/unregister') {
+    if (req.method === 'POST' && p === '/api/agent/mcp/unregister') {
       let payload;
       try { payload = JSON.parse(await readBody(req)); } catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
       const { id: clientId } = payload;
@@ -2218,12 +2290,15 @@ async function handle(req, res) {
 
       // Per-chat conversational memory: continue the saved thread, or seed from
       // recent chat history when this chat has no saved agent context yet.
-      const chatId = agentThreadKey(payload.chat_id);
+      const chatId = agentThreadKey(payload.chat_id, req.username);
       const history = Array.isArray(payload.history)
         ? payload.history.filter((m) => m && typeof m.content === 'string').slice(-14)
             .map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: String(m.content).slice(0, 8000) }))
         : [];
       if (chatId && activeAgentThreads.has(chatId)) return sendJSON(res, 409, { error: 'This conversation is already running an agent task. Wait for it to finish or cancel it first.' });
+      if (modelUnloadActive) return sendJSON(res, 409, { error: 'A model memory operation is running. Try the agent again in a moment.' });
+      const releaseGeneration = beginOllamaGeneration(model);
+      if (!releaseGeneration) return sendJSON(res, 429, { error: 'The local model has reached its concurrent-generation limit. Try again shortly.' });
       if (chatId) activeAgentThreads.add(chatId);
       let savedThread = chatId ? loadAgentThread(chatId) : [];
       if (!savedThread.length) savedThread = history;
@@ -2234,7 +2309,6 @@ async function handle(req, res) {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
-        ...CORS,
         ...securityHeaders(),
       });
       const sendSSE = (data) => { try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch {} };
@@ -2242,11 +2316,12 @@ async function handle(req, res) {
       // Track active agent loops for cancellation
       const loopId = 'agent-' + randomBytes(8).toString('hex');
       const controller = new AbortController();
+      res.on('close', () => { if (!res.writableEnded) controller.abort(); });
       activeAgentLoops.set(loopId, controller);
       sendSSE({ type: 'loop_started', loop_id: loopId });
 
       // Approval tracking (shared with /api/agent/approve endpoint)
-      let approvalIdCounter = 0;
+      const approvalIds = new Set();
 
       // LLM call function (streams tokens through SSE when connected)
       const llmCall = async (messages, tools, onToken) => {
@@ -2272,7 +2347,8 @@ async function handle(req, res) {
       // Event handler
       const onEvent = (event) => {
         if (event.type === 'waiting_approval') {
-          const approvalId = 'appr-' + (++approvalIdCounter);
+          const approvalId = 'appr-' + randomBytes(12).toString('hex');
+          approvalIds.add(approvalId);
           pendingApprovalsGlobal.set(approvalId, event.resolve);
           sendSSE({
             type: 'approval_needed',
@@ -2301,6 +2377,12 @@ async function handle(req, res) {
           sendSSE({ type: 'loop_complete', status: 'error', error: e.message });
         }
       } finally {
+        for (const approvalId of approvalIds) {
+          const resolve = pendingApprovalsGlobal.get(approvalId);
+          pendingApprovalsGlobal.delete(approvalId);
+          if (resolve) resolve(false);
+        }
+        releaseGeneration();
         activeAgentLoops.delete(loopId);
         if (chatId) activeAgentThreads.delete(chatId);
         res.end();
@@ -2310,7 +2392,7 @@ async function handle(req, res) {
 
     // ── Agent: clear a chat's saved memory ──────────────────────────────────
     if (req.method === 'DELETE' && p === '/api/agent/thread') {
-      const chatId = agentThreadKey(url.searchParams.get('chat_id'));
+      const chatId = agentThreadKey(url.searchParams.get('chat_id'), req.username);
       if (!chatId) return sendJSON(res, 400, { error: 'chat_id is required' });
       clearAgentThread(chatId);
       return sendJSON(res, 200, { ok: true });
@@ -2875,6 +2957,9 @@ async function handle(req, res) {
     let payload;
     try { payload = JSON.parse(body || '{}'); }
     catch { return sendJSON(res, 400, { error: 'Invalid JSON' }); }
+    if (!directLocalRequest && payload.mode === 'cloud') {
+      return sendJSON(res, 403, { error: 'Shared Remote sessions can use only the owner computer\'s local models' });
+    }
     return streamChat(payload, res);
   }
 
@@ -2882,17 +2967,17 @@ async function handle(req, res) {
   // If a non-Ollama provider is configured, translate OpenAI-compatible
   // requests to that provider's native API instead of proxying to Ollama.
   if (p === '/v1/models') {
-    if (isCloudProvider()) return proxyCloud('GET', '/v1/models', null, res);
+    if (directLocalRequest && isCloudProvider()) return proxyCloud('GET', '/v1/models', null, res);
     return proxyV1('GET', '/v1/models', null, res);
   }
   if (p === '/v1/chat/completions' || p === '/v1/completions' || p === '/v1/embeddings') {
     let body;
     try { body = await readBody(req); } catch (e) { return sendJSON(res, 400, { error: e.message }); }
-    if (isCloudProvider()) return proxyCloud(req.method, p, body, res);
+    if (directLocalRequest && isCloudProvider()) return proxyCloud(req.method, p, body, res);
     return proxyV1(req.method, p, body, res);
   }
   if (req.method === 'POST' && p === '/v1/responses') {
-    if (isCloudProvider() && cfg.aiProvider === 'openai') {
+    if (directLocalRequest && isCloudProvider() && cfg.aiProvider === 'openai') {
       let cloudBody;
       try { cloudBody = await readBody(req); } catch (e) { return sendJSON(res, 400, { error: e.message }); }
       return proxyCloud(req.method, p, cloudBody, res);
@@ -2905,9 +2990,10 @@ async function handle(req, res) {
     return streamResponsesLocal(payload, res);
   }
   if (p.startsWith('/v1/')) {
+    if (!directLocalRequest) return sendJSON(res, 404, { error: 'Remote API endpoint is not available' });
     let body = null;
     if (req.method !== 'GET') { try { body = await readBody(req); } catch {} }
-    if (isCloudProvider()) return proxyCloud(req.method, p, body, res);
+    if (isCloudProvider()) return sendJSON(res, 404, { error: 'Unsupported cloud API endpoint' });
     return proxyV1(req.method, p, body, res);
   }
 
@@ -2992,11 +3078,10 @@ async function proxyV1(method, path, body, res) {
       timeout: 300000,
     });
 
-    for (const [k, v] of ['content-type', 'cache-control', 'connection', 'transfer-encoding']) {
+    for (const k of ['content-type', 'cache-control', 'connection', 'transfer-encoding']) {
       const val = r.headers.get(k);
       if (val) res.setHeader(k, val);
     }
-    for (const [k, v] of Object.entries(CORS)) res.setHeader(k, v);
     for (const [k, v] of Object.entries(securityHeaders())) res.setHeader(k, v);
     res.writeHead(r.status);
     await pipeline(Readable.fromWeb(r.body), res);
@@ -3062,11 +3147,10 @@ async function proxyCloud(method, path, body, res) {
     const h = { ...(mapped.body != null ? { 'Content-Type': 'application/json' } : {}), ...headers };
     const r = await fetch(url, { method, headers: h, ...(mapped.body != null ? { body: mapped.body } : {}) });
     logEgress({ provider: cfg.aiProvider, path, status: r.status, target: url });
-    for (const [k, v] of ['content-type', 'cache-control', 'connection', 'transfer-encoding']) {
+    for (const k of ['content-type', 'cache-control', 'connection', 'transfer-encoding']) {
       const val = r.headers.get(k);
       if (val) res.setHeader(k, val);
     }
-    for (const [k, v] of Object.entries(CORS)) res.setHeader(k, v);
     res.writeHead(r.status);
     await pipeline(Readable.fromWeb(r.body), res);
   } catch (e) {
@@ -3196,7 +3280,6 @@ async function streamChat(payload, res) {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
-    ...CORS,
     ...securityHeaders(),
   });
   const sendSSE = (data) => { try { res.write(`data: ${JSON.stringify(data)}\n\n`); } catch {} };
@@ -3220,7 +3303,9 @@ async function streamChat(payload, res) {
     };
     let fullText = '';
     try {
-      const r = await fetch(anthropicBase() + '/messages', { method: 'POST', headers, body });
+      const target = anthropicBase() + '/messages';
+      assertEgressAllowed(target);
+      const r = await fetch(target, { method: 'POST', headers, body, signal: AbortSignal.timeout(300_000) });
       if (!r.ok) return fail('Anthropic HTTP ' + r.status + ': ' + await r.text().then(t => t.slice(0, 300)));
       const aborted = await consumeSseLines(r, 50_000_000, (raw) => {
         if (raw === '[DONE]') return;
@@ -3243,7 +3328,9 @@ async function streamChat(payload, res) {
     const headers = { 'Content-Type': 'application/json', ...geminiHeaders() };
     let fullText = '';
     try {
-      const r = await fetch(geminiUrl(model, true), { method: 'POST', headers, body });
+      const target = geminiUrl(model, true);
+      assertEgressAllowed(target);
+      const r = await fetch(target, { method: 'POST', headers, body, signal: AbortSignal.timeout(300_000) });
       if (!r.ok) return fail('Gemini HTTP ' + r.status + ': ' + await r.text().then(t => t.slice(0, 300)));
       const aborted = await consumeSseLines(r, 50_000_000, (raw) => {
         try {
@@ -3279,14 +3366,16 @@ async function streamChat(payload, res) {
   let fullText = '';
   const releaseGeneration = provider === 'ollama' ? beginOllamaGeneration(model) : () => {};
   if (provider === 'ollama' && !releaseGeneration) return fail('The local model is busy. Try again in a moment.');
-  const upstreamController = provider === 'ollama' ? new AbortController() : null;
-  const abortUpstream = () => upstreamController?.abort();
-  if (upstreamController) res.once('close', abortUpstream);
+  const upstreamController = new AbortController();
+  const upstreamTimer = setTimeout(() => upstreamController.abort(), 300_000);
+  const abortUpstream = () => upstreamController.abort();
+  res.once('close', abortUpstream);
   try {
     const chatPath = provider === 'ollama' ? '/v1/chat/completions' : '/chat/completions';
+    if (provider !== 'ollama') assertEgressAllowed(baseUrl + chatPath);
     const r = await fetch(baseUrl + chatPath, {
       method: 'POST', headers, body,
-      ...(upstreamController ? { signal: upstreamController.signal } : {}),
+      signal: upstreamController.signal,
     });
     if (!r.ok) return fail('Upstream HTTP ' + r.status + ': ' + await r.text().then(t => t.slice(0, 300)));
     const reader = r.body.getReader();
@@ -3314,7 +3403,8 @@ async function streamChat(payload, res) {
     return finish(fullText);
   } catch (e) { return fail(e.message); }
   finally {
-    if (upstreamController) res.off('close', abortUpstream);
+    clearTimeout(upstreamTimer);
+    res.off('close', abortUpstream);
     releaseGeneration();
   }
 }
@@ -3362,7 +3452,7 @@ async function streamResponsesLocal(payload, res) {
     const done = () => { sendSSE({ type: 'done' }); res.end(); };
 
     if (payload.stream === true) {
-      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', ...CORS, ...securityHeaders() });
+      res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive', ...securityHeaders() });
       sendSSE({ type: 'response.created', response: { id: responseId, object: 'response', model, status: 'in_progress' } });
       sendSSE({ type: 'response.output_item.added', item: { id: 'msg_' + randomBytes(8).toString('hex'), type: 'message', role: 'assistant' } });
       sendSSE({ type: 'response.content_part.added', part: { type: 'output_text', text: '' } });
@@ -3708,10 +3798,10 @@ server.listen(cfg.port, cfg.host, async () => {
   console.log('  Mode            : ' + cfg.mode + (cfg.authToken ? '  (auth token enabled)' : ''));
   console.log('  Models folder   : ' + MODELS_DIR);
   try {
-    const integrity = portableIntegrityReport(__dirname, INTEGRITY_FILE, { allowUnsigned: process.env.CAPSULE_ALLOW_UNSIGNED === '1' });
+    const integrity = portableIntegrityReport(__dirname, INTEGRITY_FILE, { allowUnsigned: CAPSULE_TRUST.allowUnsigned });
     if (integrity.verified) console.log('  Capsule files   : ' + integrity.files.length + ' files verified');
-    else if (integrity.signature) console.log('  Capsule files   : ⚠ files changed since the manifest — run: npm run integrity');
-    else console.log('  Capsule files   : ⚠ unsigned manifest (no signing key) — launch via start-portable.sh or set CAPSULE_ALLOW_UNSIGNED=1');
+    else if (integrity.signed) console.log('  Capsule files   : ⚠ signed manifest did not verify');
+    else console.log('  Capsule files   : ⚠ unsigned developer manifest did not verify');
     if (lastIntegrityRepair?.restored?.length) console.log('  Self-heal       : restored ' + lastIntegrityRepair.restored.length + ' missing release file(s)');
   } catch {}
   if (cfg.mode === 'tunnel') await startTunnel();

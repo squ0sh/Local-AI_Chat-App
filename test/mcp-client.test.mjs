@@ -43,3 +43,54 @@ test('McpClient callTool rejects after close', async () => {
   await client.close();
   await assert.rejects(() => client.callTool('echo', { text: 'x' }), /closed/i);
 });
+
+test('McpClient does not inherit application secrets', async () => {
+  const path = join(dir, 'mcp-env.cjs');
+  writeFileSync(path, `
+const keepAlive = setInterval(() => {}, 1000);
+let buffer = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', chunk => {
+  buffer += chunk;
+  let index;
+  while ((index = buffer.indexOf('\\n')) !== -1) {
+    const line = buffer.slice(0, index); buffer = buffer.slice(index + 1);
+    if (!line.trim()) continue;
+    const message = JSON.parse(line);
+    if (message.id == null) continue;
+    const result = message.method === 'initialize'
+      ? { protocolVersion: '2024-11-05', capabilities: {}, serverInfo: { name: 'env-check' } }
+      : {};
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }) + '\\n');
+  }
+});
+`);
+  const previous = process.env.AUTH_TOKEN;
+  process.env.AUTH_TOKEN = 'must-not-reach-mcp';
+  const client = new McpClient({ command: process.execPath, args: [path], timeout: 500 });
+  try {
+    await client.connect();
+    assert.equal(client.env.AUTH_TOKEN, undefined);
+  } finally {
+    await client.close();
+    if (previous === undefined) delete process.env.AUTH_TOKEN;
+    else process.env.AUTH_TOKEN = previous;
+  }
+});
+
+test('McpClient terminates oversized unframed stdout', async () => {
+  const path = join(dir, 'mcp-overflow.cjs');
+  writeFileSync(path, `process.stdout.write('x'.repeat(1_100_000)); setInterval(() => {}, 1000);`);
+  const client = new McpClient({ command: process.execPath, args: [path], timeout: 1000 });
+  await assert.rejects(() => client.connect(), /1 MB|exceeded/i);
+  await client.close();
+});
+
+test('McpClient times out and clears a pending request', async () => {
+  const path = join(dir, 'mcp-timeout.cjs');
+  writeFileSync(path, `process.stdin.resume(); setInterval(() => {}, 1000);`);
+  const client = new McpClient({ command: process.execPath, args: [path], timeout: 50 });
+  await assert.rejects(() => client.connect(), /timeout/i);
+  assert.equal(client.pending.size, 0);
+  await client.close();
+});

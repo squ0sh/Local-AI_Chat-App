@@ -28,6 +28,36 @@ test('agent loop forwards streamed deltas to onToken', async () => {
   assert.equal(result.status, 'complete');
   assert.equal(tokens.join(''), 'hello world');
   assert.ok(events.some((e) => e.type === 'completed'), 'should emit completed');
+  assert.equal(result.thread.at(-1)?.role, 'assistant');
+  assert.equal(result.thread.at(-1)?.content, 'hello world');
+});
+
+test('agent loop cancellation settles an outstanding approval wait', async () => {
+  const controller = new AbortController();
+  let waiting = false;
+  const resultPromise = runAgentLoop({
+    task: 'write a file',
+    model: 'test-model',
+    workspaceRoot: '/tmp',
+    autonomy: 'selective',
+    llmCall: async () => ({
+      content: '',
+      tool_calls: [{ name: 'write_file', arguments: { path: 'approval-test.txt', content: 'x' } }],
+    }),
+    onEvent: (event) => {
+      if (event.type === 'waiting_approval') {
+        waiting = true;
+        controller.abort();
+      }
+    },
+    signal: controller.signal,
+  });
+  const result = await Promise.race([
+    resultPromise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('approval wait did not settle')), 500)),
+  ]);
+  assert.equal(waiting, true);
+  assert.equal(result.status, 'cancelled');
 });
 
 test('agent loop invokes llmCall with onToken as the third argument', async () => {

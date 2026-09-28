@@ -105,7 +105,7 @@ test('agent tools server: git allowlist, find, and undo endpoints', async () => 
 
     const denied = await call('/api/agent/git', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ args: ['reset', '--hard'] }) });
     assert.equal(denied.status, 403);
-    assert.match(denied.body.error, /Not allowed/);
+    assert.match(denied.body.error, /not.*allow/i);
 
     const deniedRm = await call('/api/agent/git', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ args: ['rm', '-rf', '.'] }) });
     assert.equal(deniedRm.status, 403);

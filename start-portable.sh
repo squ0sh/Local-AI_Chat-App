@@ -40,6 +40,22 @@ if [[ -f "$APP_DIR/runtime/downloads.txt" ]]; then
     awk -F '\t' -v t="$TARGET" -v k="$1" '$1==t && $2==k { print; exit }' "$APP_DIR/runtime/downloads.txt"
   }
 
+  verify_runtime_binary() {
+    local kind="$1" bin="$2" row expected got
+    row="$(runtime_row "$kind")"
+    expected="$(cut -f5 <<<"$row")"
+    if [[ -z "$expected" || "$expected" == "-" ]]; then
+      echo "No binary hash pin exists for $TARGET $kind." >&2
+      exit 1
+    fi
+    got="$(shasum_of "$bin")"
+    if [[ -z "$got" || "$got" != "$expected" ]]; then
+      echo "Bundled $kind binary does not match its release pin." >&2
+      echo "Remove the damaged runtime and restart to restore it from the pinned archive." >&2
+      exit 1
+    fi
+  }
+
   download_runtime() {
     local kind="$1" bin="$2" dir="$3"
     local row url archive got sha_arc sha_bin fname
@@ -131,6 +147,8 @@ if [[ -f "$APP_DIR/runtime/downloads.txt" ]]; then
   fi
   if [[ "${LOCAL_AI_VERIFY_RUNTIMES:-}" == "1" ]]; then
     echo "Verifying bundled runtimes against release pins…" >&2
+    verify_runtime_binary node "$NODE_BIN"
+    verify_runtime_binary ollama "$OLLAMA_BIN"
     "$NODE_BIN" --version >/dev/null 2>&1 || { echo "Bundled Node failed its smoke check." >&2; exit 1; }
     "$OLLAMA_BIN" --version >/dev/null 2>&1 || { echo "Bundled Ollama failed its smoke check." >&2; exit 1; }
   fi
@@ -167,12 +185,13 @@ export OLLAMA_HOST="127.0.0.1:11435"
 # restarts. Automatic pruning can mistake a recently finalized direct-HF model
 # for an unused cache entry on some Ollama builds.
 export OLLAMA_NOPRUNE="true"
-# Machines without the Capsule signing key accept the unsigned manifest that
-# `npm run integrity` generates. Maintainers with the key keep signed checks.
-if [[ ! -f "$HOME/.capsule-signing/key.pem" ]]; then
-  export CAPSULE_ALLOW_UNSIGNED="1"
-  echo "Capsule integrity: unsigned mode (no signing key). After code changes run: npm run integrity"
+# Release verification uses only the bundled public key. Developer copies may
+# opt into unsigned manifests explicitly before launching.
+if [[ "${CAPSULE_DEV_MODE:-0}" == "1" ]]; then
+  echo "Capsule integrity: explicit developer mode (unsigned manifests allowed)."
 fi
+
+"$NODE_BIN" "$APP_DIR/tools/verify-release.mjs"
 
 OLLAMA_PID=""
 ollama_ready() {

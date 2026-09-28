@@ -2,6 +2,7 @@
 rem Portable Local AI Chat launcher for Windows.
 setlocal
 set "APP_DIR=%~dp0"
+if /i "%~1"=="--verify-runtimes" set "LOCAL_AI_VERIFY_RUNTIMES=1"
 set "PORTABLE_DIR=%APP_DIR%.portable"
 set "MACHINE=%PROCESSOR_ARCHITECTURE%"
 if defined PROCESSOR_ARCHITEW6432 set "MACHINE=%PROCESSOR_ARCHITEW6432%"
@@ -65,13 +66,17 @@ set "LOCAL_AI_OLLAMA_BIN=%OLLAMA_BIN%"
 set "OLLAMA_MODELS=%PORTABLE_DIR%\ollama\models"
 set "OLLAMA_HOST=127.0.0.1:11435"
 set "OLLAMA_NOPRUNE=true"
-rem Machines without the Capsule signing key accept the unsigned manifest that
-rem `npm run integrity` generates. Maintainers with the key keep signed checks.
-if not exist "%USERPROFILE%\.capsule-signing\key.pem" (
-  set "CAPSULE_ALLOW_UNSIGNED=1"
-  echo Capsule integrity: unsigned mode (no signing key). After code changes run: npm run integrity
-)
+rem Release verification uses only the bundled public key. Developer copies
+rem may opt into unsigned manifests explicitly before launching.
+if "%CAPSULE_DEV_MODE%"=="1" echo Capsule integrity: explicit developer mode ^(unsigned manifests allowed^).
 set "PATH=%OLLAMA_LIB_DIR%;%PATH%"
+
+"%NODE_BIN%" "%APP_DIR%tools\verify-release.mjs"
+if errorlevel 1 (
+  echo Capsule release verification failed. Refusing to start.
+  pause
+  exit /b 1
+)
 
 set "OLLAMA_URL=http://127.0.0.1:11435"
 "%NODE_BIN%" "%APP_DIR%tools\ollama-health.mjs" >nul 2>nul
@@ -90,6 +95,7 @@ pause
 exit /b 1
 
 :ollama_ready
+if "%LOCAL_AI_VERIFY_RUNTIMES%"=="1" echo Bundled runtime executable hashes verified against release pins.
 echo Starting Local AI Chat at http://127.0.0.1:5173
 "%NODE_BIN%" "%APP_DIR%server.mjs" --mode local --host 127.0.0.1 --port 5173
 if defined OLLAMA_PID taskkill /PID %OLLAMA_PID% /T /F >nul 2>nul

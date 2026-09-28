@@ -6,6 +6,7 @@ export function mockMcpServerPath(dir) {
   writeFileSync(path, `
 let buf = '';
 process.stdin.setEncoding('utf8');
+const keepAlive = setInterval(() => {}, 1000);
 function send(msg) { process.stdout.write(JSON.stringify(msg) + '\\n'); }
 function handle(line) {
   let m;

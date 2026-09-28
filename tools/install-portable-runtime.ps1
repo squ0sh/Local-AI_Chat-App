@@ -13,9 +13,6 @@ try {
   $BinDir = Join-Path $AppDir "runtime\platforms\$Target\$Kind"
   $Bin = Join-Path $BinDir ($(if ($Kind -eq 'node') { 'node.exe' } else { 'ollama.exe' }))
   $Floor = 5242880
-  if ((Test-Path $Bin) -and ((Get-Item $Bin).Length -ge $Floor)) { exit 0 }
-
-  New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
   $Downloads = Join-Path $AppDir 'runtime\downloads.txt'
   $Row = Get-Content $Downloads -Encoding utf8 | Where-Object { $_ -match "^$([regex]::Escape($Target))`t$([regex]::Escape($Kind))`t" } | Select-Object -First 1
   if (-not $Row) { Write-Error "No download entry for $Target $Kind." }
@@ -23,6 +20,16 @@ try {
   $Url = $Fields[2]
   $ShaArc = $Fields[3]
   $ShaBin = $Fields[4]
+  if ((Test-Path $Bin) -and ((Get-Item $Bin).Length -ge $Floor)) {
+    if ($env:LOCAL_AI_VERIFY_RUNTIMES -eq '1') {
+      if (-not $ShaBin -or $ShaBin -eq '-') { Write-Error "No binary hash pin exists for $Target $Kind." }
+      $gotExisting = (Get-FileHash -Algorithm SHA256 $Bin).Hash.ToLower()
+      if ($gotExisting -ne $ShaBin) { Write-Error "Bundled $Kind binary does not match its release pin." }
+    }
+    exit 0
+  }
+
+  New-Item -ItemType Directory -Force -Path $CacheDir | Out-Null
   $FileName = Split-Path -Leaf $Url
   $Archive = Join-Path $CacheDir $FileName
   $usedWebRequest = $false
