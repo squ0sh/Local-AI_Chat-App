@@ -1,12 +1,11 @@
-name: Verify x64 release ZIPs
+name: Verify published x64 release ZIPs
 
 'on':
   workflow_dispatch:
     inputs:
       tag:
-        description: Draft release tag containing the three x64 ZIPs and sidecars
+        description: Published release tag containing the three x64 ZIPs and sidecars (drafts are not visible to the workflow token)
         required: true
-        default: v1.15.0-x64
 
 permissions:
   contents: read
