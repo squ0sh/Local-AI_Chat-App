@@ -30,7 +30,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       RELEASE_TAG: ${{ inputs.tag }}
       RELEASE_PLATFORM: ${{ matrix.platform }}
-      RELEASE_DIR: ${{ runner.temp }}/capsule-release
+      RELEASE_DIR: release-assets
     steps:
       - uses: actions/checkout@v4
       - name: Download exactly this platform's ZIP and verification files
