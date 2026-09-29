@@ -6,7 +6,7 @@ name: Verify x64 release ZIPs
       tag:
         description: Draft release tag containing the three x64 ZIPs and sidecars
         required: true
-        default: v1.15.0
+        default: v1.15.0-x64
 
 permissions:
   contents: read
