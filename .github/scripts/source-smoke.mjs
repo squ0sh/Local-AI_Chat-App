@@ -19,7 +19,12 @@ function checked(command, args) {
   return (result.stdout || '').trim();
 }
 
-console.log(checked(process.execPath, [join(app, 'tools', 'verify-release.mjs')]));
+try { console.log(checked(process.execPath, [join(app, 'tools', 'verify-release.mjs')])); }
+catch (error) {
+  const { integrityCheck } = await import('../../lib/capsule-integrity.mjs');
+  const drift = integrityCheck(app);
+  throw new Error(`${error.message}\nFirst drifted files: ${drift.drifted.slice(0, 8).join(', ')}`);
+}
 const existingOllama = await fetch('http://127.0.0.1:11435/api/version', { signal: AbortSignal.timeout(1000) }).then((response) => response.ok).catch(() => false);
 if (existingOllama) throw new Error('Runner already has Ollama on port 11435; bundled-engine startup cannot be proven');
 const port = process.platform === 'win32' ? 5173 : await new Promise((resolvePort, reject) => {
