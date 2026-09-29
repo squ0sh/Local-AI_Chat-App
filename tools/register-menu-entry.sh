@@ -32,14 +32,30 @@ if [[ ! -f "$APP_DIR/start-portable.sh" ]]; then
 fi
 
 mkdir -p "$APPS_DIR"
+# Exec arguments pass through desktop-string and command-line unescaping.
+case "$APP_DIR" in
+  *$'\n'*|*$'\r'*) echo "A folder name containing a newline is unsupported." >&2; exit 1 ;;
+esac
+escape_exec() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//\$/\\\$}"
+  value="${value//\`/\\\`}"
+  value="${value//\\/\\\\}"
+  value="${value//%/%%}"
+  printf '%s' "$value"
+}
+EXEC_PATH="$(escape_exec "$APP_DIR/start-portable.sh")"
+ICON_PATH="${APP_DIR//\\/\\\\}/assets/icon.svg"
 cat > "$ENTRY" <<EOF
 [Desktop Entry]
 Type=Application
 Name=Local AI Chat
 Comment=Private local AI workspace — chat, agent, voice, images
 Keywords=AI;chat;local;capsule;
-Exec=bash "$APP_DIR/start-portable.sh"
-Icon=$APP_DIR/assets/icon.svg
+Exec=bash "$EXEC_PATH"
+Icon=$ICON_PATH
 Terminal=false
 Categories=Utility;
 StartupNotify=true

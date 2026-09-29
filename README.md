@@ -13,9 +13,15 @@ Unzip it into a folder you can write to, then:
 
 | Computer | Open |
 | --- | --- |
-| Windows | `start-portable.cmd` |
-| macOS | `Local AI Chat.command` |
-| Linux | `Local AI Chat.desktop` or `start-portable.sh` |
+| Windows x64 | Extract → double-click `start-portable.cmd` |
+| macOS Intel | Extract → double-click `Local AI Chat.command` |
+| Linux x64 | Extract → open `Local AI Chat.desktop`; approve Allow Launching if prompted |
+
+Each ZIP has a platform-specific **START HERE** text file. Linux file managers
+that do not launch desktop entries can use `bash start-portable.sh` from the
+extracted folder. Capsule is not Apple-notarized: macOS may block downloaded
+code. Do not disable Gatekeeper or remove quarantine attributes; see Apple's
+[downloaded-app guidance](https://support.apple.com/en-us/102445).
 
 Capsule checks its protected files as it starts, prepares its local engine,
 and opens the chat. On the first run, choose the model marked **Best fit** in
@@ -80,19 +86,23 @@ setup does not require them.
 
 ### Portable USB kit
 
-The release builder prepares separate Windows, Linux, and macOS ZIPs for x64
-and ARM64 where the pinned runtime artifacts are available.
+The current official release targets Windows x64, Linux x64 and Intel macOS.
+The builder retains ARM64 support for development, but no ARM64 ZIP is part of
+this release. Each ZIP contains only its platform's launchers/runtime plus
+explicitly allowlisted shared application files and user documentation.
 Use `start-portable.sh` on Linux/macOS or double-click `start-portable.cmd` on
 Windows. The launcher selects a matching bundled Node and Ollama runtime; it
 never silently falls back to host-installed software.
 
 Launchers open your browser automatically once the app answers
-(`LOCAL_AI_NO_BROWSER=1` disables that). Every desktop gets a double-click
-path: Linux runs `Local AI Chat.desktop` straight from the folder (GNOME may
-ask once to "Trust and Launch"; it works even off a USB stick), macOS runs
-`Local AI Chat.command` from Finder/Spotlight, and Windows runs
-`start-portable.cmd`. `bash tools/register-menu-entry.sh` additionally adds a
-Linux app-menu icon (`--remove` to undo).
+(`LOCAL_AI_NO_BROWSER=1` disables that). Windows uses `start-portable.cmd`;
+macOS uses `Local AI Chat.command` from Finder, subject to Gatekeeper approval.
+Linux uses `Local AI Chat.desktop` where supported; executable permissions and
+"Allow Launching"/trust approval may be required. File managers differ, and
+noexec-mounted drives cannot run the bundled binaries. The reliable Linux
+fallback is `bash start-portable.sh`. `bash tools/register-menu-entry.sh` adds
+an optional Linux app-menu icon (`--remove` to undo); re-register after moving
+the folder. Extract to a local path rather than a virtual/URI-only location.
 
 Models, settings, logs, and tunnel tooling stay under `.portable/`, so the app
 does not touch the host's Ollama library or require a system Node installation.

@@ -32,6 +32,9 @@ jobs:
       RELEASE_DIR: release-assets
     steps:
       - uses: actions/checkout@v4
+      - name: Install Linux desktop-entry validation tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y desktop-file-utils libglib2.0-bin python3-gi
       - name: Download exactly this platform's ZIP and verification files
         shell: bash
         run: |

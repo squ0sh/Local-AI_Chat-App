@@ -1,0 +1,21 @@
+CAPSULE — macOS INTEL (x64)
+
+1. Extract the entire ZIP into a writable folder.
+2. Open the Capsule folder in Finder.
+3. Double-click Local AI Chat.command.
+
+Terminal opens automatically to run Capsule; you do not need to type commands.
+Keep that window open. Your browser opens when Capsule is ready; otherwise
+visit http://127.0.0.1:5173.
+
+Capsule is not Apple-notarized. Gatekeeper may block the downloaded launcher
+or runtime. Capsule's Ed25519 signature is NOT an Apple Developer ID signature.
+If blocked, stop and consult the person who shared it and Apple's guidance:
+https://support.apple.com/en-us/102445
+Do not disable Gatekeeper, remove quarantine attributes, or bypass a malware
+warning. Managed Macs may not permit this software. A seamless first launch
+cannot currently be promised.
+
+Choose a model in Model library and approve its download. Keep the .portable
+folder private: it contains models, chats and settings. More help is in
+FRIENDS-AND-FAMILY.md; trust limitations are in SECURITY.md.
