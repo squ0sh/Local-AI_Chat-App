@@ -104,6 +104,13 @@ if [[ -f "$APP_DIR/runtime/downloads.txt" ]]; then
          echo "Manual restore: node ./tools/package-runtimes.mjs --platform-id $TARGET" >&2
          exit 1 ;;
     esac
+    # Ollama's Linux archive puts the executable under bin/, while the
+    # portable launcher uses a stable ollama/ollama path in every package.
+    if [[ "$kind" == "ollama" && ! -f "$bin" ]]; then
+      local found
+      found="$(find "$dir" -type f -name ollama -print -quit)"
+      if [[ -n "$found" ]]; then mv "$found" "$bin"; fi
+    fi
     chmod +x "$bin" 2>/dev/null || true
     if [[ -n "$sha_bin" && "$sha_bin" != "-" && "${LOCAL_AI_VERIFY_RUNTIMES:-}" == "1" ]]; then
       got="$(shasum_of "$bin")"

@@ -24,6 +24,10 @@ jobs:
     env:
       RELEASE_PLATFORM: ${{ matrix.platform }}
     steps:
+      - name: Preserve signed source bytes on Windows
+        if: matrix.platform == 'win32-x64'
+        shell: bash
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
       - name: Verify signed source and launch with the pinned native runtime
         run: node .github/scripts/source-smoke.mjs
