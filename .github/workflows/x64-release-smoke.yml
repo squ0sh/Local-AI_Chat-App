@@ -1,0 +1,43 @@
+name: Verify x64 release ZIPs
+
+'on':
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Draft release tag containing the three x64 ZIPs and sidecars
+        required: true
+        default: v1.15.0
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: ${{ matrix.platform }} on ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x64
+            runner: ubuntu-24.04
+          - platform: win32-x64
+            runner: windows-2025
+          - platform: darwin-x64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      RELEASE_PLATFORM: ${{ matrix.platform }}
+      RELEASE_DIR: ${{ runner.temp }}/capsule-release
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download exactly this platform's ZIP and verification files
+        shell: bash
+        run: |
+          mkdir -p "$RELEASE_DIR"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "Capsule-v*-$RELEASE_PLATFORM.zip*" --dir "$RELEASE_DIR"
+      - name: Verify signature and smoke the native portable launcher
+        run: node .github/scripts/release-smoke.mjs
