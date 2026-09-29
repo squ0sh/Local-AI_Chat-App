@@ -17,7 +17,7 @@ try {
   const run = spawnSync('gio', ['launch', join(app, 'Local AI Chat.desktop')], { cwd: '/', env: { ...process.env, CAPSULE_DESKTOP_PROBE_MARKER: marker }, encoding: 'utf8' });
   if (run.status !== 0) throw new Error('GIO launch failed: ' + run.stderr);
   for (let i = 0; i < 50 && !existsSync(marker); i++) await new Promise((r) => setTimeout(r, 100));
-  if (!existsSync(marker)) throw new Error('Desktop launch did not reach the shell launcher');
+  if (!existsSync(marker)) throw new Error('Desktop launch did not reach the shell launcher: ' + run.stdout + run.stderr);
   if (readFileSync(marker, 'utf8') !== join(app, 'start-portable.sh')) throw new Error('Wrong launcher path');
   mkdirSync(join(app, 'tools'));
   copyFileSync(join(dirname(source), 'tools/register-menu-entry.sh'), join(app, 'tools/register-menu-entry.sh'));
