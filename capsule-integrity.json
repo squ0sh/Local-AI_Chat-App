@@ -1,7 +1,7 @@
 {
   "schema_version": 2,
   "algorithm": "sha256",
-  "generated_at": "2026-09-29T18:30:49.418Z",
+  "generated_at": "2026-09-29T18:34:18.349Z",
   "files": [
     {
       "path": ".githooks/pre-commit",
@@ -740,10 +740,10 @@
     },
     {
       "path": "tools/check-desktop-launch.mjs",
-      "bytes": 2976,
-      "sha256": "3a41a3554c97d38ad17c38e4952fb4e3dbbf3f636dd49a131ef4e99d37cbdba6",
+      "bytes": 3344,
+      "sha256": "296991cade038465f9582ffdeffd9c6af4eaa3367c2184c39c1d67842fbed134",
       "mode": 420,
-      "content": "H4sIAAAAAAAAA8VWXW/bNhR9z6849dJKQmTZGxBscOYCWeN2RVskSFJsQFsEDHltc6FIjaTsBmn+2d72xwZKdGwlaZoBA/ZkSb6859yvwzsY4JScdxDkLrypMPlMHBWzTuoZltLP4ecExn3NFKR2nilFAq9eH0KWlaKStGdeGl1sDQY4MOSgjUfJ7AWYvvTz4Mfb2nkSYFpArEy4YrIEw1Qq6pdMsxlZcCX5BTw5X2zJsjLW4wrlhfBUVieXmufhRdr2kZvq8qVU1L4trfS0fqXP0nnXPtsy/hITKwtcY2pNiUQbQaOpS/bWgK5iS33XiM+lEmeVNZxcx96XlZC2a2w6Fn8YqQO+M2pBOYS0mpXUPVExP0/2trjRzsOZ2nLCeHUmjbAFs7PFhx8+4csXJG8NZwr7r/FiznwRS5hkKx/WGI/xZvrSwCNt6aZZjoSzytWK+vFsv7LmnPpJlu1teXuJqy2g9cWqCuMmjDS4zZG8NEqQDbnihL//wrYwSjGL3p+18dTD98Ph08AF65KlrKqaL63P0CRkV25ZVeVIFKs1n5NIot26wmmbknzT+isJaM52+iHdOOQ8s74fCsPOFRVunoRMfPdkcC714Jy5+UddWan9FL2nrofedmqJqVAd9PvobQ97WQ/P0dt+sX908v7t5OxgcvLm9PDo7Oj48JfJ2bv94zeT495HneShd0NlMTQ/7u7ieiN2Pid+QQLjdbOlyaoKzUgsmJKCeUpyfPh2yJ8CGGluhNSzEZLaT39KIqKcIo14hfPM1w5PxmMMM/i5NUtoWmJirbFpchBlIDBAZCCNxpRJRWKEBDtYuxKm9t0PZO1GkLbW3QBn0oRwYpWTx9SyCYwvA/YgyUF6McIViqJYDQTpRY6HSjFaNdp1/lCGbK2/lZ2gei31TkLakzexT41FqshDYozhHiR+xu4Qz57hyVqU0pZTtge5s5OBLZn0DdSRNaV0lKY2w/g5HPlTWZKpfWrzMFPZDeF7vD1Q0chbSNGoryXGW213c1Iq/k22E1Fb3lvhNbnaENKInceMZk32Hh63e2j+Zo2e3bBAo4W3xGPDpzdGuTjnHY1obKK6RsHIVvYDSzPpPNl+Sbruk/b2Mk7/bddfNd1obtILjO9pxd8PXp0d7J/un/16+G4y6khmcBbgHteta6h473ZnKSjVLW14mHuUiMWDUxChvjUJ70jXaIHsXYVYO7npmvYKvun6jSyGeyY2DOlF0UlfjoRVlZK8wXADFTSiz2Q/3lubd17L/zFq2mB+yh4VY8tPOkjduLgX6Y6stQh3lAvX/wa0ozTJ/y0tYeH478d+I9xGkUhg2VGC5KZXjKJCmVmaHO2fnIxwb3Wx02ymzRIrpKuYDwkMK1atLSkWllC+FDmk5qoOI9DuLy7Hey25EZSjWV9cjrjOhJ21IstJh0ubWcY9WVfg5eba2iy4g3Z5DeoaFlgSRSB/janUTKlLXK2GoFWDK1jitXVyQaPggPJQXh5fwkjieusf+z3aPKALAAA="
+      "content": "H4sIAAAAAAAAA8VXXW/bNhR996849dJKQmTZ7VCsSOYC3pJmQdslaFJsQBO4DHVtc6ZIjaTiGmn+2d72xwZScmyladIBA/aSWNL9vudcXvb7OCXrLHKyc6dL7H8ijpIZK9QUC+FmcDMC465iEkJZx6SkHAeHRxBFKakg5ZgTWmWdfh97miyUdiiYmYOppZt5O85U1lEOpnLkKxEumSjAMBGSegVTbEoGXAo+hyPrso4oSm0crlDMc0dFebJUPPUPwtQ/uS6Xr4Sk+mlhhKP1I30S1tn6tyma/8TylQSuMTG6QKR0TjsTG+2uHdqSLdSXQnwmZD4ujeZkW/KuKHNh2sK6JfGHFsr7t1peUopcGMUKamuUzM2i3Q7XyjpYXRlOGK504sZtxsz08sOzc3z+jOiN5kxidIifZ8xlTQujZGXDaO0w3Cxf7OOI63DjJEXEWWkrSb1Gt1cafUG9KEl2O5NKcd9YSFYpPturJWLfrhSkLhNcdYB+HwdvxAWeZS8GkcXHqdCNwkdIzXILhjktvVZov9SWLISzoe++CCkKNhdqWht7PAcVpVtmeG9pE3sr8R5bMEM3eB0dH6KylONiGUTQIMlmHcCQq4xatzOO+pU1/Quh+uXSzbT6PkrxIerxKO0AQNT0yy7tmQqdmYrMUKmtcNos0Xw+EPpMsbLE0P/MmsqMyvJQTXSmaDH2uuNVxLFdNm17ep6cKWYtGQevL2om/KoVbb7P6gLGH87T8C05U1Easjv3cV6BL/IdRP0o9MH/4ToXarqDqHKTFxGuk93OdceZZWhRDYY63tB/j4sU0SstczK+Opzw91/YyrWUzKD7Z6UddfF0MHjswYQ152JWluFNbdOznMzKLCvLFFEdO+VRI7emaFxjOt2U/gqCg26L0PGGknXMuJ5vBbuQlNlZ5KH83aPQ2AtmZ2eqNEK5CbqPbRfdrdgQk55e6PXQ3Rp0ky5eorv18+j45P2b/fHe/snr06Pj8fG7o5/2x29H717vv+uGol+h8NTEQP/w/Hmo6yp3PiM+pxzDTXitaBRm2iWTImeOPMYeTvncO7uzk4CYIG78ZdYxV1k8Gg4xSOBmRi+gaIF9Y7SJowaMNReaCDyJJ0xI8qjBNtamcl259gsyZiNJUykMbw2Ah1PxmWRZtppYAaP3lXpnBaR1tqZSD2Xqj6A6slZyteZNHhNtEEtyEBhisAuBH/F8gCdP8Gh9QsS1/2QXYns7AVsw4YKrY6MLYSmOTYLhS1hyp6IgXbnYpJ4fyU3Ad1i7pztN3LnIwwAwxHh90NoZSdl8JtPKqG7VrfRCrTZOtcZ32uAnCdW7nzp3hPmb0Wp6EwXCwXRrEGzYdFpL23C2xfcg0xx1DfmTlXzf0FRYR6ZXkKp6pJxZNky+bfqrohtAJXWJ4R2w+33vYLw3Oh2Nfzl6u7/TGn/emHf3bchcu2qWoDbx/dS5xfP7Y2/o/rXpXXe2cfUQE96SqlA7Ml+yfW3kBjX1PnSD+o0q+jOjAQypy6xVvhQRK0spePBh+9Kzv8dEr1kiNheQOv5vmYzB53nyTTnW8QkLoYKJtaf2iApy9ZLyL+y2hkn0f08Pv+D998zeSDcMHcqxaJE9uoGDlpRJPY2j49HJyQ7ubCC2w00gXBpyYUvmfAH94lQpQ5L5pZ8v8hRCcVl5lNfrhk3xXgmuc0oRtg2botk+/JJYkuGk/BnLDOPOb3N4tXlNCBeKfn1Z8APUXxgoz3zw15gIxaRc4mqF85rwVzDEK2PFJe14A5T69vLmwbMO151/AOn1/QsQDQAA"
     },
     {
       "path": "tools/cpuid.c",
@@ -861,6 +861,6 @@
   "signature": {
     "algorithm": "ed25519",
     "pubkey_sha256": "c2d5bf55d9d4a1167c15cc64f03b683af6b85d8c770b9cdb5367739390e84ba5",
-    "value": "uOxwynuYL2boH3NDheXMOxoXAzLICP3wSw4rQhOR6XKrcmhpsGJF1j/VMlzjladK4s5k3PhGPz/+jvmu2qqhCg=="
+    "value": "+DN6MOWqmUzQmMZAEycOyHuj1V22y4bbF3RlrreSbLBjuUNW7C8V7bHmGNgEapiDi6D1TJn736pjtrmXirdoCg=="
   }
 }

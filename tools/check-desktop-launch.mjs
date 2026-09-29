@@ -6,6 +6,13 @@ import { tmpdir } from 'node:os';
 import { join, resolve, dirname } from 'node:path';
 const source = resolve(process.argv[2] || 'Local AI Chat.desktop');
 const root = mkdtempSync(join(tmpdir(), 'capsule-desktop-probe-'));
+function launchDesktop(file, env) {
+  // GLib 2.80's `gio launch` loads a keyfile and loses its filename, making
+  // %k empty. Use the actual filename-aware desktop API used by file managers.
+  return spawnSync('/usr/bin/python3', ['-c',
+    'import sys\nfrom gi.repository import Gio\napp = Gio.DesktopAppInfo.new_from_filename(sys.argv[1])\nassert app is not None\nassert app.launch([], None)\n', file],
+  { cwd: '/', env, encoding: 'utf8' });
+}
 try {
   const app = join(root, 'Folder space ü $dollar "quote" 100%');
   mkdirSync(app);
@@ -14,7 +21,7 @@ try {
   writeFileSync(join(app, 'start-portable.sh'), '#!/bin/bash\nprintf "%s" "$(realpath -- "$0")" > "$CAPSULE_DESKTOP_PROBE_MARKER"\n', { mode: 0o755 });
   const checked = spawnSync('desktop-file-validate', [join(app, 'Local AI Chat.desktop')], { encoding: 'utf8' });
   if (checked.status !== 0) throw new Error('Desktop file validation failed: ' + checked.stdout + checked.stderr);
-  const run = spawnSync('gio', ['launch', join(app, 'Local AI Chat.desktop')], { cwd: '/', env: { ...process.env, CAPSULE_DESKTOP_PROBE_MARKER: marker }, encoding: 'utf8' });
+  const run = launchDesktop(join(app, 'Local AI Chat.desktop'), { ...process.env, CAPSULE_DESKTOP_PROBE_MARKER: marker });
   if (run.status !== 0) throw new Error('GIO launch failed: ' + run.stderr);
   for (let i = 0; i < 50 && !existsSync(marker); i++) await new Promise((r) => setTimeout(r, 100));
   if (!existsSync(marker)) throw new Error('Desktop launch did not reach the shell launcher: ' + run.stdout + run.stderr);
@@ -27,7 +34,7 @@ try {
   rmSync(marker);
   const entry = join(env.XDG_DATA_HOME, 'applications/local-ai-capsule.desktop');
   if (spawnSync('desktop-file-validate', [entry]).status !== 0) throw new Error('Menu entry is invalid');
-  if (spawnSync('gio', ['launch', entry], { cwd: '/', env }).status !== 0) throw new Error('Menu entry launch failed');
+  if (launchDesktop(entry, env).status !== 0) throw new Error('Menu entry launch failed');
   for (let i = 0; i < 50 && !existsSync(marker); i++) await new Promise((r) => setTimeout(r, 100));
   if (!existsSync(marker) || readFileSync(marker, 'utf8') !== join(app, 'start-portable.sh')) throw new Error('Menu entry reached wrong launcher');
   console.log('PASS: desktop-file-validate + GIO Exec dispatch from unrelated cwd, including spaces, Unicode, quotes, dollar and percent characters. File-manager trust/click not tested.');
