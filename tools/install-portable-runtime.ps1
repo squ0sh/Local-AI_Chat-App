@@ -8,6 +8,17 @@ param(
 # runtime\downloads.txt. Archives are always hash-checked before extraction.
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+function Get-Sha256([string]$Path) {
+  $sha = [System.Security.Cryptography.SHA256]::Create()
+  $stream = $null
+  try {
+    $stream = [System.IO.File]::OpenRead($Path)
+    return [System.BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
+  } finally {
+    if ($stream) { $stream.Dispose() }
+    $sha.Dispose()
+  }
+}
 try {
   $CacheDir = Join-Path $AppDir '.portable\cache'
   $BinDir = Join-Path $AppDir "runtime\platforms\$Target\$Kind"
@@ -23,7 +34,7 @@ try {
   if ((Test-Path $Bin) -and ((Get-Item $Bin).Length -ge $Floor)) {
     if ($env:LOCAL_AI_VERIFY_RUNTIMES -eq '1') {
       if (-not $ShaBin -or $ShaBin -eq '-') { Write-Error "No binary hash pin exists for $Target $Kind." }
-      $gotExisting = (Get-FileHash -Algorithm SHA256 $Bin).Hash.ToLower()
+      $gotExisting = Get-Sha256 $Bin
       if ($gotExisting -ne $ShaBin) { Write-Error "Bundled $Kind binary does not match its release pin." }
     }
     exit 0
@@ -47,7 +58,7 @@ try {
   }
 
   if ($ShaArc -and $ShaArc -ne '-') {
-    $got = (Get-FileHash -Algorithm SHA256 $Archive).Hash.ToLower()
+    $got = Get-Sha256 $Archive
     if ($got -ne $ShaArc) {
       Remove-Item $Archive -Force
       Write-Error "Downloaded archive hash does not match the release pin ($FileName)."
@@ -71,7 +82,7 @@ try {
 
   if ($usedWebRequest) { Unblock-File -Path $Bin -ErrorAction SilentlyContinue }
   if ($ShaBin -and $ShaBin -ne '-' -and $env:LOCAL_AI_VERIFY_RUNTIMES -eq '1') {
-    $gotBin = (Get-FileHash -Algorithm SHA256 $Bin).Hash.ToLower()
+    $gotBin = Get-Sha256 $Bin
     if ($gotBin -ne $ShaBin) { Write-Error "Restored $Kind binary does not match its release pin." }
   }
   Write-Host "  Restored $Kind ($Target)."
