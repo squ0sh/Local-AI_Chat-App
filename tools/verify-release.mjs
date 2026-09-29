@@ -12,7 +12,9 @@ const result = repairReleaseFiles(appDir, join(appDir, 'capsule-integrity.json')
   allowUnsigned: trust.allowUnsigned,
 });
 if (!result.verified) {
-  console.error('Capsule release verification failed: ' + (result.signature_error || result.failed?.[0]?.error || 'release files do not match'));
+  console.error('Capsule could not verify this installation. Some protected files may be changed or damaged.');
+  console.error('For your safety, Capsule stopped. Download a fresh copy from the official GitHub Releases page.');
+  console.error('Technical detail: ' + (result.signature_error || result.failed?.[0]?.error || 'release files do not match'));
   process.exit(78);
 }
 if (result.restored.length) console.log('Restored missing signed release files: ' + result.restored.join(', '));
