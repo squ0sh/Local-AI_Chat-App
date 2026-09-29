@@ -1,13 +1,87 @@
-# Local AI Chat
+# Capsule
 
-A local AI chat app **and** OpenAI-compatible API server for your Ollama
-models. Exposed locally, or publicly through a Cloudflare quick tunnel.
+Portable. Private. Local AI.
+
+Capsule runs an AI assistant on your own computer. Your chats and local memory
+can stay on your machine, and ordinary local chat needs no cloud AI account.
+
+## Quick start
+
+Download the package for your computer from the
+[official GitHub Releases page](https://github.com/squ0sh/Local-AI_Chat-App/releases).
+Unzip it into a folder you can write to, then:
+
+| Computer | Open |
+| --- | --- |
+| Windows | `start-portable.cmd` |
+| macOS | `Local AI Chat.command` |
+| Linux | `Local AI Chat.desktop` or `start-portable.sh` |
+
+Capsule checks its protected files as it starts, prepares its local engine,
+and opens the chat. On the first run, choose the model marked **Best fit** in
+**Model library** and approve its displayed download size. Downloading a model
+needs an internet connection; chatting with an installed model works offline.
+The [short friends and family guide](FRIENDS-AND-FAMILY.md) covers setup and
+recovery without technical commands.
+
+## What Capsule can do
+
+- **Think:** local chat, model choices, research, and reviewed agent tasks.
+- **Remember:** chats, local memory, procedures, and reviewable summaries.
+- **Act:** approved file and command tools, voice, images, and optional MCP tools.
+- **Connect:** temporary Remote links, peer transfers, and portable USB copies.
+
+## Privacy and safety
+
+Local chat and local memory stay on this computer. Web research visits public
+sites; optional cloud providers receive the prompts sent to them; Remote and
+peer features transmit data you choose to share. Browser and operating-system
+speech services may use a network connection. Review a model's source and
+license before sharing its files.
+
+**Verified release** in the sidebar means the protected app files passed the
+signed manifest check. It does not establish that the downloaded ZIP came from
+the expected publisher by itself. Compare the release key fingerprint below
+with the one on the official repository page if you need independent release
+identity. **Development build** means official release verification is not
+enforced. If verification fails, Capsule stops and explains how to get a clean
+copy. Advanced diagnostics remain available in the terminal.
+
+Official release public-key fingerprint (SHA-256 of the Ed25519 SPKI key):
+
+```text
+c2d5bf55d9d4a1167c15cc64f03b683af6b85d8c770b9cdb5367739390e84ba5
+```
+
+This value is published in the repository, outside the downloadable ZIP. It
+cannot defend against a compromised GitHub account or signing key. See
+[Security and release trust](SECURITY.md) for the exact boundaries.
+
+To verify a downloaded ZIP before opening it, download its matching `.sha256`
+and `.sha256.sig` files and run `node tools/verify-archive.mjs /path/to/Capsule-vVERSION-PLATFORM.zip`
+from a trusted source checkout. Compare the printed key fingerprint with the
+one above. The archive verification is separate from Capsule's startup check.
+
+## Models and hardware
+
+The Model library checks free memory and storage, then marks a best fit.
+The recommendation is an estimate, not a speed guarantee. Large choices may
+run slowly or need more memory; the app shows download size before you start.
+Installed models use disk space and can be unloaded from memory without being
+deleted. Advanced choices are still available in the library.
+
+## Advanced users
+
+The sections below document the local OpenAI-compatible API, agent tools,
+portable layouts, runtime pins, signing, and environment controls. Ordinary
+setup does not require them.
 
 ## Sharing modes
 
 ### Portable USB kit
 
-The Capsule is self-contained for Windows, Linux, and macOS on x64 and ARM64.
+The release builder prepares separate Windows, Linux, and macOS ZIPs for x64
+and ARM64 where the pinned runtime artifacts are available.
 Use `start-portable.sh` on Linux/macOS or double-click `start-portable.cmd` on
 Windows. The launcher selects a matching bundled Node and Ollama runtime; it
 never silently falls back to host-installed software.
@@ -23,16 +97,15 @@ Linux app-menu icon (`--remove` to undo).
 Models, settings, logs, and tunnel tooling stay under `.portable/`, so the app
 does not touch the host's Ollama library or require a system Node installation.
 
-The kit includes these pieces beside the launchers:
+The platform ZIP includes these pieces beside the launchers:
 
 ```
-runtime/platforms/       # six platform-specific Node and Ollama runtimes
-.portable/ollama/models/ # preloaded Ollama model library
+runtime/platforms/       # runtime for the ZIP's named platform
+.portable/ollama/models/ # models downloaded after first launch
 ```
 
-The model files are usually much larger than the app itself. Use a small
-quantized 3B–4B model for a friend-friendly package; it will start and respond
-far better than a 9B model on typical laptops.
+Model files are usually much larger than the app. The normal ZIP leaves model
+choice to the person running it; a model is downloaded only after approval.
 
 Use exFAT, NTFS, or a Linux filesystem for a flash drive. FAT32 cannot store an
 individual file larger than 4 GB, which many AI models exceed. A drive mounted
@@ -271,7 +344,7 @@ MCP registrations are governed because they start real processes:
 - Children start with a **hermetic environment** — `PATH` and home only — so
   child servers never see your `AUTH_TOKEN`, provider keys, or data paths.
   Secret-looking user env keys (matching `key|token|secret|passw`) are refused
-  outright; set `CAPSULE_MCP_INHERIT_ENV=1` only if a server truly needs full
+  outright; the old `CAPSULE_MCP_INHERIT_ENV` switch is ignored. If a server needs
   inheritance.
 - Registration is blocked while plan mode is on.
 - Flooding servers are cut off (8 MB stdout limit), tool results larger than
@@ -611,13 +684,13 @@ Integrity and hardening:
 
 | Variable                     | Default   | Description                         |
 | ---------------------------- | --------- | ----------------------------------- |
-| `CAPSULE_ALLOW_UNSIGNED`     | *(unset)* | Accept an unsigned integrity manifest (dev machines without the signing key; the portable launchers set this automatically) |
+| `CAPSULE_ALLOW_UNSIGNED`     | *(unset)* | Obsolete and ignored; use explicit `CAPSULE_DEV_MODE=1` for a developer copy |
 | `CAPSULE_ALLOW_INSECURE_BIND`| *(unset)* | Allow binding a tokenless server on a non-loopback host (dangerous; normally refused) |
 | `CAPSULE_MAX_CONTEXT`        | *(auto)*  | Override the auto RAM-based `num_ctx` cap (min 1024) |
 | `CAPSULE_RATE_PER_IP`        | `150`     | Per-client burst capacity of the shared API rate limiter |
 | `CAPSULE_RATE_REFILL`        | `20`      | Sustained tokens/second the rate buckets refill at (600-request global burst) |
 | `CAPSULE_MCP_ALLOW`          | `node,npx,uvx` | Executable allowlist for MCP server registration; comma-separated basenames or absolute paths |
-| `CAPSULE_MCP_INHERIT_ENV`    | *(unset)* | With `1`, MCP children inherit the server process env (not recommended) |
+| `CAPSULE_MCP_INHERIT_ENV`    | *(unset)* | Obsolete and ignored; MCP children receive a limited environment |
 | `LOCAL_AI_EMBED_STUB`        | *(unset)* | Internal/test: memory embedder stub |
 
 ## Tunnel mode

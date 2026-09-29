@@ -62,6 +62,20 @@ const auth=(extra={})=>{let t='';try{t=sessionStorage.getItem('lc.remoteToken')|
   d.querySelector('#portable-refresh').onclick=render;
   d.querySelector('#portable-close').onclick=()=>d.close();
 })();
+// Local release status is deliberately modest: file integrity is not a claim
+// about the model, the operating system, or the download channel.
+queueMicrotask(()=>{
+  if(!['localhost','127.0.0.1'].includes(location.hostname))return;
+  const nav=document.getElementById('capsule-nav');if(!nav)return;
+  const badge=document.createElement('div');badge.id='capsule-release-status';badge.setAttribute('role','status');
+  badge.style.cssText='margin:5px 10px 9px;padding:7px 9px;border:1px solid var(--line);border-radius:7px;color:var(--muted);font-size:11px;line-height:1.4';
+  badge.textContent='Checking Capsule files…';nav.insertBefore(badge,nav.children[1]||null);
+  fetch('/api/release/status').then(r=>r.json()).then(j=>{
+    badge.textContent=(j.state==='verified'?'✓ ':j.state==='development'?'⚠ ':'✕ ')+(j.label||'Verification unavailable');
+    badge.title=j.detail||'';
+    badge.style.borderColor=j.state==='verified'?'var(--green)':j.state==='development'?'#a67c2e':'#d66';
+  }).catch(()=>{badge.textContent='Verification status unavailable';badge.title='Open Portable readiness for details.'});
+});
 
 /* USB stick installer: guided, verifiable copy of the whole Capsule onto a
    removable drive — replaces the old "copy this folder by hand" dance. */
@@ -1372,10 +1386,10 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
     const renderChoice=model=>{
       const marks=(model.badges||[]).map(text=>({text}));
       if(model.category)marks.unshift({text:model.category});
-      if(model.recommended)marks.unshift({text:'Best fit',className:'good'});
+      if(model.recommended)marks.unshift({text:'Recommended for this computer',className:'good'});
       if(model.installed)marks.unshift({text:'Installed',className:'good'});
       if(model.agent_fit)marks.push({text:model.agent_fit.label,className:'agent-'+model.agent_fit.level});
-      if(!model.preflight?.fits_memory)marks.push({text:'May run slowly',className:'warn'});
+      if(model.preflight?.fits_memory===false)marks.push({text:'May not fit in memory',className:'warn'});
       const card=cardShell(model.name,model.description,marks);
       const fit=model.preflight;
       const notes=[`${Number(model.download_gb||0).toFixed(1)} GB download`,model.memory_gb?`about ${model.memory_gb} GB free memory suggested`:'memory varies',model.license].filter(Boolean);
@@ -1577,7 +1591,9 @@ const readConfig=()=>{try{return{enabled:false,code:false,...JSON.parse(localSto
     const recommendedTab=dialog.querySelector('[data-tab="recommended"]');
     if(recommendedTab&&state.tab!=='recommended')activateTab(recommendedTab);
     loadLibrary().then(()=>{
-      if(presetId&&!mutationsLocked())startInstall({preset:presetId});
+      if(!presetId)return;
+      const choice=(state.library?.catalog?.presets||[]).find(model=>model.id===presetId);
+      if(choice)setStatus(`Review ${choice.name} (${Number(choice.download_gb||0).toFixed(1)} GB download), then select Install / resume if you want it.`);
     });
   };
 })();

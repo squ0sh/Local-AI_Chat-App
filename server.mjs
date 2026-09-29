@@ -23,7 +23,7 @@ import { totalmem, freemem, cpus, loadavg, homedir, networkInterfaces } from 'os
 import { performance } from 'node:perf_hooks';
 import { randomBytes, createHash } from 'crypto';
 import qrcode from './lib/vendor/qrcode-generator.mjs';
-import { capsuleTrustFromEnv, portableIntegrityReport, rebuildManifest, repairReleaseFiles, releaseTrackedPaths } from './lib/capsule-integrity.mjs';
+import { capsuleTrustFromEnv, portableIntegrityReport, rebuildManifest, repairReleaseFiles, releaseTrackedPaths, releaseStatus } from './lib/capsule-integrity.mjs';
 import { MemoryStore, makeOllamaEmbedder, makeStubEmbedder } from './lib/capsule-memory.mjs';
 import { ConsolidationEngine } from './lib/consolidation.mjs';
 import { newDeviceIdentity, makeCard, readCard, packPostcard, unpackPostcard, envToText, textToEnv, fingerprint as peerFp, wordsPhrase } from './lib/capsule-handshake.mjs';
@@ -102,7 +102,9 @@ if (!lastIntegrityRepair?.verified) {
   const reason = lastIntegrityRepair?.signature_error
     || lastIntegrityRepair?.failed?.[0]?.error
     || 'one or more release files are missing or modified';
-  console.error('  Capsule integrity check failed: ' + reason);
+  console.error('  Capsule could not verify this installation. Some protected files may be changed or damaged.');
+  console.error('  For your safety, Capsule stopped. Download a fresh copy from the official GitHub Releases page.');
+  console.error('  Technical detail: ' + reason);
   console.error(CAPSULE_TRUST.devMode
     ? '  Developer mode still requires a current hash manifest. Run: npm run integrity'
     : '  Refusing to start in signed release mode. Restore a trusted release or explicitly use CAPSULE_DEV_MODE=1 for development.');
@@ -4381,6 +4383,14 @@ async function handle(req, res) {
   }
 
   // ── Portable kit readiness ───────────────────────────────────────────────
+  if (req.method === 'GET' && p === '/api/release/status') {
+    const report = portableIntegrityReport(__dirname, INTEGRITY_FILE, { allowUnsigned: CAPSULE_TRUST.allowUnsigned });
+    return sendJSON(res, 200, {
+      ...releaseStatus(report, CAPSULE_TRUST),
+      protected_files: report.files?.length || 0,
+      public_key_fingerprint: report.signed ? JSON.parse(readFileSync(INTEGRITY_FILE, 'utf8')).signature?.pubkey_sha256 || '' : '',
+    });
+  }
   if (req.method === 'GET' && p === '/api/portable/readiness') {
     let ollama = false, models = [];
     let manifest = null, manifestError = '';

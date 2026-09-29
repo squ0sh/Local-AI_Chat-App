@@ -106,7 +106,8 @@ const ws = new WebSocket(version.webSocketDebuggerUrl);
 await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
 let msgId = 0; const pending = new Map();
 const sendCdp = (method, params = {}) => new Promise((res) => { const id = ++msgId; pending.set(id, res); ws.send(JSON.stringify({ id, method, params })); });
-ws.onmessage = (ev) => { const m = JSON.parse(ev.data); if (m.id && pending.has(m.id)) { pending.get(m.id)(m.result); pending.delete(m.id); } };
+const pageErrors=[];
+ws.onmessage = (ev) => { const m = JSON.parse(ev.data); if(m.method==='Runtime.exceptionThrown')pageErrors.push(m.params?.exceptionDetails?.text+' '+(m.params?.exceptionDetails?.exception?.description||'')); if (m.id && pending.has(m.id)) { pending.get(m.id)(m.result); pending.delete(m.id); } };
 const { targetId } = await sendCdp('Target.createTarget', { url: 'about:blank' });
 const { sessionId } = await sendCdp('Target.attachToTarget', { targetId, flatten: true });
 const tab = (method, params = {}) => new Promise((res) => { const id = ++msgId; pending.set(id, res); ws.send(JSON.stringify({ id, method, params, sessionId })); });
@@ -118,17 +119,19 @@ const ev = async (expression) => {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 await tab('Page.enable');
+await tab('Runtime.enable');
 // Deterministic new-user environment: no stored state, no browser speech APIs
 // (forces the voice "guided setup" path), silenced alerts.
 await tab('Page.addScriptToEvaluateOnNewDocument', { source: "try{localStorage.clear();sessionStorage.clear()}catch(e){}; window.alert=(m)=>{window.__lastAlert=String(m)}; delete window.SpeechRecognition; delete window.webkitSpeechRecognition; delete window.SpeechSynthesisUtterance; delete window.speechSynthesis;" });
 await tab('Page.navigate', { url: `http://127.0.0.1:${appPort}/` });
 
 const booted = await waitFor(() => ev("!!document.getElementById('input') && !!document.getElementById('model-installer-launch')"));
-if (!booted) { console.error('ui-probe: app did not boot.\n' + serverLog.slice(-800)); cleanup(1); }
+if (!booted) { console.error('ui-probe: app did not boot.\n' + serverLog.slice(-800)); console.error('page:', await ev("JSON.stringify({url:location.href,ready:document.readyState,input:!!document.getElementById('input'),library:!!document.getElementById('model-installer-launch'),title:document.title,body:document.body?.textContent?.slice(0,180)})").catch(e=>String(e))); console.error('page errors:',pageErrors.slice(0,4)); cleanup(1); }
 await sleep(1200);
 
 // ── First-run / Batch A ──────────────────────────────────────────────────────
 ok('launcher labels present (model/vault/remote/cloud)', await ev("!!document.getElementById('model-installer-launch') && !!document.getElementById('vault-launch') && !!document.getElementById('remote-launch') && !!document.getElementById('cloud-launch')"));
+ok('verified release status is visible', /Verified release/i.test(await ev("document.getElementById('capsule-release-status')?.textContent || ''")));
 ok('empty model select is actionable', /install|Engine off/i.test(await ev("document.getElementById('model-select').options[0]?.textContent || ''")));
 
 await ev("document.getElementById('input').value='first-run probe';document.getElementById('send').click()");
@@ -136,10 +139,12 @@ await sleep(2500);
 ok('no-model send shows guidance row', await ev("!!document.querySelector('.nudge')"));
 ok('guidance names the situation', /No local model yet/i.test(await ev("document.querySelector('.nudge')?.textContent || ''")));
 ok('typed message is preserved', (await ev("document.getElementById('input').value")) === 'first-run probe');
-ok('install CTA exists in guidance', /Install/i.test(await ev("document.querySelector('.nudge .plain-btn')?.textContent || ''")));
+ok('review CTA exists in guidance', /Review in Model library/i.test(await ev("document.querySelector('.nudge .plain-btn')?.textContent || ''")));
+await ev("window.__modelInstallPosts=0;const originalFetch=window.fetch;window.fetch=(...args)=>{if(String(args[0]).includes('/api/models/install')&&args[1]?.method==='POST')window.__modelInstallPosts++;return originalFetch(...args)}");
 await ev("document.querySelector('.nudge .plain-btn')?.click()");
 await sleep(1000);
 ok('CTA opens the model library', await ev("!!document.querySelector('#model-library-dialog[open], dialog[open]')"));
+ok('review does not start a model download', await ev("window.__modelInstallPosts===0"));
 await ev("[...document.querySelectorAll('dialog[open]')].forEach(d=>d.close())");
 
 ok('humanizer: engine down', /local engine is not answering/i.test(await ev("window.humanizeErrorText('TypeError: fetch failed')")));

@@ -19,6 +19,7 @@
     "models": "node tools/model-cli.mjs list --url http://127.0.0.1:11435",
     "integrity": "node tools/generate-integrity.mjs",
     "integrity:check": "node tools/generate-integrity.mjs --check",
+    "release:build": "node tools/build-release.mjs",
     "hooks:install": "git config core.hooksPath .githooks && echo 'Hooks installed (.githooks/).'",
     "runtimes:package": "node tools/package-runtimes.mjs",
     "model:balanced": "node tools/model-cli.mjs pull hf.co/prithivMLmods/Qwen3-4B-2507-abliterated-GGUF:Q4_K_M --url http://127.0.0.1:11435",
