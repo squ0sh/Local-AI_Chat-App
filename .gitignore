@@ -77,6 +77,16 @@ web_modules/
 # ~/.capsule-signing/key.pem by default; pin the public half only.
 .capsule-signing/
 *.signing-key.pem
+*.private.pem
+*.key
+*.p12
+*.pfx
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+capsule-integrity.json.tmp
 
 # parcel-bundler cache (https://parceljs.org/)
 .cache

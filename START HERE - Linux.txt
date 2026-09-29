@@ -1,0 +1,29 @@
+CAPSULE — LINUX x64
+
+1. Extract the entire ZIP into a writable folder on an executable filesystem.
+2. Open the Capsule folder.
+3. Open Local AI Chat.desktop.
+
+Your file manager may first require Properties > Permissions > Allow executing
+as a program, and/or right-click > Allow Launching / Trust and Launch. Approve
+only after checking the source. Capsule does not set desktop trust for you.
+Some file managers only display .desktop files as text. On those systems, use
+the shell fallback: open a terminal in the Capsule folder and run:
+
+  bash start-portable.sh
+
+Optional app-menu entry (run from the Capsule folder):
+
+  bash tools/register-menu-entry.sh
+
+Re-register after moving the folder. Remove with:
+  bash tools/register-menu-entry.sh --remove
+
+Your browser opens when ready; otherwise visit http://127.0.0.1:5173.
+If your drive is mounted noexec, use a folder on an executable filesystem;
+running the script with bash does not make the bundled binaries bypass noexec.
+Extract locally: URI-only/virtual file-manager locations are not supported by
+the portable desktop entry. Executable ZIP permissions do not grant trust.
+
+Choose a model in Model library and approve its download. Keep .portable private.
+See FRIENDS-AND-FAMILY.md and SECURITY.md for help and trust limitations.

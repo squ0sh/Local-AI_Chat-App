@@ -1,0 +1,15 @@
+CAPSULE — WINDOWS x64
+
+1. Extract the entire ZIP. Do not run it from inside the ZIP viewer.
+2. Open the Capsule folder.
+3. Double-click start-portable.cmd.
+
+Keep the launcher window open while using Capsule. Your default browser opens
+when Capsule is ready. If it does not, visit http://127.0.0.1:5173.
+No commands, administrator privileges or separate Node/Ollama install needed.
+Do not turn off antivirus or Windows security if a warning appears; check the
+official download source and ask the person who shared Capsule for help.
+
+Choose a model in Model library, review its size, then approve its download.
+Models and chats stay in this folder's .portable directory. Keep it private.
+See FRIENDS-AND-FAMILY.md for help and SECURITY.md for verification limits.

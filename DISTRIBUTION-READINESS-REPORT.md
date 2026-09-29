@@ -2,8 +2,8 @@
 
 ## Scope and result
 
-This pass prepares a reviewable friends-and-family distribution path, not a
-published release. The app now has a per-platform ZIP builder, a signed archive
+This document describes the distribution path; FINAL-CLEANUP-REPORT.md records
+the current cleanup validation. The app has a per-platform ZIP builder, a signed archive
 checksum, an externally documented release-key fingerprint, a visible
 verified/development state, and first-run guidance that asks for a model
 download decision. The prior signed, self-repairing application manifest
@@ -18,12 +18,17 @@ certificate or an operating-system notarization.
 ## What ships and what stays private
 
 Each `Capsule-vVERSION-PLATFORM.zip` contains one `Capsule/` directory: the
-files in the signed application manifest, the manifest itself, and exactly the
+explicit shared-plus-platform allowlist in lib/release-layout.mjs, its freshly
+signed platform-specific manifest (including embedded repair content), and exactly the
 named platform runtime. The builder rejects symlinks and unsafe paths and
 refuses an unsigned or developer-mode manifest. It checks the bundled Node and
 Ollama executables against signed `runtime/downloads.txt` pins. It does not
 include `.portable/`, model downloads, chats, environment files, Git history,
-or the private release key. Models are chosen and downloaded by each user.
+or the private release key. Tests, developer/signing tools, Git hooks and foreign
+launchers are excluded. The signed canonical manifest binds the distribution
+platform; verification still requires complete coverage of that explicit list.
+Models are chosen and downloaded by each user. Source files retain their own
+complete manifest. Existing application paths stay unchanged for compatibility.
 
 The private Ed25519 key stays only on the controlled release machine. Its
 public-key fingerprint (SHA-256 of canonical SPKI DER) is:
@@ -74,11 +79,10 @@ operation, and explicit user control before replacing code.
 2. Review source changes and dependency/runtime pins. Run `npm run lint`,
    `npm test`, and `npm run integrity`. Then run `npm run integrity:check`.
    Confirm the manifest is signed and there is no unreviewed source drift.
-3. Run `npm run runtimes:package` on the controlled machine to obtain and
-   verify the pinned runtime archives for all six targets. Confirm the
+3. Run `npm run runtimes:package` on the controlled machine when needed to obtain and
+   verify the pinned runtime archives. Confirm the
    generated download table and source archives against the reviewed pins.
-4. For each of `linux-x64`, `linux-arm64`, `darwin-x64`, `darwin-arm64`,
-   `win32-x64`, and `win32-arm64`, run
+4. For each official target, `linux-x64`, `darwin-x64`, and `win32-x64`, run
    `npm run release:build -- --platform PLATFORM`. The output is under `dist/`:
    ZIP, `.sha256`, `.sha256.sig`, and `.release.json`.
 5. For every ZIP, run `node tools/verify-archive.mjs dist/ZIPNAME.zip` from a
@@ -93,7 +97,7 @@ operation, and explicit user control before replacing code.
    for reproducible incident review. Never publish `.portable/` or model/chat
    data. Verify the public download again after upload.
 
-## Validation record
+## Historical validation record (before final cleanup)
 
 On this Linux x64 development machine, `npm run lint`, `npm test` (229 tests),
 and `npm run integrity:check` passed. The first complete Chromium UI probe
@@ -102,6 +106,29 @@ badge and no automatic model download. A Linux x64 ZIP built from the pinned
 runtime, passed detached-signature/checksum verification, extracted to a fresh
 directory, and passed its embedded startup integrity check (116 protected
 files). Its extracted runtime directory contained only `linux-x64`; no private
-key or environment file was found. The artifact itself is a test output under
-ignored `dist/`, not a published release. Windows, macOS, and Linux ARM64 have
-not been run on this machine; their target smoke tests remain release gates.
+key or environment file was found. The subsequent published v1.15.0-x64 ZIPs
+passed native GitHub Actions startup on Ubuntu, Windows and Intel macOS
+(run 36554573163). Those old results do not validate new cleanup ZIPs; consult
+FINAL-CLEANUP-REPORT.md for current results. ARM64 is not part of this release.
+
+## Final cleanup release procedure additions
+
+Before signing, run `node tools/audit-secrets.mjs .` and review only redacted
+findings. If an actual release key is found in history, stop and rotate the
+identity with the owner's approval. Deletion alone cannot repair a leaked key.
+The public key intentionally remains at capsule-signing-pub.pem to preserve
+existing trust-root references. It is safe and necessary to distribute.
+
+Each ZIP now contains its own START HERE text file. Windows users double-click
+start-portable.cmd; Intel Mac users double-click Local AI Chat.command. Capsule
+is not Apple-notarized, so Gatekeeper can block first launch. Never disable OS
+security or strip quarantine attributes. Linux uses Local AI Chat.desktop
+where supported, with explicit Allow Launching/trust approval if required;
+the fallback is bash start-portable.sh. noexec drives cannot run bundled code.
+Do not claim a headless launcher test validates a human file-manager click.
+
+Build a new version, never overwrite an already trusted release's assets. Test
+its public prerelease ZIPs with the read-only native workflow before promotion.
+Archive acquisition trust remains necessary: self-verification starts only
+after bootstrap and bundled Node code execute. Runtime support libraries are
+archive-signed but not individually rehashed at every startup.

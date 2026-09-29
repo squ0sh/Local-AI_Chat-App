@@ -62,7 +62,7 @@ if [[ -f "$APP_DIR/runtime/downloads.txt" ]]; then
     row="$(runtime_row "$kind")"
     if [[ -z "$row" ]]; then
       echo "No download entry for $TARGET $kind." >&2
-      echo "Manual restore: node ./tools/package-runtimes.mjs --platform-id $TARGET" >&2
+      echo "Recovery: download a fresh official $TARGET ZIP and keep your existing .portable folder backed up privately." >&2
       exit 1
     fi
     url="$(cut -f3 <<<"$row")"
@@ -81,7 +81,7 @@ if [[ -f "$APP_DIR/runtime/downloads.txt" ]]; then
       if command -v curl >/dev/null 2>&1; then curl -fL --retry 2 -o "$archive.tmp" "$url"
       elif command -v wget >/dev/null 2>&1; then wget -qO "$archive.tmp" "$url"
       else echo "Neither curl nor wget is available; cannot restore $kind." >&2
-           echo "Manual restore: node ./tools/package-runtimes.mjs --platform-id $TARGET" >&2
+           echo "Recovery: download a fresh official $TARGET ZIP and keep your existing .portable folder backed up privately." >&2
            exit 1
       fi
       mv "$archive.tmp" "$archive"
@@ -90,7 +90,7 @@ if [[ -f "$APP_DIR/runtime/downloads.txt" ]]; then
       got="$(shasum_of "$archive")"
       if [[ "$got" != "$sha_arc" ]]; then
         echo "Downloaded archive hash does not match the release pin ($fname)." >&2
-        echo "Manual restore: node ./tools/package-runtimes.mjs --platform-id $TARGET" >&2
+        echo "Recovery: download a fresh official $TARGET ZIP and keep your existing .portable folder backed up privately." >&2
         exit 1
       fi
     fi
@@ -101,7 +101,7 @@ if [[ -f "$APP_DIR/runtime/downloads.txt" ]]; then
       *.tar.zst) if command -v unzstd >/dev/null 2>&1; then tar -C "$dir" --use-compress-program=unzstd -xf "$archive"
                  else tar -C "$dir" --zstd -xf "$archive"; fi ;;
       *) echo "Unsupported archive format for $kind: $fname" >&2
-         echo "Manual restore: node ./tools/package-runtimes.mjs --platform-id $TARGET" >&2
+         echo "Recovery: download a fresh official $TARGET ZIP and keep your existing .portable folder backed up privately." >&2
          exit 1 ;;
     esac
     # Ollama's Linux archive puts the executable under bin/, while the
@@ -116,7 +116,7 @@ if [[ -f "$APP_DIR/runtime/downloads.txt" ]]; then
       got="$(shasum_of "$bin")"
       if [[ "$got" != "$sha_bin" ]]; then
         echo "Restored $kind binary does not match its release pin." >&2
-        echo "Manual restore: node ./tools/package-runtimes.mjs --platform-id $TARGET" >&2
+        echo "Recovery: download a fresh official $TARGET ZIP and keep your existing .portable folder backed up privately." >&2
         exit 1
       fi
     fi
@@ -144,12 +144,12 @@ if [[ -f "$APP_DIR/runtime/downloads.txt" ]]; then
 
   if [[ ! -x "$NODE_BIN" ]]; then
     echo "The bundled Node runtime is still missing or not executable: $NODE_BIN" >&2
-    echo "Manual restore: node ./tools/package-runtimes.mjs --platform-id $TARGET" >&2
+    echo "Recovery: download a fresh official $TARGET ZIP and keep your existing .portable folder backed up privately." >&2
     exit 1
   fi
   if [[ ! -x "$OLLAMA_BIN" ]]; then
     echo "The bundled Ollama runtime is still missing or not executable: $OLLAMA_BIN" >&2
-    echo "Manual restore: node ./tools/package-runtimes.mjs --platform-id $TARGET" >&2
+    echo "Recovery: download a fresh official $TARGET ZIP and keep your existing .portable folder backed up privately." >&2
     exit 1
   fi
   if [[ "${LOCAL_AI_VERIFY_RUNTIMES:-}" == "1" ]]; then

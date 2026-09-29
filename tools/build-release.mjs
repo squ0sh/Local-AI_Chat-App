@@ -1,9 +1,10 @@
 import { spawnSync } from 'child_process';
+import { createPrivateKey, sign } from 'crypto';
 import { mkdtempSync, mkdirSync, copyFileSync, readFileSync, writeFileSync, rmSync, chmodSync, statSync, utimesSync, readdirSync, renameSync } from 'fs';
 import { homedir } from 'os';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
-import { portableIntegrityReport, pubkeyFingerprint } from '../lib/capsule-integrity.mjs';
+import { buildReleaseManifest, canonicalManifest, portableIntegrityReport, pubkeyFingerprint } from '../lib/capsule-integrity.mjs';
 import { checksumLine, releaseFiles, RELEASE_PLATFORMS, sha256, signChecksums } from '../lib/release-package.mjs';
 
 const appDir = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -39,6 +40,7 @@ try {
   const root = join(stage, 'Capsule');
   const fixedTime = new Date('2000-01-01T00:00:00Z');
   for (const path of files) {
+    if (path === 'capsule-integrity.json') continue;
     const target = join(root, path);
     mkdirSync(dirname(target), { recursive: true });
     const source = path.startsWith(`runtime/platforms/${platform}/`)
@@ -47,6 +49,18 @@ try {
     chmodSync(target, statSync(source).mode & 0o111 ? 0o755 : 0o644);
     utimesSync(target, fixedTime, fixedTime);
   }
+  // Build and sign the exact allowlisted platform tree, including its profile.
+  // Do not filter an existing signature or ship embedded copies of excluded files.
+  const packagedManifest = buildReleaseManifest(root, { platform });
+  packagedManifest.generated_at = manifest.generated_at;
+  packagedManifest.signature = {
+    algorithm: 'ed25519', pubkey_sha256: pubkeyFingerprint(publicPem),
+    value: sign(null, Buffer.from(canonicalManifest(packagedManifest)), createPrivateKey(readFileSync(keyFile))).toString('base64'),
+  };
+  const stagedManifest = join(root, 'capsule-integrity.json');
+  writeFileSync(stagedManifest, JSON.stringify(packagedManifest, null, 2) + '\n');
+  utimesSync(stagedManifest, fixedTime, fixedTime);
+  if (!portableIntegrityReport(root, stagedManifest).verified) throw new Error('Packaged manifest verification failed');
   const fixDirs = (dir) => { for (const item of readdirSync(dir, { withFileTypes: true })) if (item.isDirectory()) fixDirs(join(dir, item.name)); utimesSync(dir, fixedTime, fixedTime); };
   fixDirs(root);
   const stagedArchive = join(stage, archiveName);
@@ -57,7 +71,7 @@ try {
   renameSync(stagedArchive, join(outDir, archiveName));
   writeFileSync(join(outDir, archiveName + '.sha256'), checksum);
   writeFileSync(join(outDir, archiveName + '.sha256.sig'), signature);
-  writeFileSync(join(outDir, archiveName + '.release.json'), JSON.stringify({ version, platform, archive: archiveName, archive_sha256: checksum.slice(0, 64), public_key_sha256: pubkeyFingerprint(publicPem), manifest_schema: manifest.schema_version, signed_files: manifest.files.length }, null, 2) + '\n');
+  writeFileSync(join(outDir, archiveName + '.release.json'), JSON.stringify({ version, platform, archive: archiveName, archive_sha256: checksum.slice(0, 64), public_key_sha256: pubkeyFingerprint(publicPem), manifest_schema: packagedManifest.schema_version, signed_files: packagedManifest.files.length }, null, 2) + '\n');
   console.log(`Built ${join(outDir, archiveName)} (${files.length} files)`);
   console.log(`Public release key fingerprint: ${pubkeyFingerprint(publicPem)}`);
 } finally { rmSync(stage, { recursive: true, force: true }); }

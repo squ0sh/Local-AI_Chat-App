@@ -37,6 +37,20 @@ identity on a consumer computer. `CAPSULE_DEV_MODE=1` is explicit and is
 visibly marked as a development build. The obsolete unsigned flag has no
 effect.
 
+The public key intentionally remains at `capsule-signing-pub.pem`, beside the
+manifest, to avoid changing trust-root paths. Only explicit source release
+tooling reads the private key; that tooling is excluded from user packages.
+Platform packages have a freshly signed manifest whose canonical signature
+also binds the distribution platform. Their file coverage is checked against
+an explicit shared-plus-platform inventory, not a caller-selected subset.
+Repair therefore cannot repopulate excluded tests, developer tools or foreign
+launchers. The source checkout keeps a separate complete source manifest.
+
+A history scan cannot prove that no secret ever existed in deleted remote
+history or private backups. If release private-key material is ever found in
+history, stop distribution under that identity and rotate the trust root;
+deleting the file or rewriting history does not un-compromise the key.
+
 ## Threats and limits
 
 This design addresses corrupt or modified protected files, tampered archives
