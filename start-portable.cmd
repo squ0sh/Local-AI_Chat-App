@@ -21,9 +21,11 @@ set "OLLAMA_LIB_DIR=%RUNTIME_DIR%\ollama\lib\ollama"
 if not exist "%APP_DIR%runtime\downloads.txt" goto :legacy_check
 
 rem Restore missing runtime binaries automatically from the pinned release table.
-powershell -NoProfile -ExecutionPolicy Bypass -File "%APP_DIR%tools\install-portable-runtime.ps1" -AppDir "%APP_DIR%" -Target "%TARGET%" -Kind node
+rem The trailing dot keeps the AppDir argument from ending in a backslash before
+rem its closing quote, which would swallow following PowerShell parameters.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%APP_DIR%tools\install-portable-runtime.ps1" -AppDir "%APP_DIR%." -Target "%TARGET%" -Kind node
 if errorlevel 1 goto :runtime_failed
-powershell -NoProfile -ExecutionPolicy Bypass -File "%APP_DIR%tools\install-portable-runtime.ps1" -AppDir "%APP_DIR%" -Target "%TARGET%" -Kind ollama
+powershell -NoProfile -ExecutionPolicy Bypass -File "%APP_DIR%tools\install-portable-runtime.ps1" -AppDir "%APP_DIR%." -Target "%TARGET%" -Kind ollama
 if errorlevel 1 goto :runtime_failed
 goto :runtime_ok
 
